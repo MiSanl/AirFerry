@@ -31,8 +31,6 @@ public sealed class QrDecodePool : IDisposable
     private long _droppedFrames;
     private long _decodedSymbols;
     private long _multiMisses;
-    private int _frameWidth;
-    private int _frameHeight;
     private int[]? _multiTrackedBboxes;
     private int _multiLockedCount;
 
@@ -74,8 +72,6 @@ public sealed class QrDecodePool : IDisposable
     public long CapturedFrames => Interlocked.Read(ref _capturedFrames);
     public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
     public long DecodedSymbols => Interlocked.Read(ref _decodedSymbols);
-    public int FrameWidth => Volatile.Read(ref _frameWidth);
-    public int FrameHeight => Volatile.Read(ref _frameHeight);
 
     public QrDecodePool(Func<byte[], int[]?, bool> onDecoded)
     {
@@ -118,8 +114,6 @@ public sealed class QrDecodePool : IDisposable
         Interlocked.Increment(ref _capturedFrames);
         int width = gray.Width;
         int height = gray.Height;
-        Volatile.Write(ref _frameWidth, width);
-        Volatile.Write(ref _frameHeight, height);
         int rowStride = width;
         int length = checked(rowStride * height);
         int sourceStride = checked((int)gray.Step());
@@ -348,22 +342,6 @@ public sealed class QrDecodePool : IDisposable
                 }
             }
             _multiTrackedBboxes = updated;
-        }
-    }
-
-    public int[]? SnapshotMultiBboxes()
-    {
-        lock (_trackingGate)
-        {
-            return _multiTrackedBboxes is null ? null : (int[])_multiTrackedBboxes.Clone();
-        }
-    }
-
-    public int SnapshotMultiCount()
-    {
-        lock (_trackingGate)
-        {
-            return _multiLockedCount;
         }
     }
 

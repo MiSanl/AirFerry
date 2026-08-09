@@ -283,5 +283,5 @@ jobs:
             gh release create $Tag --draft --title $Tag --notes "Windows build from CI (workflow_dispatch)"
           }
           # --clobber：覆盖同名 asset（覆盖式发布）。
-          gh release upload $Tag "$ZipName#Windows 接收端（x64，需安装 .NET 8 Desktop Runtime）" --clobber
+          gh release upload $Tag "$ZipName#接收端-Windows-x64" --clobber
           Write-Host "已上传 $ZipName 到 release $Tag"

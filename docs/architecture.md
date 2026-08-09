@@ -99,7 +99,7 @@ core/
        ④ 否则 → 普通文件详情
 ```
 
-> **并行解码池**：采集与解码解耦；QR 识别可并行，但原生 receiver 句柄非线程安全，ingest 必须串行。Android 根据 CameraX 旋转角把 bbox 映射到用户所见四宫格，并用独立 UI 时钟让消失码及时转为暂停；Windows 进度 UI 从同一 ingest 锁下取得一致快照。两端均显示 3 秒窗口速率、有效吞吐及多码状态。详见 [data-flow.md](data-flow.md)。
+> **并行解码池**：采集与解码解耦；QR 识别可并行，但原生 receiver 句柄非线程安全，ingest 必须串行。进度 UI 从一致快照展示接收进度、3 秒窗口速率和有效吞吐；不再展示容易误判的逐二维码活跃/暂停状态。详见 [data-flow.md](data-flow.md)。
 
 ## 容错设计
 

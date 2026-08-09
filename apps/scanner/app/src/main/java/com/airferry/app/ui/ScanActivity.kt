@@ -5,7 +5,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
-import android.os.SystemClock
 import android.view.WindowManager
 import android.widget.Toast
 import android.util.Log
@@ -45,13 +44,11 @@ import androidx.core.content.ContextCompat
 import com.airferry.app.nativelib.NativeBridge
 import com.airferry.app.scan.BundleParser
 import com.airferry.app.scan.QrDecodePool
-import com.airferry.app.scan.QrPresence
 import com.airferry.app.scan.QrStreamAnalyzer
 import com.airferry.app.scan.ReceiverSessionManager
 import com.airferry.app.scan.TextParser
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.delay
 
 // Design tokens
 private val BgDark = Color(0xFF0F172A)
@@ -108,10 +105,6 @@ class ScanActivity : ComponentActivity() {
         val fileSize: Long = 0,
         val complete: Boolean = false,
         val jniReady: Boolean = false,
-        /** Snapshot of per-code activity timestamps for the code-status row. */
-        val codeActivitySnapshot: Map<Int, Long> = emptyMap(),
-        /** Largest QR layout detected for this transfer (0/1/2–4). */
-        val multiCodeCount: Int = 0,
         /** Elapsed transfer time in ms (0 = not started yet). */
         val transferElapsedMs: Long = 0,
         /** RaptorQ symbol size in bytes (from the sender's config). */
@@ -122,24 +115,6 @@ class ScanActivity : ComponentActivity() {
          */
         val recentWireBps: Long = 0,
     )
-
-    // ===== Per-code scan status (shown in the info card) =====
-    //
-    // For a multi-QR sender we show, in the bottom info card, whether each
-    // on-screen code is actively delivering symbols. A code is mapped to a fixed
-    // grid slot by [QrPresence.slotOf] (single-code → center slot, multi-code → one of
-    // four 2×2 slots). We record the last wall-clock ms each slot decoded a valid
-    // AirFerry frame; the UI compares that against now to label the code
-    // "receiving" (within [CODE_ACTIVE_MS]) / "paused" (seen before but stale) /
-    // "unseen" (multi-code slots that never fired). This replaces the old
-    // positional spark overlay, which was hard to land accurately.
-
-    /**
-     * Map of grid slot → last-decoded-frame wall-clock ms. Written on the
-     * ingest worker under [codeActivityLock]; read + snapshot on the UI tick.
-     */
-    private val codeActivityLock = Any()
-    private val codeActivity = HashMap<Int, Long>()
 
     private val recoveryStage = mutableStateOf<String?>(null)
     /** Wall-clock ms when the transfer first started (totalSymbols > 0). */
@@ -193,16 +168,6 @@ class ScanActivity : ComponentActivity() {
     private fun ScanScreen() {
         val state by uiState
         val recovery by recoveryStage
-        var presenceNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-        // Presence must expire even when decoding stops completely. Calling
-        // currentTimeMillis() only from codeStatusString is not reactive, so the
-        // old UI could leave a vanished QR marked active forever.
-        LaunchedEffect(Unit) {
-            while (true) {
-                delay(CODE_STATUS_TICK_MS)
-                presenceNowMs = SystemClock.elapsedRealtime()
-            }
-        }
 
         BoxWithConstraints(modifier = Modifier.fillMaxSize().background(BgDark)) {
 
@@ -267,15 +232,6 @@ class ScanActivity : ComponentActivity() {
                             }
                             InfoRow("已识别符号", "${state.receivedSymbols} / ${state.totalSymbols}")
                             InfoRow("解码速率", "${state.decodePerSec} 符号/秒")
-                            InfoRow(
-                                "二维码",
-                                QrPresence.statusString(
-                                    state.codeActivitySnapshot,
-                                    state.multiCodeCount,
-                                    presenceNowMs,
-                                    CODE_ACTIVE_MS,
-                                ),
-                            )
                             // 传输用时 + 近几秒滑动窗口速度（非全程平均）
                             if (state.transferElapsedMs > 0) {
                                 val elapsedStr = formatDuration(state.transferElapsedMs)
@@ -371,9 +327,6 @@ class ScanActivity : ComponentActivity() {
         }
     }
 
-    // QrPositionOverlay (spark overlay) 已移除。
-    // 改为在信息卡片中以文字标出每个码的扫描状态（活跃/暂停/未扫描）。
-
     @Composable
     private fun InfoRow(label: String, value: String) {
         Row(
@@ -438,7 +391,7 @@ class ScanActivity : ComponentActivity() {
             // returns one result), so there's no need for a user-facing toggle — it
             // worked regardless of the switch position, and only added confusion.
             p = QrDecodePool(
-                onDecoded = { payload, bbox -> handleFrameAsync(payload, bbox) },
+                onDecoded = { payload, _ -> handleFrameAsync(payload) },
                 multiMode = true,
             ).also { it.start() }
             decodePool = p
@@ -534,39 +487,13 @@ class ScanActivity : ComponentActivity() {
         val fileSize: Long
     )
 
-    /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot.
-     *
-     *  [bbox] is the decoded code's {minX,minY,maxX,maxY} in analysis-stream
-     *  pixel coords (null on the legacy single-code path). A syntactically valid
-     *  AirFerry frame refreshes the code's presence before descriptor gating or
-     *  RaptorQ duplicate handling. */
-    private fun handleFrameAsync(payload: ByteArray, bbox: IntArray?) {
+    /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot. */
+    private fun handleFrameAsync(payload: ByteArray) {
         // After completion, drop further frames: the main thread is (or will be)
         // calling assemble() on the receiver, which must not run concurrently
         // with another ingest. This runs under the pool's ingest lock, so the
         // check+ingest+stop sequence is atomic w.r.t. other workers.
         if (ingestStopped.get()) return
-        // Presence describes a physically decoded AirFerry QR, not whether the
-        // receiver happened to accept it. Before the first descriptor, valid
-        // data frames intentionally make ingest() return null; recording only
-        // after ingest therefore falsely marked those visible tiles as absent.
-        if (session.parseHeader(payload) == null) return
-        if (bbox != null) {
-            val pool = decodePool
-            if (pool != null) {
-                val (width, height) = pool.snapshotAnalysisSize()
-                val slot = QrPresence.slotOf(
-                    bbox,
-                    width,
-                    height,
-                    pool.snapshotAnalysisRotation(),
-                    pool.snapshotMultiCount(),
-                )
-                synchronized(codeActivityLock) {
-                    codeActivity[slot] = SystemClock.elapsedRealtime()
-                }
-            }
-        }
         // ingest() returns a lightweight status (no JSON) so the per-frame path
         // stays cheap; the full progress is fetched only on the throttled UI tick.
         val status = session.ingest(payload) ?: return
@@ -679,9 +606,6 @@ class ScanActivity : ComponentActivity() {
         }
         val droppedTotal = pool?.droppedCount() ?: 0L
 
-        val snapshotMap = synchronized(codeActivityLock) { HashMap(codeActivity) }
-        val mcCount = pool?.snapshotMultiCount() ?: 0
-
         // Start the transfer timer on first symbol receipt.
         if (progress.totalSymbols > 0 && transferStartMs == 0L) {
             transferStartMs = nowMs
@@ -703,8 +627,6 @@ class ScanActivity : ComponentActivity() {
                 fileSize = s.fileSize,
                 statusText = statusMsg,
                 complete = progress.complete,
-                codeActivitySnapshot = snapshotMap,
-                multiCodeCount = mcCount,
                 transferElapsedMs = elapsedMs,
                 symbolSize = symbolSize,
                 recentWireBps = recentWireBps,
@@ -927,8 +849,6 @@ class ScanActivity : ComponentActivity() {
         rateSamples.clear()
         decodePerSec = 0
         recentWireBps = 0L
-        // Clear per-code activity state.
-        synchronized(codeActivityLock) { codeActivity.clear() }
         transferStartMs = 0L
         recoveryStage.value = null
         updateUi {
@@ -971,7 +891,6 @@ class ScanActivity : ComponentActivity() {
             rateSamples.clear()
             decodePerSec = 0
             recentWireBps = 0L
-            synchronized(codeActivityLock) { codeActivity.clear() }
             transferStartMs = 0L
             recoveryStage.value = null
             updateUi { UiState(jniReady = true, statusText = "就绪 — 对准二维码…") }
@@ -1007,10 +926,6 @@ class ScanActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ScanActivity"
-        /** A tile becomes paused shortly after its last successful decode. */
-        private const val CODE_ACTIVE_MS = 2_000L
-        /** Recompose the presence row even when the camera yields no QR at all. */
-        private const val CODE_STATUS_TICK_MS = 250L
         /**
          * Sliding window for decode rate + wire throughput shown in the info card.
          * ~3s is responsive enough to feel "live" without jittering every tick.

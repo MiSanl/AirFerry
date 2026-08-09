@@ -47,8 +47,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private readonly object _lifecycleGate = new();
     private Task<RecoveryResult?>? _recoveryCoreTask;
     private Task _deferredCleanupTask = Task.CompletedTask;
-    private readonly object _codeActivityGate = new();
-    private readonly Dictionary<int, long> _codeActivity = [];
     private readonly Queue<RateSample> _rateSamples = new();
     private long _transferStartTimestamp;
     private long _decodePerSecond;
@@ -56,8 +54,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int PreviewFps = 15;
     private const int RateWindowSeconds = 3;
     private const int RateMinMilliseconds = 500;
-    private const int CodeActiveSeconds = 2;
-    private const int CenterCodeSlot = -1;
 
     private sealed record AssembledPayload(
         byte[] Bytes,
@@ -115,9 +111,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private string _transferMetricsText = "解码 0 符号/秒 · 有效 0 B/s · 用时 00:00";
-
-    [ObservableProperty]
-    private string _codeStatusText = "二维码：等待定位…";
 
     /// <summary>Raised when a transfer finishes recovering — carries the result.</summary>
     public event Action<RecoveryResult>? TransferCompleted;
@@ -440,7 +433,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// Per-frame ingest callback (runs under <see cref="QrDecodePool.IngestLock"/>).
     /// Returns true when this symbol completes recovery.
     /// </summary>
-    private bool OnDecoded(byte[] payload, int[]? bbox)
+    private bool OnDecoded(byte[] payload, int[]? _)
     {
         QrDecodePool? pool = _pool;
         ReceiverSession? session = _session;
@@ -448,23 +441,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             return false;
         }
-        // Presence means that a syntactically valid AirFerry QR is physically
-        // visible. Before the first descriptor, valid data frames are
-        // intentionally not accepted by ReceiverSession, so waiting for Ingest
-        // would falsely label those decoded tiles as absent.
-        if (FrameHeader.Parse(payload) is null)
-        {
-            return false;
-        }
-        if (bbox is not null && bbox.Length >= 4)
-        {
-            int slot = GridSlotOf(bbox, pool);
-            lock (_codeActivityGate)
-            {
-                _codeActivity[slot] = Stopwatch.GetTimestamp();
-            }
-        }
-
         IngestStatus? status = session.Ingest(payload);
         if (status is null)
         {
@@ -748,7 +724,6 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             ScanMetricsText = $"采集 {pool.CapturedFrames} 帧 · " +
                 $"丢弃 {pool.DroppedFrames} 帧 · 解码 {pool.DecodedSymbols} 码";
-            CodeStatusText = BuildCodeStatus(pool, now);
         }
         if (pool is null || session is null)
         {
@@ -868,68 +843,15 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             : $"{live.FileName} · {original}";
     }
 
-    private string BuildCodeStatus(QrDecodePool pool, long now)
-    {
-        Dictionary<int, long> activity;
-        lock (_codeActivityGate)
-        {
-            activity = new Dictionary<int, long>(_codeActivity);
-        }
-        if (activity.Count == 0)
-        {
-            return "二维码：等待定位…";
-        }
-
-        string Dot(int slot)
-        {
-            if (!activity.TryGetValue(slot, out long lastSeen))
-            {
-                return "·";
-            }
-            return now - lastSeen < Stopwatch.Frequency * CodeActiveSeconds ? "●" : "○";
-        }
-
-        int count = pool.SnapshotMultiCount();
-        int quadrantCount = activity.Keys.Count(slot => slot is >= 0 and <= 3);
-        if (quadrantCount > 0)
-        {
-            count = Math.Clamp(Math.Max(count, quadrantCount), 2, 4);
-        }
-        if (count <= 1)
-        {
-            string dot = Dot(CenterCodeSlot);
-            return $"二维码：{dot} {(dot == "●" ? "活跃" : "暂停")}";
-        }
-        return $"二维码：①{Dot(0)} ②{Dot(1)} ③{Dot(2)} ④{Dot(3)}";
-    }
-
-    private static int GridSlotOf(int[] bbox, QrDecodePool pool)
-    {
-        if (pool.SnapshotMultiCount() <= 1 || pool.FrameWidth <= 0 || pool.FrameHeight <= 0)
-        {
-            return CenterCodeSlot;
-        }
-        long centerX2 = (long)bbox[0] + bbox[2];
-        long centerY2 = (long)bbox[1] + bbox[3];
-        bool right = centerX2 > pool.FrameWidth;
-        bool bottom = centerY2 > pool.FrameHeight;
-        return (bottom ? 2 : 0) + (right ? 1 : 0);
-    }
-
     private void ResetLiveMetrics()
     {
         ScanMetricsText = "采集 0 帧 · 丢弃 0 帧 · 解码 0 码";
         FileSummaryText = "等待描述符…";
         TransferMetricsText = "解码 0 符号/秒 · 有效 0 B/s · 用时 00:00";
-        CodeStatusText = "二维码：等待定位…";
         _rateSamples.Clear();
         _transferStartTimestamp = 0;
         _decodePerSecond = 0;
         _recentWireBytesPerSecond = 0;
-        lock (_codeActivityGate)
-        {
-            _codeActivity.Clear();
-        }
     }
 
     private static string FormatBytes(ulong bytes)

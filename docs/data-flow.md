@@ -107,5 +107,5 @@
               decoded_fraction, loss_ratio, ... }
         │
         ▼ (JSON / 位域，UI 节流 ~7Hz)
-   进度条 + 3 秒窗口解码速率 + 有效吞吐 + 文件大小 + 多码 active/paused
+   进度条 + 3 秒窗口解码速率 + 有效吞吐 + 文件大小
 ```

@@ -289,7 +289,7 @@ npm run preview        # 本地预览构建产物
 1. 把上表版本（含 `windows.yml` 的 `VER`）改到目标版本（如 `1.1.1`），提交并推 `main`。
 2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`（若尚无 tag，workflow 会 **draft** 创建，之后可补 notes/其它 asset）。
 3. GitHub → Actions → **windows** → **Run workflow**（`workflow_dispatch`）。
-4. 跑完后 Release 上应有 `airferry-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset，资产标签明确写“Windows 接收端”）。
+4. 跑完后 Release 上应有 `airferry-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset，资产标签固定为 `接收端-Windows-x64`）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
 
@@ -355,7 +355,6 @@ npm run preview        # 本地预览构建产物
 | 帧头解析（Kotlin 侧） | `app/.../scan/ReceiverSessionManager.kt:99` | `parseHeader`：60B 大端 |
 | ZXing JNI 桥（Kotlin） | `app/.../scan/ZxingDecoder.kt` | 单码/多码/ROI 解码 |
 | **ZXing-C++ JNI（native）** | `app/src/main/cpp/scan_jni.cpp` | 完整保留 v1.1.3 解码实现（TryHarder/TryInvert、全帧/ROI/多码打包）；CMake 仍把 ZXing v3.0.2 固定到不可变 commit |
-| 多码显示状态 | `app/.../scan/QrPresence.kt` + `ScanActivity.kt` | bbox 按 CameraX 0/90/180/270° 映射到可见四宫格；有效帧在 ingest 前记录，250ms UI 时钟让消失的码在 2s 后变为暂停，即使完全没有新帧也会刷新 |
 | 多文件包解包 | `app/.../scan/BundleParser.kt` | 恢复后拆包（ETBUNDL1） |
 | **文字载荷解析** | `app/.../scan/TextParser.kt` | `isText`/`parse`（ETTEXTv1 → UTF-8）；字节级镜像 TS `text.ts` 与 C# `TextParser.cs` |
 | **文本类启发式** | `app/.../scan/TextLike.kt` | 扩展名 + `decodeUtf8Strict`；与 Windows `FileNameUtil.IsTextLikeName` 对齐 |
@@ -381,7 +380,7 @@ npm run preview        # 本地预览构建产物
 | 分享导出 | `apps/windows/AirFerry.Windows/Bundle/ShareExport.cs` | 不暴露无扩展名 hash blob；生成带逻辑名的临时副本、写 MOTW，并在启动/下次分享时清理超过 24 小时的受控 GUID 目录 |
 | **文字载荷解析** | `apps/windows/AirFerry.Windows/Bundle/TextParser.cs` | `IsText`/`Parse`（ETTEXTv1 → UTF-8）；字节级镜像 TS `text.ts` 与 Kotlin `TextParser.kt`。有跨平台单测 `TextParserTests.cs` |
 | 文件名 sanitize | `apps/windows/AirFerry.Windows/Bundle/FileNameUtil.cs` | + Windows 保留名（CON/PRN/COM1-9）处理 |
-| 主状态机 | `apps/windows/AirFerry.Windows/ViewModels/ScanViewModel.cs` | 编排单源采集→解码池/预览→会话→恢复→落盘；7Hz UI 快照展示 3 秒窗口解码/有效吞吐、源/传输大小及多码 active/paused。停止以 session epoch 作废旧 UI 回调；前台最多等 2 秒，超时则保留资源并由单一后台任务按 producer→recovery→workers→native/camera 顺序安全释放，完成前禁止重启；`RecoverAndStage` 按 text→bundle→单文件顺序分流 |
+| 主状态机 | `apps/windows/AirFerry.Windows/ViewModels/ScanViewModel.cs` | 编排单源采集→解码池/预览→会话→恢复→落盘；7Hz UI 快照展示 3 秒窗口解码/有效吞吐和源/传输大小。停止以 session epoch 作废旧 UI 回调；前台最多等 2 秒，超时则保留资源并由单一后台任务按 producer→recovery→workers→native/camera 顺序安全释放，完成前禁止重启；`RecoverAndStage` 按 text→bundle→单文件顺序分流 |
 | UI | `apps/windows/AirFerry.Windows/Views/*.xaml` | Scan/DeviceSelect/ReceiveDetail/ReceiveText/ReceiveBundle/FileList/Settings；Scan 的安全停止等待移出 Dispatcher，停止后可原地继续 |
 | **文字接收页（可复制/保存 .txt）** | `apps/windows/AirFerry.Windows/Views/ReceiveTextView.xaml` | `Clipboard.SetText` + SaveFileDialog UTF-8；RecoveryResult 新增 `Text`/`IsText` |
 

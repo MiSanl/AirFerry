@@ -351,7 +351,6 @@ public partial class ScanView : Page
         ProgressText.Text = $"{_vm.ReceivedSymbolsText} / {_vm.TotalSymbolsText}";
         ScanMetricsText.Text = _vm.ScanMetricsText;
         TransferMetricsText.Text = _vm.TransferMetricsText;
-        CodeStatusText.Text = _vm.CodeStatusText;
         DrawProgressRing(_vm.Progress);
     }
 }

@@ -81,11 +81,6 @@
                                FontSize="12"
                                Foreground="{StaticResource TextSecondary}"
                                Margin="0,4,0,0" />
-                    <TextBlock x:Name="CodeStatusText"
-                               Text="二维码：等待定位…"
-                               FontSize="12"
-                               Foreground="{StaticResource TextSecondary}"
-                               Margin="0,4,0,0" />
                     <TextBlock x:Name="ScanMetricsText"
                                Text="采集 0 帧 · 丢弃 0 帧 · 解码 0 码"
                                FontSize="12"
