@@ -38,6 +38,11 @@ body {
 .step-dot { width: 24px; height: 24px; border-radius: 50%; border: 2px solid currentColor; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; }
 .step-line { flex: 1; height: 2px; background: var(--color-border); margin: 0 8px; }
 .app-main { background: var(--color-card); border-radius: var(--radius); padding: 32px; box-shadow: var(--shadow); min-height: 400px; }
+.app-footer { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; margin-top: 20px; font-size: 13px; color: var(--color-text-muted); }
+.app-footer-hint { color: var(--color-text-muted); }
+.app-footer-sep { color: var(--color-text-muted); }
+.app-footer-link { color: var(--color-primary); text-decoration: none; }
+.app-footer-link:hover { color: var(--color-primary-hover); text-decoration: underline; }
 .page h2 { margin: 0 0 24px; font-size: 20px; }
 .dropzone { border: 2px dashed var(--color-border); border-radius: var(--radius); padding: 64px 24px; text-align: center; cursor: pointer; transition: all 0.2s; }
 .dropzone:hover, .dropzone.drag { border-color: var(--color-primary); background: var(--color-primary-light); }

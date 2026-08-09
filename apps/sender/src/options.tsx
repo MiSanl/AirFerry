@@ -539,6 +539,26 @@ export default function App() {
           />
         )}
       </main>
+      <footer className="app-footer">
+        <span className="app-footer-hint">需要接收文件？下载手机 / 电脑扫码端：</span>
+        <a
+          className="app-footer-link"
+          href="https://github.com/UR-SillyB/AirFerry/releases/latest"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          下载扫码端
+        </a>
+        <span className="app-footer-sep">·</span>
+        <a
+          className="app-footer-link"
+          href="https://github.com/UR-SillyB/AirFerry"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          项目地址
+        </a>
+      </footer>
       {/* Compress progress overlay — shown while the worker prepares the file.
           The worker keeps the main thread free, so this spinner animates even
           during the slow xz pass. */}
