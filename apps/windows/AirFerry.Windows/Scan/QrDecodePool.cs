@@ -1,112 +1,89 @@
+using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using OpenCvSharp;
-using ZXing;
 
 namespace AirFerry.Windows.Scan;
 
 /// <summary>
-/// Decouples video capture from QR decoding + native ingest — the Windows
-/// counterpart of Android's <c>QrDecodePool.kt</c>. A single producer thread
-/// pulls frames from <see cref="VideoCapture"/> and enqueues each as a pooled
-/// grayscale buffer; N worker threads drain the queue and run ZXing.Net on each
-/// frame. Every decoded payload is handed to <see cref="OnDecoded"/> under a
-/// single <see cref="IngestLock"/>, so the non-thread-safe native receiver
-/// (<see cref="ReceiverSession"/>) is only ever touched by one thread at a
-/// time — exactly like Android's <c>ingestLock</c>.
+/// Bounded, parallel QR decode pipeline. It mirrors Android's implementation:
+/// pooled luminance frames, 2–6 workers, multi-code bbox tracking, native
+/// ZXing-C++ region decodes, periodic full-frame re-lock, batched serialized
+/// ingest, and drop-newest backpressure.
 /// </summary>
-/// <remarks>
-/// <para>
-/// <b>Why batch the ingest:</b> the single hottest contention point in the
-/// pipeline is the serialized ingest lock (it guards a non-thread-safe native
-/// handle). Accumulating <see cref="IngestBatch"/> symbols before acquiring the
-/// lock cuts lock/fence traffic by the batch factor, directly raising
-/// steady-state symbol throughput. The <see cref="OnDecoded"/> callback is
-/// self-defending: it checks <see cref="_ingestStopped"/> at its top, so once a
-/// symbol completes recovery every later symbol (in the same batch or any future
-/// frame) is skipped — no batch-aware stop logic needed in the pool.
-/// </para>
-/// <para>
-/// <b>Drop-newest backpressure:</b> fountain symbols are independent, so
-/// dropping the freshest frame when the queue is full is harmless and never
-/// stalls the camera — matches Android's <c>ArrayBlockingQueue</c> + drop policy.
-/// </para>
-/// <para>
-/// <b>Multi-QR:</b> the first version uses full-frame <c>DecodeMultiple</c>
-/// (no ROI tracking optimization). Desktop CPUs are faster than phones and
-/// capture-card frame rates are typically 30-60 fps, so the finder scan cost is
-/// acceptable. The tracked-ROI optimization from Android is a future enhancement.
-/// </para>
-/// </remarks>
 public sealed class QrDecodePool : IDisposable
 {
-    /// <summary>
-    /// Worker count mirrors Android's <c>(cores - 3).clamp(2, 6)</c>: subtract 3
-    /// for the producer, UI thread, and ingest path overhead.
-    /// </summary>
     public int WorkerCount { get; } = Math.Clamp(Environment.ProcessorCount - 3, 2, 6);
 
-    /// <summary>
-    /// Symbols accumulated per worker before acquiring <see cref="IngestLock"/> —
-    /// cuts lock contention by this factor. Matches Android's <c>INGEST_BATCH</c>.
-    /// </summary>
     private const int IngestBatch = 4;
-
-    /// <summary>
-    /// Maximum frames buffered between producer and workers. Drop-newest when full.
-    /// Mirrors Android's <c>ArrayBlockingQueue(workerCount + 2)</c>.
-    /// </summary>
-    private readonly int _queueCapacity;
+    private const int MultiFullDecodeEvery = 3;
+    private const int MultiDiscoveryEvery = 30;
+    private const int MaxMultiCodes = 4;
+    private const float TrackMargin = 0.35F;
 
     private readonly BlockingCollection<GrayFrame> _queue;
     private readonly List<Thread> _workers = [];
     private readonly CancellationTokenSource _cts = new();
+    private readonly Func<byte[], int[]?, bool> _onDecoded;
+    private readonly object _trackingGate = new();
     private volatile bool _running;
     private int _disposed;
 
-    // Metrics (read by the UI for live diagnostics).
     private long _capturedFrames;
     private long _droppedFrames;
-    /// <summary>Count of decoded symbols (QR codes), not frames.</summary>
     private long _decodedSymbols;
+    private long _multiMisses;
+    private long _multiHotScans;
+    private int _frameWidth;
+    private int _frameHeight;
+    private int[]? _multiTrackedBboxes;
+    private int _multiLockedCount;
 
-    /// <summary>
-    /// Set true the instant recovery completes, so every later <see cref="OnDecoded"/>
-    /// call short-circuits. The main thread reads it before assembling the file
-    /// to guarantee the <c>&amp;</c> borrow can't race a worker's <c>&amp;mut</c> ingest.
-    /// </summary>
     internal volatile bool IngestStopped;
-
-    /// <summary>
-    /// Serialized ingest lock — every <see cref="ReceiverSession"/> call goes
-    /// through here. Also guards the final assemble (see <see cref="RunExclusive"/>).
-    /// </summary>
     internal readonly object IngestLock = new();
 
-    /// <summary>The callback invoked (under <see cref="IngestLock"/>) per decoded QR.</summary>
-    private readonly Func<byte[], bool> _onDecoded;
-
-    /// <summary>A captured grayscale frame; <see cref="Pixels"/> is a pooled buffer.</summary>
-    private sealed class GrayFrame(byte[] pixels, int width, int height)
+    private sealed class GrayFrame : IDisposable
     {
-        public byte[] Pixels { get; } = pixels;
-        public int Width { get; } = width;
-        public int Height { get; } = height;
+        private byte[]? _pixels;
+
+        internal GrayFrame(byte[] pixels, int length, int width, int height, int rowStride)
+        {
+            _pixels = pixels;
+            Length = length;
+            Width = width;
+            Height = height;
+            RowStride = rowStride;
+        }
+
+        internal byte[] Pixels => Volatile.Read(ref _pixels) ??
+            throw new ObjectDisposedException(nameof(GrayFrame));
+        internal int Length { get; }
+        internal int Width { get; }
+        internal int Height { get; }
+        internal int RowStride { get; }
+
+        public void Dispose()
+        {
+            byte[]? pixels = Interlocked.Exchange(ref _pixels, null);
+            if (pixels is not null)
+            {
+                ArrayPool<byte>.Shared.Return(pixels);
+            }
+        }
     }
+
+    private readonly record struct PendingSymbol(byte[] Payload, int[] Bbox);
 
     public long CapturedFrames => Interlocked.Read(ref _capturedFrames);
     public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
     public long DecodedSymbols => Interlocked.Read(ref _decodedSymbols);
+    public int FrameWidth => Volatile.Read(ref _frameWidth);
+    public int FrameHeight => Volatile.Read(ref _frameHeight);
 
-    /// <param name="onDecoded">
-    /// Invoked under <see cref="IngestLock"/> with each decoded QR payload.
-    /// Returns true if this symbol completed recovery (the pool then stops
-    /// ingesting further symbols).
-    /// </param>
-    public QrDecodePool(Func<byte[], bool> onDecoded)
+    public QrDecodePool(Func<byte[], int[]?, bool> onDecoded)
     {
         _onDecoded = onDecoded;
-        _queueCapacity = WorkerCount + 2;
-        _queue = new BlockingCollection<GrayFrame>(_queueCapacity);
+        _queue = new BlockingCollection<GrayFrame>(WorkerCount + 2);
     }
 
     public void Start()
@@ -116,142 +93,302 @@ public sealed class QrDecodePool : IDisposable
             return;
         }
         _running = true;
-        for (int i = 0; i < WorkerCount; i++)
+        for (int index = 0; index < WorkerCount; index++)
         {
-            var t = new Thread(() => WorkerLoop(_cts.Token))
+            var worker = new Thread(() => WorkerLoop(_cts.Token))
             {
                 IsBackground = true,
-                Name = $"qr-decode-{i}",
+                Name = $"qr-decode-{index}",
             };
-            _workers.Add(t);
-            t.Start();
+            _workers.Add(worker);
+            worker.Start();
         }
     }
 
     /// <summary>
-    /// Producer entry: copy a grayscale Mat's pixels into a fresh buffer and
-    /// enqueue it. Drop-newest when the queue is full. Returns false (does not
-    /// throw) if the pool is stopped/disposed.
+    /// Copy a reusable OpenCV Gray Mat into one pooled compact luminance buffer.
+    /// The native decoder reads this buffer in place; there is no second managed
+    /// frame allocation in the worker.
     /// </summary>
-    /// <remarks>
-    /// We clone the Mat's pixels because the <see cref="VideoCapture"/> reuses
-    /// its internal Mat across reads; the worker may not run before the next
-    /// frame overwrites it.
-    /// </remarks>
     public bool Submit(Mat gray)
     {
-        if (!_running || _disposed != 0)
+        if (!_running || Volatile.Read(ref _disposed) != 0 || gray.Empty() ||
+            gray.Type() != MatType.CV_8UC1 || gray.Width <= 0 || gray.Height <= 0)
         {
             return false;
         }
-        if (gray.Empty() || gray.Width <= 0 || gray.Height <= 0)
-        {
-            return false;
-        }
+
         Interlocked.Increment(ref _capturedFrames);
         int width = gray.Width;
         int height = gray.Height;
-        // Extract the grayscale pixels. GetArray returns the raw pixel bytes for
-        // a CV_8UC1 Mat; it allocates a new array internally, but that's the
-        // buffer we hand to the decoder — no separate copy needed.
-        if (!gray.GetArray(out byte[]? pixels) || pixels is null)
+        Volatile.Write(ref _frameWidth, width);
+        Volatile.Write(ref _frameHeight, height);
+        int rowStride = width;
+        int length = checked(rowStride * height);
+        int sourceStride = checked((int)gray.Step());
+        if (sourceStride < width)
         {
             Interlocked.Increment(ref _droppedFrames);
             return false;
         }
-        // The common case is step == width, so GetArray already gave us a
-        // width*height buffer. For padded Mats GetArray still returns a compact
-        // width*height array (OpenCvSharp strips the stride), so no extra handling.
-        var frame = new GrayFrame(pixels, width, height);
-        if (!_queue.TryAdd(frame, 0))
+
+        byte[] pixels = ArrayPool<byte>.Shared.Rent(length);
+        try
         {
-            // Drop-newest: a full queue means workers can't keep up; the freshest
-            // frame is least likely to carry a still-missing symbol, so drop it.
-            Interlocked.Increment(ref _droppedFrames);
-            return false;
+            if (sourceStride == rowStride)
+            {
+                Marshal.Copy(gray.Data, pixels, 0, length);
+            }
+            else
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    Marshal.Copy(IntPtr.Add(gray.Data, checked(y * sourceStride)),
+                        pixels, checked(y * rowStride), width);
+                }
+            }
         }
-        return true;
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(pixels);
+            throw;
+        }
+
+        var frame = new GrayFrame(pixels, length, width, height, rowStride);
+        try
+        {
+            if (_queue.TryAdd(frame, 0))
+            {
+                return true;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // CompleteAdding raced this submit during shutdown.
+        }
+        Interlocked.Increment(ref _droppedFrames);
+        frame.Dispose();
+        return false;
     }
 
-    private void WorkerLoop(CancellationToken ct)
+    private void WorkerLoop(CancellationToken cancellationToken)
     {
-        // Per-worker reader (ZXing BarcodeReader is not thread-safe).
-        BarcodeReader<LuminanceSource> reader = ZxingDecoder.CreateReader();
-        var pending = new List<byte[]>(IngestBatch);
-
-        while (_running && !ct.IsCancellationRequested)
+        var pending = new List<PendingSymbol>(IngestBatch);
+        while (_running && !cancellationToken.IsCancellationRequested)
         {
-            if (!_queue.TryTake(out GrayFrame? frame, 200, ct))
-            {
-                continue;
-            }
+            GrayFrame? frame;
             try
             {
-                // Build a luminance source straight over the extracted pixels —
-                // no need to reconstruct a Mat (the producer already extracted a
-                // compact width*height byte[] via Mat.GetArray).
-                var source = new MatLuminanceSource(frame.Pixels, frame.Width, frame.Height);
-                List<byte[]> results = ZxingDecoder.DecodeMultiple(reader, source);
-                if (results.Count > 0)
+                if (!_queue.TryTake(out frame, 200, cancellationToken))
                 {
-                    Interlocked.Add(ref _decodedSymbols, results.Count);
-                    pending.AddRange(results);
+                    continue;
                 }
-                // Flush the batch under one lock acquire when it fills, or when
-                // the queue has run dry (drain eagerly so latency stays low).
-                if (pending.Count >= IngestBatch || (pending.Count > 0 && _queue.Count == 0))
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            try
+            {
+                List<ZxingDecoder.MultiResult> decoded = DecodeMultiTracked(frame);
+                if (decoded.Count > 0)
                 {
-                    lock (IngestLock)
+                    Interlocked.Add(ref _decodedSymbols, decoded.Count);
+                    foreach (ZxingDecoder.MultiResult result in decoded)
                     {
-                        foreach (byte[] payload in pending)
-                        {
-                            if (IngestStopped)
-                            {
-                                break;
-                            }
-                            if (_onDecoded(payload))
-                            {
-                                // Completion signaled — stop ingesting the rest.
-                                IngestStopped = true;
-                                break;
-                            }
-                        }
+                        pending.Add(new PendingSymbol(result.Payload, result.Bbox));
                     }
-                    pending.Clear();
+                }
+                if (pending.Count >= IngestBatch ||
+                    (pending.Count > 0 && _queue.Count == 0))
+                {
+                    FlushPending(pending);
                 }
             }
             catch
             {
-                // Never let a worker die on one bad frame. Drop an un-flushed
-                // batch too so a poisoned symbol can't stall the next iteration.
                 pending.Clear();
+            }
+            finally
+            {
+                frame.Dispose();
             }
         }
 
-        // Worker shutting down: flush anything still pending so we never lose
-        // the tail of a transfer to a pool teardown.
         if (pending.Count > 0)
         {
-            lock (IngestLock)
-            {
-                foreach (byte[] payload in pending)
-                {
-                    if (IngestStopped)
-                    {
-                        break;
-                    }
-                    _onDecoded(payload);
-                }
-            }
-            pending.Clear();
+            FlushPending(pending);
         }
     }
 
-    /// <summary>
-    /// Run <paramref name="action"/> under <see cref="IngestLock"/> — used by the
-    /// scan VM to run the final assemble with the same lock that serializes
-    /// ingest, preventing any straggler worker from racing the <c>&amp;</c> borrow.
-    /// </summary>
+    private void FlushPending(List<PendingSymbol> pending)
+    {
+        lock (IngestLock)
+        {
+            foreach (PendingSymbol symbol in pending)
+            {
+                if (IngestStopped)
+                {
+                    break;
+                }
+                if (_onDecoded(symbol.Payload, symbol.Bbox))
+                {
+                    IngestStopped = true;
+                    break;
+                }
+            }
+        }
+        pending.Clear();
+    }
+
+    private List<ZxingDecoder.MultiResult> DecodeMultiTracked(GrayFrame frame)
+    {
+        int[]? tracked;
+        int lockedCount;
+        lock (_trackingGate)
+        {
+            tracked = _multiTrackedBboxes;
+            lockedCount = _multiLockedCount;
+        }
+
+        if (tracked is not null && lockedCount > 0)
+        {
+            List<ZxingDecoder.MultiResult> regionResults = ZxingDecoder.DecodeMulti(
+                frame.Pixels, frame.Length, frame.Width, frame.Height, frame.RowStride,
+                tracked, lockedCount, TrackMargin);
+            if (regionResults.Count > 0)
+            {
+                UpdateTrackedSlots(regionResults);
+                Interlocked.Exchange(ref _multiMisses, 0);
+                // The first full-frame pass can lock only one tile of a 4-code
+                // display. A permanently successful ROI would otherwise prevent
+                // miss-based re-lock and cap throughput at one code per frame.
+                bool discoveryDue = lockedCount < MaxMultiCodes &&
+                    Interlocked.Increment(ref _multiHotScans) % MultiDiscoveryEvery == 0;
+                if (!discoveryDue)
+                {
+                    return regionResults;
+                }
+                List<ZxingDecoder.MultiResult> discovered = DecodeMultiFull(frame);
+                if (discovered.Count > lockedCount)
+                {
+                    SeedTrackedSlots(discovered);
+                    return discovered;
+                }
+                return regionResults;
+            }
+
+            long misses = Interlocked.Increment(ref _multiMisses);
+            if (misses % MultiFullDecodeEvery != 0)
+            {
+                return [];
+            }
+        }
+
+        List<ZxingDecoder.MultiResult> fullResults = DecodeMultiFull(frame);
+        if (fullResults.Count > 0)
+        {
+            SeedTrackedSlots(fullResults);
+            Interlocked.Exchange(ref _multiMisses, 0);
+        }
+        return fullResults;
+    }
+
+    private static List<ZxingDecoder.MultiResult> DecodeMultiFull(GrayFrame frame) =>
+        ZxingDecoder.DecodeMulti(
+            frame.Pixels, frame.Length, frame.Width, frame.Height, frame.RowStride,
+            hints: null, hintCount: 0, marginFraction: TrackMargin);
+
+    private void SeedTrackedSlots(IReadOnlyList<ZxingDecoder.MultiResult> results)
+    {
+        if (results.Count == 0)
+        {
+            return;
+        }
+        int[] packed = new int[results.Count * 4];
+        for (int index = 0; index < results.Count; index++)
+        {
+            Array.Copy(results[index].Bbox, 0, packed, index * 4, 4);
+        }
+        lock (_trackingGate)
+        {
+            // Never shrink a multi-code lock because one full-frame pass was
+            // partially blurred. Stale slots are more useful than losing those
+            // codes until a future complete discovery scan.
+            if (results.Count < _multiLockedCount)
+            {
+                return;
+            }
+            _multiTrackedBboxes = packed;
+            _multiLockedCount = results.Count;
+            Interlocked.Exchange(ref _multiHotScans, 0);
+        }
+    }
+
+    private void UpdateTrackedSlots(IReadOnlyList<ZxingDecoder.MultiResult> results)
+    {
+        lock (_trackingGate)
+        {
+            int[]? old = _multiTrackedBboxes;
+            int count = _multiLockedCount;
+            if (old is null || count == 0)
+            {
+                SeedTrackedSlots(results);
+                return;
+            }
+
+            int[] updated = (int[])old.Clone();
+            bool[] claimed = new bool[count];
+            foreach (ZxingDecoder.MultiResult result in results)
+            {
+                int centerX = (result.Bbox[0] + result.Bbox[2]) / 2;
+                int centerY = (result.Bbox[1] + result.Bbox[3]) / 2;
+                int bestSlot = -1;
+                long bestDistance = long.MaxValue;
+                for (int slot = 0; slot < count; slot++)
+                {
+                    if (claimed[slot])
+                    {
+                        continue;
+                    }
+                    int oldCenterX = (old[slot * 4] + old[slot * 4 + 2]) / 2;
+                    int oldCenterY = (old[slot * 4 + 1] + old[slot * 4 + 3]) / 2;
+                    long dx = (long)centerX - oldCenterX;
+                    long dy = (long)centerY - oldCenterY;
+                    long distance = dx * dx + dy * dy;
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        bestSlot = slot;
+                    }
+                }
+                if (bestSlot >= 0)
+                {
+                    claimed[bestSlot] = true;
+                    Array.Copy(result.Bbox, 0, updated, bestSlot * 4, 4);
+                }
+            }
+            _multiTrackedBboxes = updated;
+        }
+    }
+
+    public int[]? SnapshotMultiBboxes()
+    {
+        lock (_trackingGate)
+        {
+            return _multiTrackedBboxes is null ? null : (int[])_multiTrackedBboxes.Clone();
+        }
+    }
+
+    public int SnapshotMultiCount()
+    {
+        lock (_trackingGate)
+        {
+            return _multiLockedCount;
+        }
+    }
+
     public T RunExclusive<T>(Func<T> action)
     {
         lock (IngestLock)
@@ -269,11 +406,15 @@ public sealed class QrDecodePool : IDisposable
         _running = false;
         _cts.Cancel();
         _queue.CompleteAdding();
-        foreach (Thread t in _workers)
+        foreach (Thread worker in _workers)
         {
-            t.Join(TimeSpan.FromSeconds(2));
+            worker.Join();
         }
         _workers.Clear();
+        while (_queue.TryTake(out GrayFrame? frame))
+        {
+            frame.Dispose();
+        }
     }
 
     public void Dispose()

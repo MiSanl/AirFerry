@@ -1,8 +1,8 @@
 //! Sender-side session orchestration.
 
 use crate::descriptor::FileMeta;
-use crate::{progress::Stats, Error, Result};
 use crate::time::now_ms;
+use crate::{progress::Stats, Error, Result};
 use qr_protocol::{chunker, frame::SessionIdRaw, Frame, SessionId};
 use raptorq_core::{Config, Encoder, ObjectMeta, Symbol};
 use std::vec::Vec;
@@ -14,7 +14,7 @@ pub struct SenderConfig {
     pub codec: Config,
     /// Redundancy ratio in percent (5..=50). **Retained for API/UI
     /// compatibility and frame-count estimation only** — the live stream now
-    /// emits the K source symbols once and then an *unbounded* stream of fresh
+    /// emits the K source symbols once and then a long-lived stream of fresh
     /// repair symbols (see [`build_source_plan`] + [`SenderSession::next_symbol_id`]),
     /// so it no longer bounds how many repair symbols are transmitted.
     pub redundancy_pct: u8,
@@ -26,7 +26,7 @@ impl Default for SenderConfig {
             codec: Config::default(),
             // 25% is a sensible default for the UI frame-count estimate under
             // real camera-scan conditions (the receiver commonly reports 30–50%
-            // frame loss). NOTE: with the unbounded fresh-repair emitter this no
+            // frame loss). NOTE: with the fresh-repair emitter this no
             // longer caps the stream — the sender keeps producing new repair
             // symbols until the receiver completes — it only drives the on-screen
             // time/throughput estimate.
@@ -66,7 +66,7 @@ pub struct SenderSession {
     source_plan: Vec<(u32, u32)>,
     /// Cursor into `source_plan` during the initial source pass.
     source_cursor: usize,
-    /// Monotonic counter driving the unbounded fresh-repair phase. It
+    /// Monotonic counter driving the fresh-repair phase. It
     /// round-robins across blocks (`% nblocks`) with a per-block repair offset
     /// that only ever increases (`/ nblocks`), so every post-source data frame
     /// carries a brand-new symbol the receiver has never seen. This eliminates
@@ -97,6 +97,11 @@ impl SenderSession {
         let padded = chunker::pad_to_symbols(compressed_payload, config.codec);
         let encoder = Encoder::new(&padded, config.codec)?;
         let meta = encoder.meta().clone();
+        // Session construction must guarantee that its mandatory first frame
+        // can actually be emitted. Small symbols or unusually many source
+        // blocks may be valid RaptorQ configurations while being too small for
+        // the current v3 descriptor.
+        crate::descriptor::build_payload(&meta, &file_meta)?;
         let total_k: u32 = meta.blocks.iter().map(|b| b.num_source_symbols).sum();
 
         let source_plan = build_source_plan(&meta);
@@ -121,12 +126,12 @@ impl SenderSession {
             // while reclaiming ~15% of the wire for real symbols.
             descriptor_interval: 16,
             started: false,
-            start_ms: 0,            // Set on first next_frame() call
+            start_ms: 0, // Set on first next_frame() call
             stats: Stats::default(),
         })
     }
 
-    /// How often (in frames) a descriptor frame is emitted. Default 5.
+    /// How often (in frames) a descriptor frame is emitted. Default 16.
     pub fn set_descriptor_interval(&mut self, interval: u32) {
         self.descriptor_interval = interval.max(1);
     }
@@ -158,7 +163,7 @@ impl SenderSession {
     /// Cadence: a *descriptor frame* every `descriptor_interval` emitted frames
     /// (and always as the very first frame) so late-joining receivers can build
     /// a decoder. Data frames emit the K source symbols once (round-robin across
-    /// blocks) and then an **unbounded** stream of fresh repair symbols — every
+    /// blocks) and then fresh repair symbols up to the 24-bit ESI limit — every
     /// post-source frame is a new symbol, so the receiver never receives a
     /// sender-induced duplicate and recovery progress stays ~linear.
     pub fn next_frame(&mut self) -> Result<Frame> {
@@ -183,12 +188,18 @@ impl SenderSession {
         let interval = self.descriptor_interval.max(1) as u64;
         if self.frame_index == 0 || (self.frame_index > 0 && self.frame_index % interval == 0) {
             self.frame_index = self.frame_index.wrapping_add(1);
-            let frame = crate::descriptor::build_frame(&self.meta, &self.file_meta, self.session_id, self.frame_index, now_ms_val)?;
+            let frame = crate::descriptor::build_frame(
+                &self.meta,
+                &self.file_meta,
+                self.session_id,
+                self.frame_index,
+                now_ms_val,
+            )?;
             self.stats.record_sent(frame.payload.len() as u64);
             return Ok(frame);
         }
 
-        let (sbn, esi) = self.next_symbol_id();
+        let (sbn, esi) = self.next_symbol_id()?;
 
         let symbol = self.fetch_symbol(sbn, esi)?;
         self.frame_index = self.frame_index.wrapping_add(1);
@@ -202,7 +213,7 @@ impl SenderSession {
             esi,
             self.meta.blocks.len() as u32,
             self.total_k,
-            self.config.codec.symbol_size,
+            self.config.codec.symbol_size(),
             self.frame_index,
             now_ms_val,
             &symbol.data,
@@ -226,23 +237,27 @@ impl SenderSession {
     /// Phase 1 — source pass: walk `source_plan` once, emitting each of the K
     /// source symbols a single time (round-robin across blocks).
     ///
-    /// Phase 2 — unbounded fresh repair: round-robin across blocks via
+    /// Phase 2 — fresh repair: round-robin across blocks via
     /// `repair_cursor % nblocks`, with a per-block repair offset
     /// `repair_cursor / nblocks` that increases forever and never wraps back to
     /// an already-sent ESI. Each returned id is therefore unique for the whole
     /// session, so the receiver never sees a sender-induced duplicate — the fix
     /// for the "progress crawls near the end" coupon-collector problem.
-    fn next_symbol_id(&mut self) -> (u32, u32) {
+    fn next_symbol_id(&mut self) -> Result<(u32, u32)> {
         if self.source_cursor < self.source_plan.len() {
             let id = self.source_plan[self.source_cursor];
             self.source_cursor += 1;
-            return id;
+            return Ok(id);
         }
         // `source_plan` is non-empty (guarded in `next_frame`), so there is at
         // least one block.
-        let id = repair_symbol_id(&self.meta.blocks, self.repair_cursor);
-        self.repair_cursor = self.repair_cursor.wrapping_add(1);
-        id
+        let id = repair_symbol_id(&self.meta.blocks, self.repair_cursor)
+            .ok_or(Error::SymbolIdSpaceExhausted)?;
+        self.repair_cursor = self
+            .repair_cursor
+            .checked_add(1)
+            .ok_or(Error::SymbolIdSpaceExhausted)?;
+        Ok(id)
     }
 
     /// Live statistics snapshot (sent frames, fps, throughput, elapsed).
@@ -264,10 +279,14 @@ impl SenderSession {
 /// block-major order: a burst of dropped frames is spread thinly across all
 /// blocks instead of stranding a single block, so every block advances roughly
 /// in lockstep toward its decode threshold. Repair symbols are no longer part of
-/// a precomputed plan — they are generated on demand and without bound by
+/// a precomputed plan — they are generated on demand up to the ESI limit by
 /// [`SenderSession::next_symbol_id`].
 fn build_source_plan(meta: &ObjectMeta) -> Vec<(u32, u32)> {
-    let total_k: usize = meta.blocks.iter().map(|b| b.num_source_symbols as usize).sum();
+    let total_k: usize = meta
+        .blocks
+        .iter()
+        .map(|b| b.num_source_symbols as usize)
+        .sum();
     let mut plan: Vec<(u32, u32)> = Vec::with_capacity(total_k);
     let max_k = meta
         .blocks
@@ -285,20 +304,19 @@ fn build_source_plan(meta: &ObjectMeta) -> Vec<(u32, u32)> {
     plan
 }
 
-/// Compute the `(sbn, esi)` of the `cursor`-th repair symbol in the unbounded
+/// Compute the `(sbn, esi)` of the `cursor`-th repair symbol in the bounded
 /// fresh-repair phase. Round-robins across blocks (`cursor % nblocks`) with a
 /// per-block offset that only ever increases (`cursor / nblocks`), so the
 /// returned id is unique for every distinct `cursor` and the ESI is always ≥ the
 /// block's K (i.e. a repair, never a source, symbol). Callers guarantee `blocks`
 /// is non-empty.
-fn repair_symbol_id(blocks: &[raptorq_core::SourceBlockMeta], cursor: u64) -> (u32, u32) {
+fn repair_symbol_id(blocks: &[raptorq_core::SourceBlockMeta], cursor: u64) -> Option<(u32, u32)> {
     let nblocks = blocks.len() as u64;
     let bi = (cursor % nblocks) as usize;
-    let offset = (cursor / nblocks) as u32;
+    let offset = u32::try_from(cursor / nblocks).ok()?;
     let b = &blocks[bi];
-    // saturating_add is defensive: reaching u32::MAX offsets needs billions of
-    // frames, but we must never wrap back into the source-ESI range.
-    (b.sbn, b.num_source_symbols.saturating_add(offset))
+    let esi = b.num_source_symbols.checked_add(offset)?;
+    (esi < (1 << 24)).then_some((b.sbn, esi))
 }
 
 #[cfg(test)]
@@ -324,7 +342,13 @@ mod tests {
     #[test]
     fn produces_frames_in_sequence() {
         let data = payload(50_000);
-        let mut s = SenderSession::new(&data, SessionId::derive("f", 50_000, 0, &[]), SenderConfig::default(), test_file_meta()).unwrap();
+        let mut s = SenderSession::new(
+            &data,
+            SessionId::derive("f", 50_000, 0, &[]),
+            SenderConfig::default(),
+            test_file_meta(),
+        )
+        .unwrap();
         let f0 = s.next_frame().unwrap();
         assert_eq!(f0.header.session_id, s.session_id());
         assert_eq!(f0.payload.len(), 1024);
@@ -334,10 +358,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_session_when_v3_descriptor_does_not_fit_symbol() {
+        let data = payload(64);
+        let result = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig {
+                codec: Config::new(64).unwrap(),
+                redundancy_pct: 25,
+            },
+            test_file_meta(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(qr_protocol::Error::BufferTooShort { .. }))
+        ));
+    }
+
+    #[test]
     fn emits_frames_indefinitely() {
         let data = payload(2048);
-        let mut s = SenderSession::new(&data, SessionId::zero(), SenderConfig::default(), test_file_meta()).unwrap();
-        // Drive well past the one-shot source pass into the unbounded repair
+        let mut s = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            test_file_meta(),
+        )
+        .unwrap();
+        // Drive well past the one-shot source pass into the fresh-repair
         // phase; next_frame must keep producing frames without panicking.
         let n = s.source_plan.len() * 3 + 500;
         for _ in 0..n {
@@ -352,7 +400,13 @@ mod tests {
     #[test]
     fn no_duplicate_data_frames() {
         let data = payload(20_000);
-        let mut s = SenderSession::new(&data, SessionId::zero(), SenderConfig::default(), test_file_meta()).unwrap();
+        let mut s = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            test_file_meta(),
+        )
+        .unwrap();
         let total_k = s.total_k();
         let mut seen = std::collections::HashSet::new();
         let mut repair_seen = false;
@@ -370,7 +424,10 @@ mod tests {
             let id = (f.header.sbn, f.header.esi);
             assert!(seen.insert(id), "duplicate data frame id emitted: {id:?}");
         }
-        assert!(repair_seen, "repair symbols (esi >= K) must be emitted after the source pass");
+        assert!(
+            repair_seen,
+            "repair symbols (esi >= K) must be emitted after the source pass"
+        );
     }
 
     /// Source symbols must be interleaved round-robin across blocks (esi-major
@@ -389,9 +446,21 @@ mod tests {
             symbol_size: 1024,
             oti_bytes: [0u8; 12],
             blocks: vec![
-                SourceBlockMeta { sbn: 0, num_source_symbols: 10, block_length: 10 * 1024 },
-                SourceBlockMeta { sbn: 1, num_source_symbols: 10, block_length: 10 * 1024 },
-                SourceBlockMeta { sbn: 2, num_source_symbols: 10, block_length: 10 * 1024 },
+                SourceBlockMeta {
+                    sbn: 0,
+                    num_source_symbols: 10,
+                    block_length: 10 * 1024,
+                },
+                SourceBlockMeta {
+                    sbn: 1,
+                    num_source_symbols: 10,
+                    block_length: 10 * 1024,
+                },
+                SourceBlockMeta {
+                    sbn: 2,
+                    num_source_symbols: 10,
+                    block_length: 10 * 1024,
+                },
             ],
         };
         let plan = build_source_plan(&meta);
@@ -401,17 +470,30 @@ mod tests {
 
         // Round-robin: first 3 symbols must be esi=0 of each of the 3 blocks.
         let first_round = &source_plan[..3];
-        let sbns: std::collections::HashSet<u32> = first_round.iter().map(|(sbn, _)| *sbn).collect();
-        assert_eq!(sbns.len(), 3, "first round should cover all 3 blocks once, got {:?}", first_round);
-        assert!(first_round.iter().all(|(_, esi)| *esi == 0), "first round should all be esi=0");
+        let sbns: std::collections::HashSet<u32> =
+            first_round.iter().map(|(sbn, _)| *sbn).collect();
+        assert_eq!(
+            sbns.len(),
+            3,
+            "first round should cover all 3 blocks once, got {:?}",
+            first_round
+        );
+        assert!(
+            first_round.iter().all(|(_, esi)| *esi == 0),
+            "first round should all be esi=0"
+        );
 
         // The old block-major order would emit sbn=0 ten times in a row.
         // Round-robin must NOT — consecutive entries must differ in sbn.
         let consecutive_same = first_round.windows(2).all(|w| w[0].0 == w[1].0);
-        assert!(!consecutive_same, "plan is block-major, not interleaved: {:?}", first_round);
+        assert!(
+            !consecutive_same,
+            "plan is block-major, not interleaved: {:?}",
+            first_round
+        );
     }
 
-    /// The unbounded fresh-repair phase, exercised directly on a multi-block
+    /// The fresh-repair phase, exercised directly on a multi-block
     /// object with **unequal** per-block K. Real payloads stay single-block until
     /// ~56k symbols (RaptorQ partitioning), so the cross-block round-robin in
     /// `repair_symbol_id` is otherwise never exercised by the end-to-end tests.
@@ -421,21 +503,52 @@ mod tests {
     fn repair_round_robin_multiblock_unique_and_fair() {
         use raptorq_core::SourceBlockMeta;
         let blocks = vec![
-            SourceBlockMeta { sbn: 0, num_source_symbols: 5, block_length: 5 * 1024 },
-            SourceBlockMeta { sbn: 1, num_source_symbols: 8, block_length: 8 * 1024 },
-            SourceBlockMeta { sbn: 2, num_source_symbols: 3, block_length: 3 * 1024 },
+            SourceBlockMeta {
+                sbn: 0,
+                num_source_symbols: 5,
+                block_length: 5 * 1024,
+            },
+            SourceBlockMeta {
+                sbn: 1,
+                num_source_symbols: 8,
+                block_length: 8 * 1024,
+            },
+            SourceBlockMeta {
+                sbn: 2,
+                num_source_symbols: 3,
+                block_length: 3 * 1024,
+            },
         ];
         let mut seen = std::collections::HashSet::new();
         let mut per_block = [0u32; 3];
         for cursor in 0..3000u64 {
-            let (sbn, esi) = repair_symbol_id(&blocks, cursor);
+            let (sbn, esi) = repair_symbol_id(&blocks, cursor).unwrap();
             let k = blocks[sbn as usize].num_source_symbols;
-            assert!(esi >= k, "esi {esi} below K {k} for block {sbn} (must be a repair symbol)");
+            assert!(
+                esi >= k,
+                "esi {esi} below K {k} for block {sbn} (must be a repair symbol)"
+            );
             assert!(seen.insert((sbn, esi)), "duplicate repair id ({sbn},{esi})");
             per_block[sbn as usize] += 1;
         }
         // 3000 / 3 = 1000 each; round-robin must serve every block equally.
-        assert_eq!(per_block, [1000, 1000, 1000], "repair not round-robin: {per_block:?}");
+        assert_eq!(
+            per_block,
+            [1000, 1000, 1000],
+            "repair not round-robin: {per_block:?}"
+        );
+    }
+
+    #[test]
+    fn repair_id_stops_at_rfc_24_bit_boundary() {
+        use raptorq_core::SourceBlockMeta;
+        let blocks = vec![SourceBlockMeta {
+            sbn: 0,
+            num_source_symbols: 5,
+            block_length: 5 * 1024,
+        }];
+        assert!(repair_symbol_id(&blocks, (1 << 24) - 5 - 1).is_some());
+        assert!(repair_symbol_id(&blocks, (1 << 24) - 5).is_none());
     }
 
     /// The default descriptor interval should be high enough that descriptors
@@ -443,16 +556,26 @@ mod tests {
     #[test]
     fn default_descriptor_interval_is_efficient() {
         let data = payload(50_000);
-        let s = SenderSession::new(&data, SessionId::zero(), SenderConfig::default(), test_file_meta()).unwrap();
+        let s = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            test_file_meta(),
+        )
+        .unwrap();
         // <=20% of the wire for descriptors means interval >= 5; we default to
         // 16 (~6%), so this guards against accidentally dropping it back to the
         // old wasteful 5.
-        assert!(s.descriptor_interval >= 16, "descriptor interval too low: {}", s.descriptor_interval);
+        assert!(
+            s.descriptor_interval >= 16,
+            "descriptor interval too low: {}",
+            s.descriptor_interval
+        );
     }
 
     /// A receiver that never sees a single source symbol — only fresh repair
     /// symbols — must still recover the object (RaptorQ fountain property). This
-    /// guards the new "source once, then unbounded repair" emitter: a receiver
+    /// guards the new "source once, then fresh repair" emitter: a receiver
     /// that joins after the source pass relies entirely on repair symbols.
     #[test]
     fn repair_only_recovery() {
@@ -461,14 +584,15 @@ mod tests {
         let sid = SessionId::derive("repair", data.len() as u64, 0, &[]);
         // Probe once to learn the padded transfer length, then rebuild with a
         // FileMeta whose compressed_size matches so assemble() trims correctly.
-        let probe = SenderSession::new(&data, sid, SenderConfig::default(), test_file_meta()).unwrap();
+        let probe =
+            SenderSession::new(&data, sid, SenderConfig::default(), test_file_meta()).unwrap();
         let meta = probe.meta().clone();
         let mut fm = test_file_meta();
         fm.compressed_size = meta.transfer_length;
         fm.compressed_size_known = true;
         let mut sender = SenderSession::new(&data, sid, SenderConfig::default(), fm).unwrap();
 
-        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta.clone());
+        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta.clone()).unwrap();
         let mut guard = 0;
         while !rx.is_complete() {
             let frame = sender.next_frame().unwrap();
@@ -486,6 +610,10 @@ mod tests {
             let _ = rx.ingest(parsed);
         }
         let out = rx.assemble().unwrap();
-        assert_eq!(&out[..data.len()], &data[..], "repair-only recovery payload mismatch");
+        assert_eq!(
+            &out[..data.len()],
+            &data[..],
+            "repair-only recovery payload mismatch"
+        );
     }
 }

@@ -25,6 +25,7 @@ dist-standalone/
 apps/sender/build/
 apps/sender/.plasmo/
 apps/sender/assets/icon.png
+apps/web/wasm-pkg/
 .plasmo/
 
 # Android / Gradle
@@ -46,6 +47,7 @@ apps/scanner/captures/
 apps/windows/**/bin/
 apps/windows/**/obj/
 apps/windows/AirFerry.Windows/runtime/*.dll
+apps/windows/native/build/
 apps/windows/.vs/
 
 # IDE

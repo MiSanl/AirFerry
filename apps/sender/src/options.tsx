@@ -47,16 +47,22 @@ const standaloneGlobals = globalThis as {
   __WASM_ZSTD__?: string
 }
 
-const compressWorker = standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGlobals.__WORKER_CODE__
-  ? new Worker(
-      URL.createObjectURL(
-        new Blob([standaloneGlobals.__WORKER_CODE__], { type: "text/javascript" })
-      )
+function createCompressWorker(): Worker {
+  if (standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGlobals.__WORKER_CODE__) {
+    const blobUrl = URL.createObjectURL(
+      new Blob([standaloneGlobals.__WORKER_CODE__], { type: "text/javascript" })
     )
-  : new Worker(
-      new URL("./workers/compress.worker.ts", import.meta.url),
-      { type: "module" }
-    )
+    try {
+      return new Worker(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  }
+  return new Worker(
+    new URL("./workers/compress.worker.ts", import.meta.url),
+    { type: "module" }
+  )
+}
 
 /**
  * Pre-load zstd WASM bytes on the main thread and transfer them to the worker.
@@ -70,15 +76,19 @@ const compressWorker = standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGl
  *    `globalThis.__WASM_ZSTD__` (file:// can't fetch it). Decode directly.
  *  - **Browser extension**: `chrome.runtime.getURL` resolves the packed asset.
  *  - **Plain web page**: resolve relative to the document.
- * If the pre-load fails for any reason the worker still has its own fetch
- * fallback (see compress.ts), so this is an optimization, not a hard dependency.
+ *
+ * Always posts `wasm-init` (with bytes or null) so the worker never parks
+ * forever waiting for zstd — preparePayload already falls back to raw.
  */
-;(async () => {
+async function initializeCompressWorker(worker: Worker): Promise<void> {
+  let bytes: ArrayBuffer | null = null
   try {
-    let bytes: ArrayBuffer | undefined
     if (standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGlobals.__WASM_ZSTD__) {
       // Standalone build: decode the inlined base64 (file:// can't fetch).
-      bytes = base64ToBuffer(standaloneGlobals.__WASM_ZSTD__)
+      // base64ToBuffer returns ArrayBuffer | undefined; coerce to null so the
+      // unified `bytes` slot (ArrayBuffer | null) stays consistent below.
+      const decoded = base64ToBuffer(standaloneGlobals.__WASM_ZSTD__)
+      if (decoded) bytes = decoded
     } else {
       const wasmUrl =
         typeof chrome !== "undefined" && chrome.runtime?.getURL
@@ -88,13 +98,16 @@ const compressWorker = standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGl
       if (resp.ok) bytes = await resp.arrayBuffer()
       else console.warn("Failed to pre-load wasm-zstd.wasm:", resp.status)
     }
-    if (bytes) {
-      compressWorker.postMessage({ type: "wasm-init", zstd: bytes }, [bytes])
-    }
   } catch (e) {
     console.warn("Failed to pre-load wasm-zstd.wasm:", e)
   }
-})()
+  if (bytes) {
+    worker.postMessage({ type: "wasm-init", zstd: bytes }, [bytes])
+  } else {
+    // Still unlock the worker queue; compress may use raw-only.
+    worker.postMessage({ type: "wasm-init", zstd: null })
+  }
+}
 
 export type { Page, PendingItem, TransferConfig }
 
@@ -139,6 +152,16 @@ export interface AppState {
   error: string | null
 }
 
+// wasm-bindgen `free()` is not idempotent: a second call can dereference an
+// already-released native pointer. Keep ownership release idempotent across
+// async epoch exits, React cleanup, and session replacement.
+const freedSessions = new WeakSet<SenderSessionWasm>()
+function freeSenderSession(session: SenderSessionWasm | null | undefined): void {
+  if (!session || freedSessions.has(session)) return
+  freedSessions.add(session)
+  session.free()
+}
+
 /** Materialise pending items as File[] for the file/bundle worker path. */
 function itemsToFiles(items: PendingItem[]): File[] {
   return items.map((it) => {
@@ -176,14 +199,35 @@ export default function App() {
     error: null
   })
 
+  const ownedSessionRef = useRef<SenderSessionWasm | null>(null)
+  const mountedRef = useRef(false)
+  const releaseOwnedSession = useCallback(() => {
+    const session = ownedSessionRef.current
+    ownedSessionRef.current = null
+    freeSenderSession(session)
+  }, [])
+
+  // Track the actual owner independently of React effect dependencies. A
+  // dependency cleanup can run twice under StrictMode and must never free a
+  // still-live session. This mount cleanup only releases the current owner.
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      releaseOwnedSession()
+    }
+  }, [releaseOwnedSession])
+
   /**
    * Epoch for in-flight compress. Bumped when the pending list changes so a
    * late worker `done` cannot apply after the user edited the selection.
-   * `issuedEpoch` is the epoch at postMessage time; results apply only when
-   * `epoch.current === issuedEpoch.current`.
+   * Sent to the worker as `jobId`; worker suppresses posts for stale ids.
+   * Main thread also double-checks `issuedEpoch === epoch` before applying.
    */
   const epoch = useRef(0)
   const issuedEpoch = useRef(-1)
+  const workerRef = useRef<Worker | null>(null)
+  const restartWorkerRef = useRef<() => void>(() => undefined)
   /** Items snapshot at compress start (for prepared.isText). */
   const compressItemsRef = useRef<PendingItem[]>([])
 
@@ -192,6 +236,7 @@ export default function App() {
     // worker result (same as editing the list).
     if (page === "select") {
       epoch.current += 1
+      if (issuedEpoch.current >= 0) restartWorkerRef.current()
       issuedEpoch.current = -1
       setState((s) => ({
         ...s,
@@ -204,13 +249,21 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    let worker: Worker | null = null
+    let disposed = false
     const handler = (e: MessageEvent) => {
       const msg = e.data
       if (!msg || typeof msg.phase !== "string") return
       // Stale: list was edited (or a newer send replaced this one).
-      if (issuedEpoch.current !== epoch.current) return
+      // Prefer jobId from worker when present; fall back to issued epoch.
+      if (typeof msg.jobId === "number") {
+        if (msg.jobId !== epoch.current || issuedEpoch.current !== epoch.current) return
+      } else if (issuedEpoch.current !== epoch.current) {
+        return
+      }
 
       if (msg.phase === "done") {
+        issuedEpoch.current = -1
         const itemsSnap = compressItemsRef.current
         const pureText =
           itemsSnap.length === 1 && itemsSnap[0].kind === "text"
@@ -234,6 +287,7 @@ export default function App() {
           error: null,
         }))
       } else if (msg.phase === "error") {
+        issuedEpoch.current = -1
         setState((s) => ({
           ...s,
           compressPhase: null,
@@ -247,8 +301,55 @@ export default function App() {
         )
       }
     }
-    compressWorker.addEventListener("message", handler)
-    return () => compressWorker.removeEventListener("message", handler)
+
+    const failWorker = (message: string) => {
+      if (disposed) return
+      epoch.current += 1
+      issuedEpoch.current = -1
+      setState((s) => ({
+        ...s,
+        compressPhase: null,
+        error: `文件处理线程失败: ${message}`,
+      }))
+      startWorker()
+    }
+    const errorHandler = (e: ErrorEvent) => {
+      e.preventDefault()
+      failWorker(e.message || "worker crashed")
+    }
+    const messageErrorHandler = () => failWorker("无法解析 worker 消息")
+    const startWorker = () => {
+      worker?.removeEventListener("message", handler)
+      worker?.removeEventListener("error", errorHandler)
+      worker?.removeEventListener("messageerror", messageErrorHandler)
+      worker?.terminate()
+      try {
+        worker = createCompressWorker()
+        workerRef.current = worker
+        worker.addEventListener("message", handler)
+        worker.addEventListener("error", errorHandler)
+        worker.addEventListener("messageerror", messageErrorHandler)
+        void initializeCompressWorker(worker).catch((e) =>
+          failWorker(e instanceof Error ? e.message : String(e))
+        )
+      } catch (e) {
+        worker = null
+        workerRef.current = null
+        setState((s) => ({
+          ...s,
+          compressPhase: null,
+          error: `无法启动文件处理线程: ${e instanceof Error ? e.message : String(e)}`,
+        }))
+      }
+    }
+    restartWorkerRef.current = startWorker
+    startWorker()
+    return () => {
+      disposed = true
+      restartWorkerRef.current = () => undefined
+      worker?.terminate()
+      workerRef.current = null
+    }
   }, [])
 
   /**
@@ -257,7 +358,9 @@ export default function App() {
    * Changing the list invalidates prepared/session and cancels in-flight compress.
    */
   const onItemsChange = useCallback((items: PendingItem[]) => {
+    releaseOwnedSession()
     epoch.current += 1
+    if (issuedEpoch.current >= 0) restartWorkerRef.current()
     issuedEpoch.current = -1
     compressItemsRef.current = []
     setState((s) => ({
@@ -269,41 +372,64 @@ export default function App() {
       error: null,
       page: "select",
     }))
-  }, [])
+  }, [releaseOwnedSession])
 
   /**
    * Explicit send:
-   *  - one text item alone → worker `{ text }` → ETTEXTv1 (receiver copy/share)
-   *  - otherwise → materialise text as .txt Files → worker `{ files }`
+   *  - one text item alone → worker `{ jobId, text, name }` → ETTEXTv1
+   *  - otherwise → materialise text as .txt Files → worker `{ jobId, files }`
    * Re-entry while compressPhase != null is ignored.
+   * `jobId` is the current epoch so the worker can drop superseded jobs.
    */
   const onSend = useCallback(() => {
     const items = state.items
     if (items.length === 0) return
     if (state.compressPhase != null) return
+    const worker = workerRef.current
+    if (!worker) {
+      setState((s) => ({ ...s, error: "文件处理线程尚未就绪，请重试" }))
+      return
+    }
+    // Bump epoch so any prior in-flight job (if re-entry races) is superseded.
+    epoch.current += 1
     const e = epoch.current
     issuedEpoch.current = e
     compressItemsRef.current = items
+    releaseOwnedSession()
     setState((s) => ({
       ...s,
+      session: null,
       compressPhase: "reading",
       error: null,
     }))
     if (items.length === 1 && items[0].kind === "text") {
-      compressWorker.postMessage({ text: items[0].content })
+      // Carry the user-chosen filename into the descriptor (worker defaults to
+      // "文字消息.txt" only when name is empty).
+      worker.postMessage({
+        jobId: e,
+        text: items[0].content,
+        name: items[0].name,
+      })
     } else {
-      compressWorker.postMessage({ files: itemsToFiles(items) })
+      worker.postMessage({ jobId: e, files: itemsToFiles(items) })
     }
-  }, [state.items, state.compressPhase])
+  }, [state.items, state.compressPhase, releaseOwnedSession])
 
   /** Params confirmed → build the WASM sender session, go to play. */
   const onStart = useCallback(async () => {
-    await ensureWasm()
     if (!state.prepared) return
+    const startEpoch = epoch.current
     const cfg = state.config
     const p = state.prepared
     setState((s) => ({ ...s, initializing: true, error: null }))
     try {
+      await ensureWasm()
+      if (!mountedRef.current || epoch.current !== startEpoch) {
+        if (mountedRef.current) {
+          setState((s) => ({ ...s, initializing: false }))
+        }
+        return
+      }
       const session = new SenderSessionWasm(
         p.compressed,
         p.sessionId.lo,
@@ -315,6 +441,16 @@ export default function App() {
         p.preCrc32,
         p.compressionAlgorithm
       )
+      if (!mountedRef.current || epoch.current !== startEpoch) {
+        freeSenderSession(session)
+        releaseOwnedSession()
+        if (mountedRef.current) {
+          setState((s) => ({ ...s, session: null, initializing: false }))
+        }
+        return
+      }
+      releaseOwnedSession()
+      ownedSessionRef.current = session
       setState((s) => ({ ...s, session, page: "play", initializing: false }))
     } catch (e: any) {
       console.error("WASM session creation failed:", e)
@@ -324,7 +460,7 @@ export default function App() {
         error: `编码器初始化失败: ${e?.message || e}`
       }))
     }
-  }, [state.prepared, state.config])
+  }, [state.prepared, state.config, releaseOwnedSession])
 
   const updateConfig = useCallback(
     (patch: Partial<TransferConfig>) =>
@@ -412,13 +548,11 @@ export default function App() {
         displayName={
           state.items.length === 0
             ? undefined
-            : state.items.length === 1 && state.items[0].kind === "text"
-              ? "文字消息"
-              : state.items.length > 1
-                ? `${state.items.length}项`
-                : state.items[0].kind === "file"
-                  ? state.items[0].file.name
-                  : state.items[0].name
+            : state.items.length > 1
+              ? `${state.items.length}项`
+              : state.items[0].kind === "file"
+                ? state.items[0].file.name
+                : state.items[0].name
         }
         originalSize={
           state.items.reduce((sum, it) => sum + itemByteSize(it), 0) || undefined

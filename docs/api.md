@@ -15,7 +15,7 @@ impl Encoder {
     pub fn new(data: &[u8], config: Config) -> Result<Self>;
     pub fn meta(&self) -> &ObjectMeta;
     pub fn source_symbol(&self, sbn: u32, esi: u32) -> Result<Symbol>;
-    // 任意 start 偏移 → 支持无限生成新鲜修复符号
+    // 任意合法 start 偏移 → 按需生成新鲜修复符号（ESI < 2^24）
     pub fn repair_symbols(&self, sbn: u32, start: u32, count: u32) -> Result<Vec<Symbol>>;
 }
 
@@ -77,7 +77,7 @@ impl SenderSession {
         config: SenderConfig,
         file_meta: FileMeta,      // 文件名、大小、CRC32、压缩标签
     ) -> Result<Self>;
-    // 源符号发完后无限产生新鲜修复符号；每 16 帧插描述符（首帧即描述符）
+    // 源符号发完后持续产生新鲜修复符号；ESI 达上限时报错停止
     pub fn next_frame(&mut self) -> Result<Frame>;
     pub fn stats(&self) -> Stats;
 }
@@ -137,9 +137,11 @@ function encode_qr(frameBytes: Uint8Array, outSide: Uint32Array): Uint8Array
 // 返回扁平模块网格（1=深色, 0=浅色），outSide[0] = 边长
 ```
 
-> **构造参数来源**：`compressedPayload` / `sessionId` / `crc32` / `compression` 由 `src/workers/compress.worker.ts` 离线产出（避免同步 WASM 卡住 UI）。主线程仅在用户点「发送」后 postMessage：
-> - `{ text }` → `processText`：包 `ETTEXTv1` 魔数后压缩（**仅**列表里恰好 1 条文字时）
-> - `{ files }` → `processFiles`：0/1 文件原样；≥2 → `bundle.ts` ETBUNDL1；混发时文字已物化为命名 `.txt` File
+> **构造参数来源**：`compressedPayload` / `sessionId` / `crc32` / `compression` 由 `src/workers/compress.worker.ts` 离线产出（避免同步 WASM 卡住 UI）。主线程仅在用户点「发送」后 postMessage（均带 `jobId` = 当前 epoch）：
+> - `{ jobId, text, name? }` → `processText`：包 `ETTEXTv1` 魔数后压缩（**仅**列表里恰好 1 条文字时）；`name` 经 `normalizeDraftFilename` 写入 descriptor 并参与 session 派生（缺省 `文字消息.txt`）
+> - `{ jobId, files }` → `processFiles`：0/1 文件原样；≥2 → `bundle.ts` ETBUNDL1；混发时文字已物化为命名 `.txt` File
+> - `{ type: "wasm-init", zstd?: ArrayBuffer \| null }`：主线程**始终**发送（失败时 `zstd: null`），worker 标记 ready；无 zstd 时 `preparePayload` 回退 raw，**不得**永久挂起队列
+> - 过期 `jobId` 的 progress/`done`/`error` 在 worker 与主线程双侧丢弃（改列表/回选择页 bump epoch）
 > 然后 `compress.ts` 三算法选优 → CRC → `session.ts` 派生会话 ID。详见 [protocol.md](protocol.md)、[data-flow.md](data-flow.md)。
 
 ## JNI 绑定（Android）

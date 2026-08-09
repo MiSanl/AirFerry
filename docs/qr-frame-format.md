@@ -18,7 +18,7 @@
 | 1008 | 1072 | V22 | 105×105 |
 | 1024（核心库默认） | 1088 | V23 | 109×109 |
 | 1400（浏览器默认，激进预设） | **1464** | **V27** | **125×125** |
-| 1900（极速预设） | 1964 | 动态最小 | 见 `min_version_for` |
+| 1904（极速预设） | 1968 | V34 | 153×153 |
 | 2400（极限预设） | 2464 | 动态最小 | 见 `min_version_for` |
 
 权威源：`core/qr-protocol/src/qr_render.rs`（含 `min_version_for` 与单测：1400 → 125 模块 = V27）。
@@ -33,7 +33,7 @@ UI 把 (symbol_size, fps) 打包成用户选项；默认「激进」实测最快
 | fast | 896 | 60 | V21 | 平衡 |
 | extreme | 1008 | 60 | V22 | 更密、对焦要求更高 |
 | aggressive（默认） | 1400 | 60 | V27 | 实测最快；码密度高 |
-| turbo | 1900 | 60 | 更高 | 码密度极高 |
+| turbo | 1904 | 60 | V34 | 码密度极高 |
 | max | 2400 | 60 | 接近上限 | 接近 V39 一带 |
 
 > 历史教训：曾对每帧强制 Version 40（177×177，最密），导致每个模块占用的摄像头像素过少，数据帧无法解码、接收端卡在「恢复中 0%」。改用最小版本后稳定。
@@ -54,7 +54,7 @@ pub fn encode(data: &[u8]) -> Result<QrMatrix>          // 选最小版本编码
 // modules[y * size + x] = true 表示深色模块
 ```
 
-矩阵经 WASM（`next_qr_into` / `next_qr_multi_into` 热路径）交给浏览器；Canvas 在 JS 中用 `drawMatrix` 把模块展开为像素后 **单次 `putImageData`** 绘制（见 `apps/sender/src/components/QrStream.tsx`）。
+热路径先用 WASM `next_qr_scratch` 写入会话内预分配缓冲，再由 `qr_scratch_view` 借用当帧矩阵；Canvas 用 `drawMatrix` 展开模块后 **单次 `putImageData`** 绘制。
 
 ## 渲染优化
 
@@ -67,7 +67,7 @@ pub fn encode(data: &[u8]) -> Result<QrMatrix>          // 选最小版本编码
 | 自动亮度 | `filter: brightness(≥1.15)` 屏幕增亮 |
 | 自动对比 | `filter: contrast(1.1)` |
 | 像素展开 | `drawMatrix`：模块 → `ImageData`，每码一次 `putImageData`（非逐模块 fillRect） |
-| 零拷贝热路径 | `next_qr_*_into` 写入预分配 buffer，跨帧复用 |
+| 零拷贝热路径 | `next_qr_scratch` + `qr_scratch_view` 直接借用 WASM 内存，跨帧复用 |
 | 全屏 | Fullscreen API，消除浏览器 UI 干扰 |
 
 ## 帧率控制
@@ -79,7 +79,7 @@ pub fn encode(data: &[u8]) -> Result<QrMatrix>          // 选最小版本编码
 | 推荐 | 45 | 扫描可靠性与吞吐的平衡 |
 | 默认 | 60 | 配合接收端并行解码 |
 | 高刷 | 120 | 高刷新率屏幕 |
-| 无限制 | 0 | `setTimeout(0)` 驱动，不按 rAF 节流 |
+| 显示器上限 | 0 | 每个 `requestAnimationFrame` 推进一次；不会在两次绘制之间生成并丢弃光学符号 |
 
 通过 `requestAnimationFrame` + 时间间隔节流（fps>0）实现精确帧率，并带防失速保护。接收端摄像头建议以较高帧率采集，才能稳定抓到每个不同帧。
 

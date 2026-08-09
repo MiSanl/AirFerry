@@ -1,4 +1,4 @@
-use raptorq_core::{Config, Encoder, Decoder};
+use raptorq_core::{Config, Decoder, Encoder};
 use std::time::Instant;
 
 fn test_k(k_target: usize) {
@@ -9,7 +9,11 @@ fn test_k(k_target: usize) {
     let enc = Encoder::new(&data, Config::default()).unwrap();
     let meta = enc.meta().clone();
     let k: u32 = meta.blocks.iter().map(|b| b.num_source_symbols).sum();
-    println!("K={}: encoder built in {:.2}s", k, t0.elapsed().as_secs_f64());
+    println!(
+        "K={}: encoder built in {:.2}s",
+        k,
+        t0.elapsed().as_secs_f64()
+    );
 
     let t1 = Instant::now();
     for sbn in 0..meta.blocks.len() as u32 {
@@ -18,10 +22,14 @@ fn test_k(k_target: usize) {
             let _ = enc.source_symbol(sbn, esi);
         }
     }
-    println!("K={}: all source symbols fetched in {:.2}s", k, t1.elapsed().as_secs_f64());
+    println!(
+        "K={}: all source symbols fetched in {:.2}s",
+        k,
+        t1.elapsed().as_secs_f64()
+    );
 
     let t2 = Instant::now();
-    let mut dec = Decoder::new(meta.clone());
+    let mut dec = Decoder::new(meta.clone()).unwrap();
     for sbn in 0..meta.blocks.len() as u32 {
         let bk = meta.blocks[sbn as usize].num_source_symbols;
         for esi in 0..bk {
@@ -29,7 +37,12 @@ fn test_k(k_target: usize) {
             let _ = dec.add_symbol(&sym);
         }
     }
-    println!("K={}: decode in {:.2}s complete={}", k, t2.elapsed().as_secs_f64(), dec.is_complete());
+    println!(
+        "K={}: decode in {:.2}s complete={}",
+        k,
+        t2.elapsed().as_secs_f64(),
+        dec.is_complete()
+    );
 }
 
 #[test]

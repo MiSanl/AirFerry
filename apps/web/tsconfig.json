@@ -26,6 +26,9 @@
     "paths": {
       "@/*": [
         "../sender/src/*"
+      ],
+      "@airferry-wasm/*": [
+        "./wasm-pkg/*"
       ]
     }
   },
@@ -36,7 +39,7 @@
   "exclude": [
     "node_modules",
     "dist",
-    "../sender/wasm-pkg",
+    "wasm-pkg",
     "../sender/wasm-pkg-legacy",
     "../sender/wasm-pkg-simd",
     "../sender/node_modules",

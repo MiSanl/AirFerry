@@ -55,7 +55,7 @@
 
         <!-- FileProvider for sharing received files via ACTION_SEND -->
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name=".scan.AirFerryFileProvider"
             android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">

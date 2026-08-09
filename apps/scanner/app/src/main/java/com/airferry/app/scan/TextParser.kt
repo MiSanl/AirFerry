@@ -1,5 +1,8 @@
 package com.airferry.app.scan
 
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+
 /**
  * Text payload parser — mirrors the browser sender's `text.ts` byte-for-byte.
  *
@@ -46,7 +49,11 @@ object TextParser {
     fun parse(bytes: ByteArray): String? {
         if (!isText(bytes)) return null
         return try {
-            String(bytes, MAGIC.size, bytes.size - MAGIC.size, Charsets.UTF_8)
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes, MAGIC.size, bytes.size - MAGIC.size))
+                .toString()
         } catch (_: Exception) {
             null
         }

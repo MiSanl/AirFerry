@@ -22,7 +22,8 @@ pub struct Decoder {
 impl Decoder {
     /// Create a decoder from object metadata (typically received out-of-band
     /// via the first QR frame's header, or reconstructed from a resume file).
-    pub fn new(meta: ObjectMeta) -> Self {
+    pub fn new(meta: ObjectMeta) -> Result<Self> {
+        meta.validate().map_err(crate::Error::InvalidObjectMeta)?;
         let oti = meta.oti();
         let blocks = meta
             .blocks
@@ -32,7 +33,7 @@ impl Decoder {
                 decoded: None,
             })
             .collect();
-        Self { meta, blocks }
+        Ok(Self { meta, blocks })
     }
 
     #[inline]
@@ -131,7 +132,12 @@ mod tests {
             .collect()
     }
 
-    fn encode_decode(data: &[u8], drop_pct: u32, duplicate: bool, shuffle: bool) -> Option<Vec<u8>> {
+    fn encode_decode(
+        data: &[u8],
+        drop_pct: u32,
+        duplicate: bool,
+        shuffle: bool,
+    ) -> Option<Vec<u8>> {
         let enc = Encoder::new(data, Config::default()).unwrap();
         let meta = enc.meta().clone();
 
@@ -166,7 +172,7 @@ mod tests {
                 .collect();
         }
 
-        let mut dec = Decoder::new(meta);
+        let mut dec = Decoder::new(meta).unwrap();
         for s in &syms {
             dec.add_symbol(s).unwrap();
         }

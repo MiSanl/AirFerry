@@ -23,5 +23,13 @@ public partial class App : Application
         {
             // Non-fatal
         }
+        try
+        {
+            ShareExport.PruneExpired();
+        }
+        catch
+        {
+            // Non-fatal
+        }
     }
 }

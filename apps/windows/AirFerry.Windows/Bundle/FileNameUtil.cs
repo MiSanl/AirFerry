@@ -70,7 +70,7 @@ public static class FileNameUtil
             }
             sb.Append(c);
         }
-        string cleaned = sb.ToString().Trim();
+        string cleaned = sb.ToString().Trim().TrimEnd('.');
 
         // Truncate without splitting a UTF-16 surrogate pair.
         if (cleaned.Length > MaxComponentChars)
@@ -83,7 +83,7 @@ public static class FileNameUtil
             cleaned = cleaned[..cut];
         }
         // Trim again after truncation (trailing spaces/dots can reappear).
-        cleaned = cleaned.Trim().TrimStart('.');
+        cleaned = cleaned.Trim().TrimEnd('.').TrimStart('.');
 
         if (string.IsNullOrEmpty(cleaned) || cleaned is "." or "..")
         {

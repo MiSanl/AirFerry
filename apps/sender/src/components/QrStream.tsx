@@ -2,12 +2,12 @@
  * QR Video Stream Renderer.
  *
  * Drives a Canvas2D render loop. Each tick pulls the next frame from the Rust
- * `SenderSessionWasm` via `next_qr_into` / `next_qr_multi_into` (fixed-mask
+ * `SenderSessionWasm` via its WASM-owned QR scratch buffer (fixed-mask
  * QR matrix, vendored fast_qr), expands modules to pixels in JS (`drawMatrix`),
  * and blits with one `putImageData` per code.
  *
- * Supports fps=0 (unlimited) via setTimeout(0) to bypass the display refresh
- * rate cap, and fps up to 240 for high-refresh displays.
+ * Supports fps=0 (one symbol set per visible display refresh) and explicit
+ * targets up to 240 for high-refresh displays.
  */
 import { useEffect, useRef, useCallback, useState } from "react"
 import { SenderSessionWasm, ensureWasm } from "@/wasm/loader"
@@ -23,7 +23,7 @@ export interface QrStreamStats {
 interface Props {
   /** Initialized sender session. */
   session: SenderSessionWasm
-  /** Target frames per second (0 = unlimited via setTimeout). */
+  /** Target frames per second (0 = every display refresh). */
   fps: number
   /** Brightness multiplier for screen (1.0 = normal, >1 = brighter). */
   brightness: number
@@ -54,18 +54,6 @@ export function QrStream({
   const statsTimerRef = useRef<number>(0)
   const [fullscreen, setFullscreen] = useState(false)
 
-  // Pre-allocated, reused-across-frames WASM scratch buffers. The hot path
-  // runs at up to 60fps×4 codes = 240 encodes/s; allocating fresh TypedArrays
-  // each tick heaps up GC pressure that shows up as rAF jitter. These buffers
-  // live for the component's whole lifetime and are fed to the zero-copy
-  // `next_qr_into` / `next_qr_multi_into` exports, which write directly into
-  // them and return only the byte count.
-  const MAX_QR_SIDE = 177
-  const MAX_QR_MODULES = MAX_QR_SIDE * MAX_QR_SIDE
-  const matrixBufRef = useRef(new Uint8Array(MAX_QR_MODULES))
-  const sideBufRef = useRef(new Uint32Array(1))
-  const multiBufRef = useRef(new Uint8Array(4 + 4 * (4 + MAX_QR_MODULES)))
-
   const onStatsRef = useRef(onStats)
   const onErrorRef = useRef(onError)
   onStatsRef.current = onStats
@@ -82,18 +70,12 @@ export function QrStream({
     type Matrix = { side: number; modules: Uint8Array }
     let matrices: Matrix[]
     try {
-      if (!wantMulti) {
-        const n = session.next_qr_into(matrixBufRef.current, sideBufRef.current)
-        const side = sideBufRef.current[0]
-        matrices = [{ side, modules: matrixBufRef.current.subarray(0, n) }]
-      } else {
-        const written = session.next_qr_multi_into(
-          multiQr,
-          multiBufRef.current
-        )
-        matrices = parseMultiQrBuf(multiBufRef.current, written)
-        if (matrices.length === 0) return
-      }
+      const written = session.next_qr_scratch(wantMulti ? multiQr : 1)
+      // This is a direct view of stable WASM memory, not a wasm-bindgen
+      // copy-in/copy-out slice. Consume it synchronously before the next WASM call.
+      const scratch = session.qr_scratch_view()
+      matrices = parseMultiQrBuf(scratch, written)
+      if (matrices.length === 0) return
     } catch (e) {
       onErrorRef.current?.(e as Error)
       return
@@ -162,7 +144,7 @@ export function QrStream({
         /* ignore */
       }
     }
-  }, [session, multiQr])
+  }, [session, multiQr, ditherJitter])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -176,31 +158,16 @@ export function QrStream({
   useEffect(() => {
     let cancelled = false
 
-    if (fps === 0) {
-      // Unlimited mode: setTimeout(0) bypasses the rAF 60Hz cap. Renders as
-      // fast as the WASM encode + putImageData pipeline allows. Useful for
-      // high-refresh displays or throughput benchmarking.
-      let timerRef: ReturnType<typeof setTimeout> | null = null
-      const unlimitedLoop = () => {
-        if (cancelled) return
-        render()
-        timerRef = setTimeout(unlimitedLoop, 0)
-      }
-      timerRef = setTimeout(unlimitedLoop, 0)
-      return () => {
-        cancelled = true
-        if (timerRef != null) clearTimeout(timerRef)
-      }
-    }
-
     // Throttled mode: rAF with interval gating.
-    const interval = 1000 / Math.max(1, Math.min(240, fps))
+    const interval = fps === 0 ? 0 : 1000 / Math.max(1, Math.min(240, fps))
 
     const loop = (ts: number) => {
       if (cancelled) return
       const delta = ts - lastTickRef.current
-      if (delta >= interval) {
-        lastTickRef.current = delta > interval * 3 ? ts : ts - (delta % interval)
+      if (interval === 0 || delta >= interval) {
+        lastTickRef.current = interval === 0 || delta > interval * 3
+          ? ts
+          : ts - (delta % interval)
         render()
       }
       rafRef.current = requestAnimationFrame(loop)

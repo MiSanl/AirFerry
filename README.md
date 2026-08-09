@@ -18,8 +18,8 @@
   │ 三算法选优压缩 (Raw / Zstd / XZ)              │
   ├─ 分块                                         │
   ├─ RaptorQ 编码 (RFC 6330)                      │
-  ├─ QR 帧生成 (源一遍→无限新鲜修复) ── 视频流 ──► 并行 QR 解码 (N×ZXing-C++)
-  └─ 连续播放 (20/30/45/60fps, 默认 60)              ├─ 串行 RaptorQ 摄入/恢复
+  ├─ QR 帧生成 (源一遍→持续新鲜修复) ── 视频流 ──► 并行 QR 解码 (N×ZXing-C++)
+  └─ 连续播放 (15/20/30/45/60/90/120fps或无限制, 默认 60) ├─ 串行 RaptorQ 摄入/恢复
                                                    ├─ 解压缩
                                                    ├─ 文件重组
                                                    └─ 文件保存
@@ -29,36 +29,37 @@
 
 - ✅ 高可靠性、高容错率（支持高丢帧 / 乱序 / 重复帧 / 部分损坏）
 - ✅ 支持大文件传输
-- ✅ 无限新鲜喷泉码：源符号发一遍后持续补充新符号，进度近似线性、无"越往后越慢"
+- ✅ 持续新鲜喷泉码：源符号发一遍后持续补充不重复修复符号，进度近似线性；到 RFC 24 位 ESI 上限时明确停止
 - ✅ 接收端并行解码池：多线程 ZXing + 串行原生摄入，吃满高帧率采集
 - ✅ 断点恢复（接收端状态持久化，同会话 ID 续传）
-- ✅ 连续二维码视频流（30 / 45 / 60 fps）
+- ✅ 连续二维码视频流（15 / 20 / 30 / 45 / 60 / 90 / 120 fps 或无限制，默认 60）
 - ✅ Air-Gap 场景，零网络依赖
 - ✅ 单向信道，无需回传确认
 - ✅ 三算法选优压缩（Raw / Zstd Lv1 / Xz Lv9），自动选取最小结果
 - ✅ 多文件打包传输（≥2 项自动打包成单个 ETBUNDL1 容器，走同一条二维码流）
-- ✅ 文件与文字混发（统一选择列表；单条纯文字仍为 ETTEXTv1，收端可复制）
+- ✅ 文件与文字混发（统一选择列表；文件/文件夹支持全页拖放；单条纯文字仍为 ETTEXTv1，收端可复制）
 - ✅ 文本类文件（txt/md/json/源码等）收端可复制 / 分享 / 存盘
 - ✅ 4 码并行模式（同帧 tile 4 个不同符号，吞吐 ~4×，默认开启）
 - ✅ 速度预设（稳定 / 高速 / 极限 / 激进 / 极速 / 极限 2400B，默认激进 1400B@60fps）
 - ✅ 多浏览器支持（Chrome / Edge / Firefox，MV2 + MV3）
-- ✅ 多接收端：Android App（CameraX + ZXing-C++）与 Windows 应用（OpenCvSharp + ZXing.Net，支持摄像头 + USB/HDMI/SDI 采集卡）
+- ✅ 多接收端：Android App 与 Windows 应用共用 ZXing-C++ 解码核心和 ROI 策略；Windows 支持摄像头 + USB/HDMI/SDI 采集卡
 
 ## 下载安装
 
-最新版本发布在 [GitHub Release v1.1.3](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.1.3)。
+最新版本发布在 [GitHub Release v1.1.4](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.1.4)。
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-android-v1.1.3.apk` | Android 接收端（Android 10+，arm64-v8a） |
-| `airferry-windows-x64-v1.1.3.zip` | Windows 接收端（Windows 10+，x64；需 .NET 8 运行时；由 CI `windows.yml` 打包） |
-| `airferry-sender-chrome-mv3-v1.1.3.crx` | Chrome / Edge MV3 扩展（已签名 Cr24） |
-| `airferry-sender-chrome-mv3-v1.1.3.zip` | Chrome / Edge MV3（解压加载，crx 被拦截时用） |
-| `airferry-sender-chrome-mv2-v1.1.3.crx` | Chrome / Edge MV2 扩展（旧版兼容，已签名 Cr24） |
-| `airferry-sender-chrome-mv2-v1.1.3.zip` | Chrome / Edge MV2（解压加载） |
-| `airferry-sender-firefox-mv3-v1.1.3.xpi` | Firefox MV3 扩展（Firefox 109+） |
-| `airferry-sender-firefox-mv2-v1.1.3.xpi` | Firefox MV2 扩展（Firefox 91+） |
-| `airferry-web-v1.1.3.zip` | 网页发送端静态站点 |
+| `airferry-android-v1.1.4.apk` | Android 接收端（Android 10+，arm64-v8a） |
+| `airferry-windows-x64-v1.1.4.zip` | Windows 接收端（Windows 10+，x64；需 .NET 8 运行时；由 CI `windows.yml` 打包） |
+| `airferry-sender-chrome-mv3-v1.1.4.crx` | Chrome / Edge MV3 扩展（已签名 Cr24） |
+| `airferry-sender-chrome-mv3-v1.1.4.zip` | Chrome / Edge MV3（解压加载，crx 被拦截时用） |
+| `airferry-sender-chrome-mv2-v1.1.4.crx` | Chrome / Edge MV2 扩展（旧版兼容，已签名 Cr24） |
+| `airferry-sender-chrome-mv2-v1.1.4.zip` | Chrome / Edge MV2（解压加载） |
+| `airferry-sender-firefox-mv3-v1.1.4.xpi` | Firefox MV3 扩展（Firefox 116+） |
+| `airferry-sender-firefox-mv2-v1.1.4.xpi` | Firefox MV2 扩展（Firefox 91+） |
+| `airferry-web-v1.1.4.zip` | 网页发送端静态站点 |
+| `airferry-web-standalone-v1.1.4.html` | 网页发送端单文件版（双击即可运行） |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 
@@ -68,7 +69,7 @@
 
 ### Windows 接收端
 
-解压 `airferry-windows-x64-v1.1.3.zip`，安装 [.NET 8 运行时](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
+解压 `airferry-windows-x64-v1.1.4.zip`，安装 [.NET 8 运行时](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 
@@ -85,7 +86,7 @@
 > - 或将 `.xpi` 解压后用 `about:debugging#/runtime/this-firefox` → 「Load Temporary Add-on」临时载入（重启后失效）；
 > - 或将 `.xpi` 上传至 [addons.mozilla.org](https://addons.mozilla.org/developers/) 由 AMO 服务端签名后分发（正式发布推荐）。
 
-1. 下载对应 `.xpi` 文件（MV3 为 Firefox 109+，MV2 为 Firefox 91+）
+1. 下载对应 `.xpi` 文件（MV3 为 Firefox 116+，MV2 为 Firefox 91+）
 2. 打开 `about:addons` → 齿轮图标 → 「Install Add-on From File」选择 `.xpi`
 3. 或在 `about:debugging#/runtime/this-firefox` 中「Load Temporary Add-on」临时载入
 
@@ -93,14 +94,15 @@
 
 ```
 AirFerry/
-├── core/                  # Rust workspace（双端共享核心库）
+├── core/                  # 跨端 Rust 协议核心 + 共享 ZXing-C++ 相机解码核心
 │   ├── raptorq-core/      # RFC 6330 RaptorQ 编解码封装
 │   ├── qr-protocol/       # 帧格式 / 分块 / 压缩 / CRC / QR 矩阵
-│   └── transfer-engine/   # 编排 / 状态机 / 进度 / 断点 + WASM&JNI 绑定
+│   ├── transfer-engine/   # 编排 / 状态机 / 进度 / 断点 + WASM/JNI/C ABI
+│   └── zxing-decoder/     # Android/Windows 共用全帧/多 ROI ZXing-C++ 逻辑
 ├── apps/
 │   ├── sender/            # Plasmo + React + TS + WASM 发送端（浏览器扩展）
 │   ├── scanner/           # Kotlin + CameraX + ZXing-C++ 接收端（Android App）
-│   └── windows/           # C# WPF + OpenCvSharp + ZXing.Net 接收端（Windows App）
+│   └── windows/           # C# WPF + OpenCvSharp + 共享 ZXing-C++（Windows App）
 ├── scripts/
 │   ├── build-all.sh       # 一键构建 + 打包（含 crx/xpi 签名，windows 子命令）
 │   └── build-windows.ps1  # Windows 端原生 PowerShell 构建脚本（首选）
@@ -118,16 +120,16 @@ AirFerry/
 | 核心库 | `cargo build` / `cargo test` | Rust workspace |
 | 浏览器扩展 | `npm run build` | 构建全部 4 个目标 |
 | Android App | `./gradlew assembleDebug` | 需要 Android NDK |
-| Windows App | `./scripts/build-windows.ps1` | 须 Windows + .NET 8 SDK（详见 [docs/build-windows.md](docs/build-windows.md)） |
+| Windows App | `./scripts/build-windows.ps1` | 须 Windows + .NET 8 SDK + CMake/VS C++（详见 [docs/build-windows.md](docs/build-windows.md)） |
 
 ## 技术架构
 
-- **编码层**：RaptorQ 喷泉码（RFC 6330）；发送端源符号发一遍后**无限补充新鲜修复符号**（ESI 单调递增、永不重复），接收端可随时加入
+- **编码层**：RaptorQ 喷泉码（RFC 6330）；发送端源符号发一遍后持续补充新鲜修复符号（ESI 单调递增、不重复；上限 2²⁴−1），接收端可随时加入
 - **打包层**：≥2 文件先打包成 ETBUNDL1 容器，整批走单条压缩 + 单条 RaptorQ 流
 - **压缩层**：三算法选优（Raw / Zstd Lv1 / Xz Lv9），70% Zstd early-exit 启发式跳过慢速 Xz
 - **传输层**：60 字节帧头 + symbol_size 负载（浏览器默认 1400）+ 4 字节 CRC，编码为**最小版本** EC-L 二维码（**1464B 帧 → V27 125×125**）；4 码模式同帧 tile 4 个符号、吞吐 ~4×
 - **协议层**：Descriptor 帧（每 16 帧，首帧即描述符）携带 OTI + 文件元数据（文件名、大小、CRC32、压缩标签）
-- **接收层**：Android（CameraX 锁定 ~60fps → 并行解码池 多线程 ZXing-C++ + 中心 ROI 裁剪 → 串行 JNI 摄入）；Windows（OpenCvSharp DirectShow 采集 → 并行解码池 多线程 ZXing.Net → 串行 P/Invoke 摄入）
+- **接收层**：Android 用 CameraX、Windows 用 OpenCvSharp DirectShow；两端均为 2–6 worker + 共享 ZXing-C++ 全帧/多 bbox ROI 热路径 + 串行 Rust 摄入。Windows Gray 帧仅池化复制一次，UI 以约 7Hz 展示 3 秒窗口速率、有效吞吐和多码状态
 
 ## 文档
 

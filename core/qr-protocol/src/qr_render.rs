@@ -37,7 +37,7 @@
 //! V16 (81²), far easier to scan.
 
 use crate::{Error, Result};
-use fast_qr::{qr::QRBuilder, datamasking::Mask, ECL, Version};
+use fast_qr::{datamasking::Mask, qr::QRBuilder, Version, ECL};
 use std::vec::Vec;
 
 /// Maximum payload (bytes) a Version-40 / L QR can carry in binary mode.
@@ -46,24 +46,55 @@ pub const QR_MAX_BYTES: usize = 2953;
 /// Byte-mode data capacity (bytes) for QR Versions 1..=40 at EC level L
 /// (ISO/IEC 18004 Table 7). Index `i` is the capacity of version `i+1`.
 const QR_BYTE_CAPACITY_L: [usize; 40] = [
-    17, 32, 53, 78, 106, 134, 154, 192, 230, 271,
-    321, 367, 425, 458, 520, 586, 644, 718, 792, 858,
-    929, 1003, 1091, 1171, 1273, 1367, 1465, 1528, 1628, 1732,
-    1840, 1952, 2068, 2188, 2303, 2431, 2563, 2699, 2809, 2953,
+    17, 32, 53, 78, 106, 134, 154, 192, 230, 271, 321, 367, 425, 458, 520, 586, 644, 718, 792, 858,
+    929, 1003, 1091, 1171, 1273, 1367, 1465, 1528, 1628, 1732, 1840, 1952, 2068, 2188, 2303, 2431,
+    2563, 2699, 2809, 2953,
 ];
 
 /// `fast_qr::Version` is a C-like enum (`V01=0`..`V40=39`) whose `from_n(n)`
 /// constructor is `pub(crate)`, so we keep our own lookup table to convert a
 /// 1-based version number (1..=40) into the enum without `unsafe` transmute.
 const VERSIONS: [Version; 40] = [
-    Version::V01, Version::V02, Version::V03, Version::V04, Version::V05,
-    Version::V06, Version::V07, Version::V08, Version::V09, Version::V10,
-    Version::V11, Version::V12, Version::V13, Version::V14, Version::V15,
-    Version::V16, Version::V17, Version::V18, Version::V19, Version::V20,
-    Version::V21, Version::V22, Version::V23, Version::V24, Version::V25,
-    Version::V26, Version::V27, Version::V28, Version::V29, Version::V30,
-    Version::V31, Version::V32, Version::V33, Version::V34, Version::V35,
-    Version::V36, Version::V37, Version::V38, Version::V39, Version::V40,
+    Version::V01,
+    Version::V02,
+    Version::V03,
+    Version::V04,
+    Version::V05,
+    Version::V06,
+    Version::V07,
+    Version::V08,
+    Version::V09,
+    Version::V10,
+    Version::V11,
+    Version::V12,
+    Version::V13,
+    Version::V14,
+    Version::V15,
+    Version::V16,
+    Version::V17,
+    Version::V18,
+    Version::V19,
+    Version::V20,
+    Version::V21,
+    Version::V22,
+    Version::V23,
+    Version::V24,
+    Version::V25,
+    Version::V26,
+    Version::V27,
+    Version::V28,
+    Version::V29,
+    Version::V30,
+    Version::V31,
+    Version::V32,
+    Version::V33,
+    Version::V34,
+    Version::V35,
+    Version::V36,
+    Version::V37,
+    Version::V38,
+    Version::V39,
+    Version::V40,
 ];
 
 /// Fixed data mask used for all QR codes. Mask 0 (Checkerboard: `(row + col) % 2 == 0`)
@@ -133,10 +164,7 @@ pub fn encode(data: &[u8]) -> Result<QrMatrix> {
         // `fast_qr::QRCode.data` is a fixed `[Module; 177*177]` array; only the
         // leading `size*size` entries are meaningful. `Module::value()` is
         // `true` for a dark module — exactly the convention `QrMatrix` uses.
-        let modules = code.data[..size * size]
-            .iter()
-            .map(|m| m.value())
-            .collect();
+        let modules = code.data[..size * size].iter().map(|m| m.value()).collect();
         return Ok(QrMatrix { modules, size });
     }
     Err(Error::BufferTooShort {
@@ -198,22 +226,26 @@ mod tests {
         for &(sym_size, expected_side) in &cases {
             let frame = Frame::build(
                 0u128,
-                0, // flags
-                1, // sbn
-                1, // esi
-                1, // total_blocks
+                0,  // flags
+                1,  // sbn
+                1,  // esi
+                1,  // total_blocks
                 10, // total_symbols
                 sym_size as u32,
-                1, // frame_index
+                1,       // frame_index
                 1234567, // timestamp_ms
                 &vec![0u8; sym_size],
             );
             let bytes = frame.to_bytes();
             let m = encode(&bytes).unwrap();
             assert_eq!(
-                m.size, expected_side,
+                m.size,
+                expected_side,
                 "symbol_size={} frame ({} wire bytes) expected side {}, got {}",
-                sym_size, bytes.len(), expected_side, m.size
+                sym_size,
+                bytes.len(),
+                expected_side,
+                m.size
             );
             assert_eq!(m.modules.len(), expected_side * expected_side);
         }

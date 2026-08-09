@@ -31,6 +31,7 @@ if (!fs.existsSync(manifestPath)) {
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
 const isMV2 = manifest.manifest_version === 2;
 const isFirefox = target.includes("firefox");
+const isChrome = target.includes("chrome");
 
 // 1. Icons: copy the real RGBA icons from assets/ into the build dir and
 //    point the manifest at them. Plasmo generates tiny 1-bit placeholder
@@ -98,9 +99,15 @@ if (isFirefox) {
   manifest.browser_specific_settings = {
     gecko: {
       id: "airferry@airferry.app",
-      strict_min_version: isMV2 ? "91.0" : "109.0",
+      strict_min_version: isMV2 ? "91.0" : "116.0",
     },
   };
+}
+if (isChrome && !isMV2) {
+  // Modern wasm-bindgen emits externref, available from Chrome 96.
+  manifest.minimum_chrome_version = "96";
+} else {
+  delete manifest.minimum_chrome_version;
 }
 
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));

@@ -8,10 +8,10 @@
  *     imports each other through `@/*` which resolves to its own `src/`. We
  *     map `@/` to `../sender/src/` so every such import lands on the real file.
  *
- *  2. WASM packages — `loader.ts` does `import "../../wasm-pkg/transfer_engine.js"`
- *     which is a real filesystem path relative to `sender/src/wasm/`, so Vite's
- *     default resolver finds it. `wasm-pack --target web` emits standard ESM
- *     that Vite bundles natively.
+ *  2. WASM packages — `@airferry-wasm/` points to the web-owned snapshot made
+ *     by `prepare-wasm.cjs`. This avoids reading sender's target-switching
+ *     package during a concurrent extension build. wasm-pack emits standard
+ *     ESM that Vite bundles natively.
  *
  * The compress worker is spawned via the standard
  *   `new Worker(new URL("./workers/compress.worker.ts", import.meta.url), {type:"module"})`
@@ -34,6 +34,7 @@ export default defineConfig({
       // { find, replacement } form with a trailing-slash replacement is the
       // reliable way to alias a path prefix under Vite/Rollup.
       { find: "@/", replacement: path.resolve(__dirname, "../sender/src/") + "/" },
+      { find: "@airferry-wasm/", replacement: path.resolve(__dirname, "wasm-pkg/") + "/" },
     ],
   },
   // The transfer_engine wasm-pkg and the lzma/zstd loaders are only needed at

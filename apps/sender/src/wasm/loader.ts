@@ -1,10 +1,10 @@
 /**
  * Loader + thin wrapper around the Rust `transfer_engine` WASM module.
  *
- * The WASM pkg is produced by `pnpm wasm` (wasm-pack) into `../wasm-pkg/`. It
- * exposes `SenderSessionWasm` and `encode_qr`. We lazily initialize the module
- * on first use. The wasm-bindgen glue resolves the `.wasm` asset URL relative
- * to its own `import.meta.url`, which Vite/Plasmo bundles correctly.
+ * `npm run wasm` produces the Rust package. The `@airferry-wasm` alias selects
+ * sender's target-specific package for Plasmo and web's private modern-package
+ * snapshot for Vite, so concurrent builds cannot switch files underneath each
+ * other. It exposes `SenderSessionWasm` and `encode_qr`; initialization is lazy.
  *
  * Standalone (single-file) build: under `file://`, `fetch()` of the `.wasm`
  * asset is blocked, so the standalone build inlines the WASM as a base64
@@ -13,7 +13,7 @@
  * any non-string/URL/Request input straight to `WebAssembly.instantiate(buffer)`,
  * bypassing fetch entirely.
  */
-import init, { SenderSessionWasm, encode_qr } from "../../wasm-pkg/transfer_engine.js"
+import init, { SenderSessionWasm, encode_qr } from "@airferry-wasm/transfer_engine.js"
 import { base64ToBuffer } from "./base64"
 
 let initPromise: Promise<void> | null = null
@@ -26,7 +26,15 @@ export function ensureWasm(): Promise<void> {
     // URL from import.meta.url and fetches normally.
     const standaloneB64 =
       (globalThis as { __WASM_TRANSFER_ENGINE__?: string }).__WASM_TRANSFER_ENGINE__
-    initPromise = init(base64ToBuffer(standaloneB64)).then(() => undefined)
+    const pending = init(base64ToBuffer(standaloneB64)).then(() => undefined)
+    let retryable: Promise<void>
+    retryable = pending.catch((error) => {
+      // A transient fetch/instantiation failure must not poison every later
+      // retry for the lifetime of the page.
+      if (initPromise === retryable) initPromise = null
+      throw error
+    })
+    initPromise = retryable
   }
   return initPromise
 }

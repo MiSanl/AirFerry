@@ -1,12 +1,12 @@
 # 网页端构建说明 (Web Build)
 
-> 网页端是一个**纯静态网站**，功能与浏览器扩展完全一致（统一选择列表：添加文件 + 添加文字 → 点「发送」；三算法压缩、零拷贝 QR 渲染、多码模式、亮度优化）。它通过 Vite alias **直接复用 `apps/sender/src/` 的全部源码**，不复制任何业务代码——改 sender，网页端自动同步。
+> 网页端是一个**纯静态网站**，功能与浏览器扩展完全一致（统一选择列表：文件/文件夹可拖到页面任意位置，也可点选；添加文字后点「发送」；三算法压缩、零拷贝 QR 渲染、多码模式、亮度优化）。它通过 Vite alias **直接复用 `apps/sender/src/` 的全部源码**，不复制任何业务代码——改 sender，网页端自动同步。
 
 ## 前置条件
 
 - Node.js ≥ 18
 - npm
-- **`apps/sender/wasm-pkg/` 必须存在**（Rust WASM 产物，网页端复用它，不单独编译 Rust）
+- **`apps/sender/wasm-pkg-simd/` 必须完整**（Rust WASM 现代产物，网页端复用它，不单独编译 Rust）
 
 ## 构建 WASM 核心（一次性前置）
 
@@ -15,12 +15,12 @@
 ```bash
 cd apps/sender
 npm install            # 首次
-npm run wasm           # 生成 wasm-pkg-legacy/ + wasm-pkg-simd/，并复制其中一份到 wasm-pkg/
+npm run wasm           # 生成 legacy/simd 两个变体
 ```
 
-> 网页端只需 `apps/sender/wasm-pkg/`（构建时由 `build-wasm.cjs` 从 legacy/simd 复制而来），对 SIMD 与否不敏感（见 `AGENTS.md` §5.6 实测结论）。若只想最快跑通，单独跑 `npm run wasm:legacy` 也能生成可用的 `wasm-pkg-`。
+> 网页端明确使用现代/MV3 变体。`prepare-wasm.cjs` 每次都校验 sender 的 `wasm-pkg-simd`，持跨进程锁原子复制到 **web 自有**的 `apps/web/wasm-pkg/`；扩展构建切换自己的 MV2/MV3 包时不会改动 Vite 正在读取的文件。
 
-> 若 `apps/sender/wasm-pkg/transfer_engine.js` 缺失，网页端的 `predev`/`prebuild`（`prepare-wasm.cjs`）会报清晰错误并退出，提示先跑此步。
+> 若 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}` 不完整，`predev`/`prebuild`/`prebuild:standalone` 会报错退出并提示先跑此步。
 
 ## 构建网页端
 
@@ -34,8 +34,10 @@ npm run preview        # 本地预览构建产物（默认 http://localhost:4173
 ```
 
 `npm run build` 会先跑 `prebuild`（`scripts/prepare-wasm.cjs`）：
-1. 校验 `apps/sender/wasm-pkg/transfer_engine.js` 存在
+1. 校验 `apps/sender/wasm-pkg-simd` 的 JS + WASM，并持锁原子复制到 `apps/web/wasm-pkg/`
 2. 把 `@foxglove/wasm-zstd/dist/wasm-zstd.wasm` 拷到 `apps/web/public/wasm-zstd.wasm`（供压缩 worker 运行时 fetch）
+
+`npm run build:standalone` 也有相同的 `prebuild:standalone` 前置，不会在缺少 `wasm-zstd.wasm` 时先成功打包、再在后处理阶段失败。
 
 ## 产物结构
 
@@ -47,7 +49,7 @@ apps/web/dist/
     ├── index-*.js                 # 主应用（含复用的 sender 页面/组件）
     ├── index-*.css                # 样式
     ├── compress.worker-*.js       # 压缩 worker（含 zstd/xz/CRC/session 逻辑）
-    ├── transfer_engine_bg-*.wasm  # Rust 核心引擎（复用 sender 的 wasm-pkg）
+    ├── transfer_engine_bg-*.wasm  # Rust 核心引擎（来自 web 自有 WASM 快照）
     ├── lzma_wasm_bg-*.wasm        # xz 压缩 WASM
     └── icon128-*.png              # 复用 sender 的图标
 ```
@@ -69,7 +71,7 @@ apps/web/dist/
 | 入口 | 图标点击 → `background/index.ts` 开新标签页打开 options.html | 直接访问网页 URL |
 | 构建工具 | Plasmo（Parcel 2）+ manifest 后处理 | Vite（纯 SPA） |
 | 业务源码 | `apps/sender/src/`（**单一事实源**） | 通过 alias **复用** `apps/sender/src/`，零代码重复 |
-| Rust WASM | 自己编译（`npm run wasm`） | 复用 sender 的 `wasm-pkg/`，不单独编译 |
+| Rust WASM | 自己编译（`npm run wasm`） | 从 sender 的 `wasm-pkg-simd/` 复制私有快照，不单独编译 |
 | 部署形态 | `.crx`/`.xpi`/`.zip` 扩展包 | 纯静态网站 |
 | 扩展 API | `chrome.runtime.getURL` 等 | `typeof chrome` 判断后走网页 fallback（`document.baseURI`） |
 
@@ -92,7 +94,7 @@ npm run build:standalone    # 产出自包含单文件 dist-standalone/index.htm
 
 ### 使用
 
-直接双击 `dist-standalone/index.html`，或在 Finder/资源管理器里打开。无需 `python -m http.server`、无需部署。
+直接双击 `dist-standalone/index.html`，或在 Finder/资源管理器里打开。无需 `python -m http.server`、无需部署；进入选择页后，可把文件或文件夹拖到窗口任意位置追加。
 
 ### file:// 下的三大障碍及解法
 
@@ -136,6 +138,6 @@ npm run build:standalone    # 产出自包含单文件 dist-standalone/index.htm
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
-| 启动报 `transfer_engine.js not found` | `apps/sender/wasm-pkg/` 缺失 | `cd apps/sender && npm run wasm` |
+| 启动报 `transfer_engine.js not found` | `apps/sender/wasm-pkg-simd/` 缺失或不完整 | `cd apps/sender && npm run wasm`，再重跑 web 命令 |
 | 压缩总是 100%（走 raw） | `public/wasm-zstd.wasm` 缺失，worker fetch 404 | 重跑 `npm run build`（触发 `prebuild`→prepare-wasm） |
 | 跨工程 import 报 `@/options` 找不到 | Vite alias 未生效 | 确认 `vite.config.ts` 的 `resolve.alias` 含 `{ find: "@/", replacement: ".../sender/src/" }` |

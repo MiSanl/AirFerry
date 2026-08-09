@@ -46,6 +46,14 @@ public class FileNameUtilTests
     }
 
     [Fact]
+    public void Sanitize_DropsWindowsTrailingDotsAndSpaces()
+    {
+        Assert.Equal("report.txt", FileNameUtil.Sanitize("report.txt..."));
+        Assert.Equal("report", FileNameUtil.Sanitize("report.   "));
+        Assert.Equal("received_file", FileNameUtil.Sanitize("...   "));
+    }
+
+    [Fact]
     public void Sanitize_BlankFallsBackToReceivedFile()
     {
         Assert.Equal("received_file", FileNameUtil.Sanitize(""));

@@ -67,13 +67,25 @@ class ScanActivity : ComponentActivity() {
      *  the main thread. The work runs under the decode pool's ingest lock. */
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private var cameraStarted = false
+    private var previewView: PreviewView? = null
 
     /** Parallel QR decode pool (capture → queue → N workers → serialized ingest). */
     private var decodePool: QrDecodePool? = null
-    // Decode-rate sampling (computed on the throttled UI snapshot).
-    private var lastRateTimeMs = 0L
-    private var lastDecodedCount = 0L
+
+    /**
+     * Sliding-window rate samples for the UI.
+     * Prefer the last [RATE_WINDOW_MS] over whole-session averages so the user
+     * sees near-instant throughput when the stream speeds up or stalls.
+     *
+     * Store symbol *counts* (not wire bytes) so a late-arriving real
+     * [symbolSize] does not create a fake throughput spike from a discontinuous
+     * byte counter.
+     */
+    private data class RateSample(val tMs: Long, val decoded: Long, val receivedSymbols: Long)
+    private val rateSamples = ArrayDeque<RateSample>()
     private var decodePerSec = 0
+    /** Recent wire throughput (bytes/s) over the sliding window. */
+    private var recentWireBps = 0L
 
     // Reactive state observed by Compose
     private val uiState = mutableStateOf(UiState())
@@ -101,6 +113,11 @@ class ScanActivity : ComponentActivity() {
         val transferElapsedMs: Long = 0,
         /** RaptorQ symbol size in bytes (from the sender's config). */
         val symbolSize: Int = 0,
+        /**
+         * Recent wire throughput (bytes/s) over ~[RATE_WINDOW_MS], not the
+         * whole-session average. 0 when the window is still empty.
+         */
+        val recentWireBps: Long = 0,
     )
 
     // ===== Per-code scan status (shown in the info card) =====
@@ -129,7 +146,12 @@ class ScanActivity : ComponentActivity() {
 
     private val requestCameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startCamera() else updateUi { it.copy(statusText = "需要相机权限") }
+            if (granted) {
+                cameraStarted = false
+                startCamera()
+            } else {
+                updateUi { it.copy(statusText = "需要相机权限") }
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -234,16 +256,14 @@ class ScanActivity : ComponentActivity() {
                             }
                             InfoRow("已识别符号", "${state.receivedSymbols} / ${state.totalSymbols}")
                             InfoRow("解码速率", "${state.decodePerSec} 符号/秒")
-                            // 传输用时 + 实时速度（进度条上方）
+                            InfoRow("二维码", codeStatusString(
+                                state.codeActivitySnapshot, state.multiCodeCount))
+                            // 传输用时 + 近几秒滑动窗口速度（非全程平均）
                             if (state.transferElapsedMs > 0) {
                                 val elapsedStr = formatDuration(state.transferElapsedMs)
-                                // 传输速度 = 线上已收符号数据量 / 用时
-                                // （符号数 × 符号大小 = 实际线上传输量，非原始文件大小）
-                                val rxSymbols = state.receivedSymbols.coerceAtLeast(0)
-                                val wireBytes = rxSymbols.toLong() * state.symbolSize.coerceAtLeast(1)
-                                val speedBytesPerSec = if (state.transferElapsedMs > 0)
-                                    (wireBytes * 1000 / state.transferElapsedMs).coerceAtLeast(0) else 0L
-                                val speedStr = if (speedBytesPerSec > 0) formatSize(speedBytesPerSec) + "/s" else ""
+                                // 线上吞吐 = 最近 RATE_WINDOW_MS 内 Δ(符号×symbolSize)/Δt
+                                val speedStr = if (state.recentWireBps > 0)
+                                    formatSize(state.recentWireBps) + "/s" else ""
                                 InfoRow("用时", if (speedStr.isNotEmpty()) "$elapsedStr @ $speedStr" else elapsedStr)
                             }
                             LinearProgressIndicator(
@@ -428,13 +448,18 @@ class ScanActivity : ComponentActivity() {
     // ===== Camera + session logic =====
 
     private fun bindCameraIfNeeded(previewView: PreviewView) {
+        this.previewView = previewView
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
         if (cameraStarted) return
         cameraStarted = true
         startCameraWithView(previewView)
     }
 
     private fun startCamera() {
-        // Will be triggered by AndroidView update once a PreviewView is available.
+        val view = previewView ?: return
+        bindCameraIfNeeded(view)
     }
 
     /** Lazily create + start the shared parallel decode pool. */
@@ -518,6 +543,7 @@ class ScanActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Camera bind failed", e)
+                cameraStarted = false
                 updateUi { it.copy(statusText = "相机启动失败") }
             }
         }, ContextCompat.getMainExecutor(this))
@@ -640,30 +666,55 @@ class ScanActivity : ComponentActivity() {
                 "接收中… ${progress.receivedSymbols}/${progress.totalSymbols} 符号 (等待解码)"
             else -> "恢复中… $pct%"
         }
-        // Sample the parallel decode rate (~1 Hz) from the pool's counters.
+        // Sliding-window rates: decode symbols/s + wire bytes/s over RATE_WINDOW_MS.
+        // UI ticks are already throttled (~7 Hz), so each sample is a fresh point;
+        // prune anything older than the window and derive Δcount/Δt.
         val pool = decodePool
-        if (pool != null) {
-            val nowMs = System.currentTimeMillis()
-            val decoded = pool.decodedCount()
-            if (lastRateTimeMs == 0L) {
-                lastRateTimeMs = nowMs
-                lastDecodedCount = decoded
-            } else if (nowMs - lastRateTimeMs >= 1000) {
-                decodePerSec = ((decoded - lastDecodedCount) * 1000 / (nowMs - lastRateTimeMs)).toInt()
-                lastRateTimeMs = nowMs
-                lastDecodedCount = decoded
+        val nowMs = System.currentTimeMillis()
+        // Rate math uses ≥1 so early pre-descriptor ticks don't div0; samples
+        // store symbol counts so a late real symbolSize never rewrites history.
+        val symbolSize = session.symbolSizeBytes().coerceAtLeast(1)
+        val receivedNow = progress.receivedSymbols.toLong().coerceAtLeast(0)
+        val decodedNow = pool?.decodedCount() ?: 0L
+        if (progress.complete) {
+            // Freeze at 0 once done — final tick would otherwise show the last
+            // non-zero window forever on the completed card.
+            decodePerSec = 0
+            recentWireBps = 0L
+            rateSamples.clear()
+        } else if (receivedNow > 0L || decodedNow > 0L) {
+            rateSamples.addLast(RateSample(nowMs, decodedNow, receivedNow))
+            while (rateSamples.size > 1 && nowMs - rateSamples.first().tMs > RATE_WINDOW_MS) {
+                rateSamples.removeFirst()
+            }
+            if (rateSamples.size >= 2) {
+                val oldest = rateSamples.first()
+                val newest = rateSamples.last()
+                val dt = newest.tMs - oldest.tMs
+                // Need a short baseline so a single tick doesn't explode the rate.
+                if (dt >= RATE_MIN_DT_MS) {
+                    decodePerSec = (((newest.decoded - oldest.decoded) * 1000L) / dt)
+                        .toInt().coerceAtLeast(0)
+                    val dSym = (newest.receivedSymbols - oldest.receivedSymbols).coerceAtLeast(0L)
+                    recentWireBps = ((dSym * symbolSize * 1000L) / dt).coerceAtLeast(0L)
+                }
+            } else {
+                // Window collapsed (e.g. long stall then one fresh tick) — don't
+                // keep showing a stale non-zero rate from before the gap.
+                decodePerSec = 0
+                recentWireBps = 0L
             }
         }
-        val droppedTotal = decodePool?.droppedCount() ?: 0L
+        val droppedTotal = pool?.droppedCount() ?: 0L
 
         val snapshotMap = synchronized(codeActivityLock) { HashMap(codeActivity) }
-        val mcCount = decodePool?.snapshotMultiCount() ?: 0
+        val mcCount = pool?.snapshotMultiCount() ?: 0
 
         // Start the transfer timer on first symbol receipt.
         if (progress.totalSymbols > 0 && transferStartMs == 0L) {
-            transferStartMs = System.currentTimeMillis()
+            transferStartMs = nowMs
         }
-        val elapsedMs = if (transferStartMs > 0) System.currentTimeMillis() - transferStartMs else 0L
+        val elapsedMs = if (transferStartMs > 0) nowMs - transferStartMs else 0L
 
         updateUi {
             it.copy(
@@ -683,7 +734,8 @@ class ScanActivity : ComponentActivity() {
                 codeActivitySnapshot = snapshotMap,
                 multiCodeCount = mcCount,
                 transferElapsedMs = elapsedMs,
-                symbolSize = session.symbolSizeBytes()
+                symbolSize = symbolSize,
+                recentWireBps = recentWireBps,
             )
         }
 
@@ -704,12 +756,23 @@ class ScanActivity : ComponentActivity() {
                 // native session via assemble/crc32/fileSize), then post the
                 // resulting Intent to the main thread. runExclusive returns Unit,
                 // so capture the Intent in a holder.
-                var intent: Intent? = null
-                val work = {
-                    intent = recoverAndStage(snapshotFileName)
+                try {
+                    var intent: Intent? = null
+                    val work = {
+                        intent = recoverAndStage(snapshotFileName)
+                    }
+                    decodePool?.runExclusive(work) ?: work()
+                    intent?.let { runOnUiThread { startActivity(it) } }
+                } catch (e: Exception) {
+                    clearRecoveryStage()
+                    runOnUiThread {
+                        Toast.makeText(
+                            this,
+                            e.message ?: "保存接收内容失败",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                 }
-                decodePool?.runExclusive(work) ?: work()
-                intent?.let { runOnUiThread { startActivity(it) } }
             }
         }
     }
@@ -741,7 +804,14 @@ class ScanActivity : ComponentActivity() {
             originalSize > 0 && originalSize <= fileBytes.size -> originalSize.toInt()
             else -> fileBytes.size
         }
-        val truncBytes = fileBytes.copyOfRange(0, truncLen)
+        // v3 assemble normally already returns exactly originalSize. Reuse that
+        // array instead of allocating a second full-size ByteArray; only legacy
+        // padded results need an actual truncation copy.
+        val truncBytes = if (truncLen == fileBytes.size) {
+            fileBytes
+        } else {
+            fileBytes.copyOfRange(0, truncLen)
+        }
 
         updateRecoveryStage("正在校验完整性…")
         val expectedCrc = session.crc32()
@@ -753,6 +823,8 @@ class ScanActivity : ComponentActivity() {
         val store = com.airferry.app.scan.ContentStore
 
         // Text payload → ETTEXTv1. Detected BEFORE the bundle check.
+        // Prefer the descriptor filename (sender select-page name); fall back
+        // to the default only when the descriptor never supplied one.
         if (TextParser.isText(truncBytes)) {
             val text = TextParser.parse(truncBytes)
             if (text != null) {
@@ -760,19 +832,26 @@ class ScanActivity : ComponentActivity() {
                 val contentBytes = text.toByteArray(Charsets.UTF_8)
                 val contentCrc = crc32OfBytes(contentBytes)
                 val crcHex = java.lang.Long.toHexString(contentCrc)
+                // Prefer descriptor name; ensure a .txt-ish save label for pure text.
+                // (Sender already normalizes to *.txt; this is a receive-side belt.)
+                val textName = when {
+                    displayName.isEmpty() -> TEXT_RECEIVED_NAME
+                    displayName.contains('.') -> displayName
+                    else -> "$displayName.txt"
+                }
                 val put = store.putBytes(
-                    this, TEXT_RECEIVED_NAME, contentBytes,
+                    this, textName, contentBytes,
                     crcHex = crcHex, crcUnknown = false, kind = "text",
                 )
                 clearRecoveryStage()
                 return Intent(this, ReceiveTextActivity::class.java).apply {
-                    putExtra("TEXT", text)
                     putExtra("FILE_PATH", put.path.absolutePath)
-                    putExtra("FILE_NAME", put.entry.name)
+                    // Prefer the user-facing name (descriptor) over store sanitization.
+                    putExtra("FILE_NAME", textName)
                     putExtra("ENTRY_ID", put.entry.id)
-                    putExtra("CRC32", contentCrc)
-                    putExtra("CRC32_RECEIVED", contentCrc)
-                    putExtra("CRC32_UNKNOWN", false)
+                    putExtra("CRC32", expectedCrc)
+                    putExtra("CRC32_RECEIVED", receivedCrc)
+                    putExtra("CRC32_UNKNOWN", !crcKnown)
                 }
             }
         }
@@ -837,7 +916,6 @@ class ScanActivity : ComponentActivity() {
                 )
                 clearRecoveryStage()
                 return Intent(this, ReceiveTextActivity::class.java).apply {
-                    putExtra("TEXT", text)
                     putExtra("FILE_PATH", put.path.absolutePath)
                     putExtra("FILE_NAME", finalName)
                     putExtra("ENTRY_ID", put.entry.id)
@@ -877,9 +955,9 @@ class ScanActivity : ComponentActivity() {
         decodePool?.runExclusive(swap) ?: swap()
         completedHandled = false
         lastUiUpdate = 0
-        lastRateTimeMs = 0
-        lastDecodedCount = 0
+        rateSamples.clear()
         decodePerSec = 0
+        recentWireBps = 0L
         // Clear per-code activity state.
         synchronized(codeActivityLock) { codeActivity.clear() }
         codeActivityState.value = emptyMap()
@@ -957,9 +1035,9 @@ class ScanActivity : ComponentActivity() {
             decodePool?.runExclusive(swap) ?: swap()
             completedHandled = false
             lastUiUpdate = 0
-            lastRateTimeMs = 0
-            lastDecodedCount = 0
+            rateSamples.clear()
             decodePerSec = 0
+            recentWireBps = 0L
             synchronized(codeActivityLock) { codeActivity.clear() }
             codeActivityState.value = emptyMap()
             transferStartMs = 0L
@@ -1000,11 +1078,13 @@ class ScanActivity : ComponentActivity() {
         /** Slot index for a single on-screen code (used by gridSlotOf). */
         private const val SLOT_CENTER = -1
         /**
-         * Filename used when archiving a recovered TEXT transfer to received/.
-         * uniqueTarget appends (1)/(2)… on collision so each text is a distinct
-         * history entry. The `.txt` extension keeps it openable as plain text
-         * by any app.
+         * Sliding window for decode rate + wire throughput shown in the info card.
+         * ~3s is responsive enough to feel "live" without jittering every tick.
          */
+        private const val RATE_WINDOW_MS = 3_000L
+        /** Minimum Δt before publishing a rate (avoids 1-tick spikes). */
+        private const val RATE_MIN_DT_MS = 300L
+        /** Default display/store name when an older TEXT descriptor has no filename. */
         private const val TEXT_RECEIVED_NAME = "文字消息.txt"
 
         fun formatSize(bytes: Long): String {

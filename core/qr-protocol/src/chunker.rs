@@ -14,7 +14,7 @@ use raptorq_core::Config;
 /// payload exactly `symbol_size` bytes — which simplifies rendering and
 /// scanning (uniform module density) at the cost of negligible overhead.
 pub fn pad_to_symbols(data: &[u8], config: Config) -> Vec<u8> {
-    let t = config.symbol_size as usize;
+    let t = config.symbol_size() as usize;
     let rem = data.len() % t;
     if rem == 0 {
         data.to_vec()

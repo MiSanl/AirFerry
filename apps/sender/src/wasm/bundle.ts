@@ -37,6 +37,16 @@
 
 export const BUNDLE_MAGIC = "ETBUNDL1"
 const BUNDLE_VERSION = 1
+/**
+ * Product memory budget shared with `raptorq_core::MAX_OBJECT_BYTES`.
+ *
+ * Encoding/compression and native receivers necessarily overlap more than one
+ * representation of a payload. Keeping this below the wire-format maximum
+ * prevents a valid transfer from exhausting a phone or browser process.
+ */
+export const MAX_TRANSFER_BYTES = 32 * 1024 * 1024
+export const MAX_TRANSFER_MIB = MAX_TRANSFER_BYTES / (1024 * 1024)
+export const MAX_BUNDLE_NAME_BYTES = 0xffff
 
 /** One file inside a bundle. `data` is the raw file content. */
 export interface BundleEntry {
@@ -92,22 +102,22 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
     throw new Error("buildBundle: too many files (max 65535)")
   }
 
-  // Read every file up front so we can size the output buffer exactly.
-  const entries: BundleEntry[] = []
-  for (const f of files) {
-    const data = new Uint8Array(await f.arrayBuffer())
-    entries.push({ name: f.name, data })
+  // Validate the complete allocation before reading any file into memory.
+  const nameBytes: Uint8Array[] = files.map((f) => new TextEncoder().encode(f.name))
+  let total = 8 + 2 + 2
+  for (let i = 0; i < files.length; i++) {
+    if (nameBytes[i].length > MAX_BUNDLE_NAME_BYTES) {
+      throw new Error(`文件名 UTF-8 编码超过 ${MAX_BUNDLE_NAME_BYTES} 字节: ${files[i].name}`)
+    }
+    total += 2 + nameBytes[i].length + 8 + files[i].size
+    if (!Number.isSafeInteger(total) || total > MAX_TRANSFER_BYTES) {
+      throw new Error(`打包后内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
+    }
   }
 
-  // Pre-encode names + compute total length.
-  const nameBytes: Uint8Array[] = entries.map((e) =>
-    new TextEncoder().encode(e.name)
-  )
-  let total = 8 + 2 + 2 // magic + version + count
-  for (let i = 0; i < entries.length; i++) {
-    total += 2 + nameBytes[i].length + 8 + entries[i].data.length
-  }
-
+  // Allocate the final container once, then read each file directly into it.
+  // The old implementation retained every per-file ArrayBuffer while also
+  // allocating the complete bundle, doubling peak memory for large batches.
   const out = new Uint8Array(total)
   const dv = new DataView(out.buffer)
   let o = 0
@@ -118,23 +128,24 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
   dv.setUint16(o, BUNDLE_VERSION)
   o += 2
   // file_count (u16 BE)
-  dv.setUint16(o, entries.length)
+  dv.setUint16(o, files.length)
   o += 2
 
   const manifest: BundleManifestEntry[] = []
-  for (let i = 0; i < entries.length; i++) {
+  for (let i = 0; i < files.length; i++) {
     const name = nameBytes[i]
     dv.setUint16(o, name.length)
     o += 2
     out.set(name, o)
     o += name.length
     // size as u64 BE
-    const sizeBytes = u64be(entries[i].data.length)
+    const data = new Uint8Array(await files[i].arrayBuffer())
+    const sizeBytes = u64be(data.length)
     for (const b of sizeBytes) out[o++] = b
     // content
-    out.set(entries[i].data, o)
-    o += entries[i].data.length
-    manifest.push({ name: entries[i].name, size: entries[i].data.length })
+    out.set(data, o)
+    o += data.length
+    manifest.push({ name: files[i].name, size: data.length })
   }
 
   return { bytes: out, entries: manifest }

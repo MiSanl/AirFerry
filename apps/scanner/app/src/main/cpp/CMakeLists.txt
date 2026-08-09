@@ -27,15 +27,17 @@ add_compile_definitions(NDEBUG)
 add_link_options("-Wl,-z,max-page-size=16384")
 
 # --- Fetch ZXing-C++ (zxing-cpp) ---
-# Correct repo: github.com/zxing-cpp/zxing-cpp. Pin stable v3.0.2.
-set(ZXING_TAG "v3.0.2")
+# Correct repo: github.com/zxing-cpp/zxing-cpp. Pin the v3.0.2 commit digest;
+# a mutable tag name is not sufficient for reproducible native builds.
+set(ZXING_COMMIT "8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825")
 set(ZXING_SRC_DIR "${CMAKE_BINARY_DIR}/zxing-src")
 
 include(FetchContent)
 FetchContent_Declare(
     zxing
     GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
-    GIT_TAG ${ZXING_TAG}
+    GIT_TAG ${ZXING_COMMIT}
+    GIT_SHALLOW FALSE
     SOURCE_DIR ${ZXING_SRC_DIR}
 )
 # Build only the core reader library (no examples, tests, writers, C-API).
@@ -49,8 +51,14 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zxing)
 
 # --- JNI bridge library ---
+set(AIRFERRY_ZXING_CORE_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/../../../../../../core/zxing-decoder")
 add_library(airferry_zxing SHARED
     scan_jni.cpp
+    "${AIRFERRY_ZXING_CORE_DIR}/airferry_zxing_core.cpp"
+)
+target_include_directories(airferry_zxing PRIVATE
+    "${AIRFERRY_ZXING_CORE_DIR}"
 )
 target_link_libraries(airferry_zxing
     ZXing::ZXing

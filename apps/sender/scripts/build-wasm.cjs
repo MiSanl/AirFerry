@@ -1,153 +1,104 @@
 /**
- * Build BOTH WASM variants the sender ships:
- *
- *   ① wasm-pkg-legacy/ — wasm-bindgen 0.2.92 (the default pinned in
- *      core/transfer-engine/Cargo.toml), scalar (no SIMD), no reference-types
- *      / externref. Loadable on Chrome 87+ (the MV3 extension_pages baseline)
- *      and Firefox 91+. Used by the MV2 build targets.
- *
- *   ② wasm-pkg-simd/ — wasm-bindgen 0.2.125 + js-sys/web-sys 0.3.102 (a modern,
- *      reference-types-enabled combo), built with RUSTFLAGS=+simd128. Used by
- *      the MV3 build targets. The `next_qr_into` zero-copy API is available in
- *      both variants.
- *
- * ## ⚠️ Measured performance (do NOT expect a speedup)
- *
- * Benchmark on the full `next_qr_into` path (V25 / 1400B symbol, 5000 frames),
- * taken BEFORE the QR library swap (i.e. with the old scalar `qrcode` crate):
- *   - SIMD vs scalar: 0.95× (slightly SLOWER). `raptorq` and `qrcode` were pure
- *     scalar Rust with no `std::arch::wasm32::*` intrinsics, so `+simd128` had
- *     nothing to vectorize — it only made the wasm ~8KB larger (312KB vs
- *     304KB) and marginally slower from icache pressure.
- *   - externref: no measurable win either; the cost was drowned out by QR
- *     Reed-Solomon encoding (~4.8ms/frame, ~98% of per-tick work).
- *
- * NOTE: QR encoding now uses `fast_qr` (replaces `qrcode`, ~7-9× faster on the
- * Reed-Solomon path), so QR is no longer the dominant cost. The SIMD finding
- * still holds: `fast_qr` likewise has no wasm32 SIMD intrinsics, so `+simd128`
- * remains a no-op for the hot path. Re-benchmark if a SIMD-aware QR lib is added.
- *
- * ## Why keep the dual build + SIMD then
- *
- *   1. Solves the root cause of the Chrome 87 `externref` CompileError: MV2
- *      gets the legacy (externref-free) build, MV3 gets the modern one.
- *   2. Keeps the build infrastructure ready for the day we swap in a SIMD-aware
- *      RaptorQ GF(256) SIMD path — flipping `+simd128` on/off is then a
- *      one-line change with instant effect.
- *
- * ## How the dual-version build stays reproducible
- *
- * The default checked-in Cargo.toml pins wasm-bindgen = "=0.2.92" (and
- * js-sys / web-sys = "=0.3.69") with exact `=` requirements — this MUST stay
- * the default state so any casual `cargo update` / `cargo test` produces a
- * Chrome-87-safe module. To build the SIMD variant against a newer
- * wasm-bindgen we temporarily rewrite those three version pins to a modern
- * matched set, regenerate Cargo.lock, run wasm-pack, then RESTORE the
- * original bytes verbatim in `finally`. This preserves even uncommitted
- * Cargo.toml/Cargo.lock edits that existed before the build; the script never
- * uses `git checkout` to overwrite developer work.
- *
- * Output dirs (both git-ignored via their internal `*` .gitignore copied from
- * wasm-pack's pkg/ output):
- *   apps/sender/wasm-pkg-legacy/   ← MV2 targets
- *   apps/sender/wasm-pkg-simd/     ← MV3 targets
- * The loader (apps/sender/src/wasm/loader.ts) still imports from `wasm-pkg/`;
- * scripts/build-all.cjs copies the right variant into `wasm-pkg/` per target
- * before each `plasmo build`.
+ * Build the legacy and modern WASM variants from isolated temporary workspace
+ * copies. The checked-out Cargo.toml/Cargo.lock are never rewritten, so a
+ * concurrent Cargo command, interruption, or process kill cannot corrupt or
+ * roll back a developer's working tree.
  */
-const { execSync } = require("child_process");
-const fs = require("fs");
-const path = require("path");
+const { execFileSync } = require("child_process")
+const fs = require("fs")
+const os = require("os")
+const path = require("path")
+const { acquireWasmLock } = require("./wasm-lock.cjs")
 
-const root = path.resolve(__dirname, "..");
-const repoRoot = path.resolve(root, "../..");
-const cargoTomlPath = path.join(repoRoot, "core/transfer-engine/Cargo.toml");
-const cargoLockPath = path.join(repoRoot, "Cargo.lock");
+const senderRoot = path.resolve(__dirname, "..")
+const repoRoot = path.resolve(senderRoot, "../..")
+const requested = process.argv[2] || "all"
+if (!new Set(["all", "legacy", "simd"]).has(requested)) {
+  console.error("Usage: node scripts/build-wasm.cjs [all|legacy|simd]")
+  process.exit(2)
+}
 
-// Modern, matched triple: these three crates release in lockstep, so their
-// versions must move together. 0.2.125 / 0.3.102 is the current stable line.
 const MODERN = {
   wasmBindgen: "0.2.125",
   jsSys: "0.3.102",
   webSys: "0.3.102",
-};
-
-function run(cmd, opts = {}) {
-  console.log(`\n▶ ${cmd}`);
-  execSync(cmd, { cwd: root, stdio: "inherit", ...opts });
 }
 
-function fail(msg) {
-  console.error(`\n✖ ${msg}`);
-  process.exit(1);
+function run(file, args, cwd, env = process.env) {
+  console.log(`\n▶ ${file} ${args.join(" ")}`)
+  execFileSync(file, args, { cwd, env, stdio: "inherit" })
 }
 
-// --- 1. Read the canonical Cargo.toml and verify it's in the expected
-//        legacy-pinned state before we touch anything. ----------------------
-const originalToml = fs.readFileSync(cargoTomlPath, "utf8");
-const originalLock = fs.readFileSync(cargoLockPath);
+function isolatedWorkspace() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "airferry-wasm-"))
+  fs.copyFileSync(path.join(repoRoot, "Cargo.toml"), path.join(temp, "Cargo.toml"))
+  fs.copyFileSync(path.join(repoRoot, "Cargo.lock"), path.join(temp, "Cargo.lock"))
+  fs.cpSync(path.join(repoRoot, "core"), path.join(temp, "core"), {
+    recursive: true,
+    filter: (source) => !source.split(path.sep).includes("target"),
+  })
+  return temp
+}
 
-const LEGACY_PATTERNS = {
-  wasmBindgen: /wasm-bindgen = \{ version = "=0\.2\.92"/,
-  jsSys: /^js-sys = "=0\.3\.69"/m,
-  webSys: /web-sys = \{ version = "=0\.3\.69"/,
-};
-for (const [k, re] of Object.entries(LEGACY_PATTERNS)) {
-  if (!re.test(originalToml)) {
-    fail(
-      `Cargo.toml is not in the expected legacy-pinned state (${k} does not match ${re}). ` +
-        `Refusing to rewrite — restore core/transfer-engine/Cargo.toml to wasm-bindgen =0.2.92 / js-sys,web-sys =0.3.69 before retrying.`
-    );
+function modernize(temp) {
+  const manifest = path.join(temp, "core/transfer-engine/Cargo.toml")
+  const original = fs.readFileSync(manifest, "utf8")
+  const requiredPins = [
+    /wasm-bindgen = \{ version = "=0\.2\.92"/,
+    /^js-sys = "=0\.3\.69"/m,
+    /web-sys = \{ version = "=0\.3\.69"/,
+  ]
+  if (requiredPins.some((pattern) => !pattern.test(original))) {
+    throw new Error("one or more legacy wasm-bindgen/js-sys/web-sys pins were not found")
   }
-}
-
-try {
-  // --- 2. Legacy build (uses the default =0.2.92 pins as-is). --------------
-  console.log("\n=== [1/2] Legacy WASM (wasm-bindgen 0.2.92, scalar, Chrome87-safe) ===");
-  run("npm run wasm:legacy");
-
-  // --- 3. SIMD build: temporarily rewrite Cargo.toml + Cargo.lock. --------
-  console.log("\n=== [2/2] SIMD WASM (wasm-bindgen 0.2.125 + SIMD, MV3) ===");
-  const modernized = originalToml
-    .replace(
-      /wasm-bindgen = \{ version = "=0\.2\.92"/,
-      `wasm-bindgen = { version = "=${MODERN.wasmBindgen}"`
-    )
+  const modern = original
+    .replace(/wasm-bindgen = \{ version = "=0\.2\.92"/, `wasm-bindgen = { version = "=${MODERN.wasmBindgen}"`)
     .replace(/^js-sys = "=0\.3\.69"/m, `js-sys = "=${MODERN.jsSys}"`)
-    .replace(
-      /web-sys = \{ version = "=0\.3\.69"/,
-      `web-sys = { version = "=${MODERN.webSys}"`
-    );
-  fs.writeFileSync(cargoTomlPath, modernized);
-  console.log(
-    `  Cargo.toml rewritten: wasm-bindgen =${MODERN.wasmBindgen}, js-sys/web-sys =${MODERN.jsSys}`
-  );
+    .replace(/web-sys = \{ version = "=0\.3\.69"/, `web-sys = { version = "=${MODERN.webSys}"`)
+  fs.writeFileSync(manifest, modern)
+  run("cargo", ["generate-lockfile", "--manifest-path", path.join(temp, "Cargo.toml")], temp)
+}
 
-  // Re-resolve the lockfile so wasm-pack downloads the matching cli. Run from
-  // the repo root so the workspace Cargo.lock is what gets regenerated.
-  run("cargo generate-lockfile", { cwd: repoRoot });
-  run("npm run wasm:simd");
-} finally {
-  // --- 4. Restore both files from their pre-build byte snapshots. --------
-  //    This is the critical reproducibility invariant: after this script,
-  //    `git status` must show no Cargo.toml / Cargo.lock changes.
-  //
-  //    Never restore through Git: doing so discards legitimate uncommitted
-  //    lockfile changes that predated this build. We also must not run
-  //    `cargo generate-lockfile` here because it would re-resolve unrelated
-  //    packages. The startup snapshots preserve the caller's exact bytes.
+function publishDirectory(source, name) {
+  const destination = path.join(senderRoot, name)
+  const staged = path.join(senderRoot, `.${name}.staged-${process.pid}`)
+  fs.rmSync(staged, { recursive: true, force: true })
+  fs.cpSync(source, staged, { recursive: true })
+  fs.rmSync(destination, { recursive: true, force: true })
+  fs.renameSync(staged, destination)
+}
+
+function buildVariant(variant) {
+  const temp = isolatedWorkspace()
   try {
-    fs.writeFileSync(cargoTomlPath, originalToml);
-    fs.writeFileSync(cargoLockPath, originalLock);
-    console.log("\n✓ Cargo.toml + Cargo.lock restored to their pre-build bytes.");
-  } catch (restoreErr) {
-    console.error("\n‼ Failed to restore the pre-build Cargo file snapshots.");
-    console.error(`   Cargo.toml: ${cargoTomlPath}`);
-    console.error(`   Cargo.lock: ${cargoLockPath}`);
-    throw restoreErr;
+    if (variant === "simd") modernize(temp)
+    const pkg = path.join(temp, `pkg-${variant}`)
+    const env = variant === "simd"
+      ? { ...process.env, RUSTFLAGS: "-C target-feature=+simd128" }
+      : process.env
+    run(
+      "wasm-pack",
+      ["build", path.join(temp, "core/transfer-engine"), "--target", "web", "--out-dir", pkg,
+        "--", "--features", "wasm,serde"],
+      temp,
+      env
+    )
+    publishDirectory(pkg, `wasm-pkg-${variant}`)
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true })
   }
 }
 
-console.log("\n✅ Both WASM variants built:");
-console.log("   apps/sender/wasm-pkg-legacy/  (MV2 targets, Chrome87-safe)");
-console.log("   apps/sender/wasm-pkg-simd/    (MV3 targets, SIMD)");
+const releaseLock = acquireWasmLock(senderRoot)
+try {
+  if (requested === "all" || requested === "legacy") buildVariant("legacy")
+  if (requested === "all" || requested === "simd") buildVariant("simd")
+  // Publish a default sender snapshot for direct tooling/import resolution.
+  // Web copies wasm-pkg-simd into its own directory during prepare-wasm.
+  if (requested !== "legacy") {
+    publishDirectory(path.join(senderRoot, "wasm-pkg-simd"), "wasm-pkg")
+  }
+  console.log("\n✅ WASM output published without modifying Cargo sources")
+} finally {
+  releaseLock()
+}

@@ -1,18 +1,18 @@
 using System.Collections.ObjectModel;
-using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
-using AirFerry.Windows.ViewModels;
+using AirFerry.Windows.Scan;
 
 namespace AirFerry.Windows.Views;
 
 /// <summary>
 /// Received-file history browser — mirrors Android's <c>FileListActivity</c>.
-/// Lists files (and bundle subdirs) under <see cref="ScanViewModel.ReceivedDir"/>,
-/// double-click to open (text-like → copy UI, else shell), "clear all" to wipe.
+/// Lists logical entries from <see cref="ContentStore"/>. Opening is always
+/// handled inside AirFerry; untrusted received files are never shell-executed.
 /// </summary>
 public partial class FileListView : Page
 {
@@ -28,47 +28,36 @@ public partial class FileListView : Page
     private void Refresh()
     {
         _entries.Clear();
-        string dir = ScanViewModel.ReceivedDir;
-        PathHint.Text = $"位置: {dir}";
-        if (!Directory.Exists(dir))
+        PathHint.Text = $"位置: {ContentStore.RootDir}";
+        IReadOnlyList<ContentStore.Entry> entries;
+        try
+        {
+            ContentStore.MigrateLegacyReceivedIfNeeded();
+            entries = ContentStore.ListEntries();
+        }
+        catch (InvalidDataException ex)
         {
             ClearButton.IsEnabled = false;
+            PathHint.Text = ex.Message;
+            MessageBox.Show(ex.Message, "AirFerry", MessageBoxButton.OK,
+                MessageBoxImage.Error);
             return;
         }
-        ClearButton.IsEnabled = true;
-
-        var infos = new List<FileEntry>();
-        // Directories (bundle subdirs) first, then files; both by modified desc.
-        foreach (string d in Directory.EnumerateDirectories(dir))
+        ClearButton.IsEnabled = entries.Count > 0;
+        foreach (ContentStore.Entry item in entries.OrderByDescending(e => e.CreatedAt))
         {
-            var info = new DirectoryInfo(d);
-            infos.Add(new FileEntry(
-                info.Name + "/",
-                info.Name,
-                "—",
-                info.LastWriteTime.ToString("yyyy-MM-dd HH:mm"),
-                d,
-                IsDirectory: true));
-        }
-        foreach (string f in Directory.EnumerateFiles(dir))
-        {
-            // Skip the .meta sidecars (mirror Android which filters them).
-            if (f.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-            var info = new FileInfo(f);
-            infos.Add(new FileEntry(
-                info.Name,
-                info.Name,
-                FormatSize((ulong)info.Length),
-                info.LastWriteTime.ToString("yyyy-MM-dd HH:mm"),
-                f,
-                IsDirectory: false));
-        }
-        foreach (FileEntry entry in infos.OrderByDescending(e => e.ModifiedText))
-        {
-            _entries.Add(entry);
+            string path = ContentStore.BlobPath(item.Hash);
+            _entries.Add(new FileEntry(
+                item.Id,
+                item.BundleTitle is null ? item.Name : $"{item.BundleTitle} / {item.Name}",
+                item.Name,
+                FormatSize((ulong)item.Size),
+                DateTimeOffset.FromUnixTimeMilliseconds(item.CreatedAt)
+                    .ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                path,
+                item.Kind,
+                item.CrcHex,
+                item.CrcUnknown));
         }
     }
 
@@ -78,44 +67,47 @@ public partial class FileListView : Page
         {
             return;
         }
-        if (!entry.IsDirectory && FileNameUtil.IsTextLikeName(entry.Name))
+        if (!File.Exists(entry.FullPath))
         {
-            try
-            {
-                long len = new FileInfo(entry.FullPath).Length;
-                if (FileNameUtil.FitsTextUi(len))
-                {
-                    byte[] bytes = File.ReadAllBytes(entry.FullPath);
-                    string? text = FileNameUtil.DecodeUtf8Strict(bytes);
-                    if (text is not null)
-                    {
-                        var result = new RecoveryResult(
-                            SingleFilePath: entry.FullPath,
-                            SingleFileSize: (ulong)bytes.Length,
-                            ExpectedCrc32: null,
-                            Crc32Known: false,
-                            ReceivedCrc32: null,
-                            Bundle: null,
-                            BundleDir: null,
-                            Text: text);
-                        NavigationService?.Navigate(new ReceiveTextView(result, entry.Name));
-                        return;
-                    }
-                }
-                // Oversize or invalid UTF-8 → fall through to shell open.
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"无法作为文字打开: {ex.Message}", "AirFerry",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
-                // fall through to shell open
-            }
+            MessageBox.Show("内容文件已丢失或损坏。", "AirFerry",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
         }
-        // Open with the shell handler (file → default app, dir → Explorer).
-        Process.Start(new ProcessStartInfo(entry.FullPath)
+        try
         {
-            UseShellExecute = true,
-        });
+            long len = new FileInfo(entry.FullPath).Length;
+            byte[]? bytes = null;
+            bool textCandidate = entry.Kind == "text" || FileNameUtil.IsTextLikeName(entry.Name);
+            if (textCandidate && FileNameUtil.FitsTextUi(len))
+            {
+                bytes = File.ReadAllBytes(entry.FullPath);
+                string? text = FileNameUtil.DecodeUtf8Strict(bytes);
+                if (text is not null)
+                {
+                    var textResult = BuildResult(entry, (ulong)bytes.Length,
+                        Crc32.Compute(bytes), text);
+                    NavigationService?.Navigate(new ReceiveTextView(textResult, entry.Name));
+                    return;
+                }
+            }
+            ulong receivedCrc;
+            if (bytes is not null)
+            {
+                receivedCrc = Crc32.Compute(bytes);
+            }
+            else
+            {
+                using FileStream stream = File.OpenRead(entry.FullPath);
+                receivedCrc = Crc32.Compute(stream);
+            }
+            NavigationService?.Navigate(new ReceiveDetailView(
+                BuildResult(entry, (ulong)len, receivedCrc, null)));
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"无法打开: {ex.Message}", "AirFerry",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void ClearAll_Click(object sender, RoutedEventArgs e)
@@ -127,11 +119,7 @@ public partial class FileListView : Page
         }
         try
         {
-            string dir = ScanViewModel.ReceivedDir;
-            if (Directory.Exists(dir))
-            {
-                Directory.Delete(dir, recursive: true);
-            }
+            ContentStore.ClearAll();
             Refresh();
         }
         catch (Exception ex)
@@ -150,11 +138,32 @@ public partial class FileListView : Page
         _ => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
     };
 
+    private static RecoveryResult BuildResult(
+        FileEntry entry, ulong size, ulong receivedCrc, string? text)
+    {
+        ulong expected = 0;
+        bool parsed = !entry.CrcUnknown && ulong.TryParse(entry.CrcHex,
+            NumberStyles.HexNumber, CultureInfo.InvariantCulture, out expected);
+        return new RecoveryResult(
+            SingleFilePath: entry.FullPath,
+            SingleFileSize: size,
+            ExpectedCrc32: parsed ? expected : null,
+            Crc32Known: parsed,
+            ReceivedCrc32: receivedCrc,
+            Bundle: null,
+            BundleDir: null,
+            Text: text,
+            DisplayName: entry.Name);
+    }
+
     public sealed record FileEntry(
+        string Id,
         string DisplayName,
         string Name,
         string SizeText,
         string ModifiedText,
         string FullPath,
-        bool IsDirectory);
+        string Kind,
+        string CrcHex,
+        bool CrcUnknown);
 }

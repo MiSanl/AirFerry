@@ -8,7 +8,9 @@ use transfer_engine::receiver::ReceiverSession;
 use transfer_engine::sender::{SenderConfig, SenderSession};
 
 fn pseudo_random(n: usize) -> Vec<u8> {
-    (0..n).map(|i| ((i * 1103515245 + 12345) & 0xff) as u8).collect()
+    (0..n)
+        .map(|i| ((i * 1103515245 + 12345) & 0xff) as u8)
+        .collect()
 }
 
 /// Drive a full send → receive cycle. The receiver is bootstrapped from the

@@ -55,7 +55,7 @@ val keystoreProperties = Properties().apply {
 }
 signingConfigs {
     create("release") {
-        if (!keystoreProperties.isEmpty) {
+        if (releaseSigningReady) {
             storeFile     = rootProject.file(keystoreProperties.getProperty("storeFile"))
             storePassword = keystoreProperties.getProperty("storePassword")
             keyAlias      = keystoreProperties.getProperty("keyAlias")
@@ -65,12 +65,10 @@ signingConfigs {
 }
 buildTypes {
     release {
-        // 有 keystore.properties → 用 release keystore；否则回退 debug（保证 CI 无密钥也能产出 APK）
-        signingConfig = if (!keystoreProperties.isEmpty)
-            signingConfigs.getByName("release")
-        else signingConfigs.getByName("debug")
+        signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else null
     }
 }
+// taskGraph guard: 任一 release 任务在 !releaseSigningReady 时抛 GradleException。
 ```
 
 `keystore.properties`（每个构建环境各一份，git-ignored）指向 `dist/` 下的 release keystore：
@@ -85,7 +83,7 @@ keyPassword=airferry
 
 > keystore 路径相对于 Gradle `rootProject`（即 `apps/scanner/`），解析到 `<repo>/dist/airferry-release.keystore`。`dist/` 与 `*.keystore` 均在 `.gitignore` 中，密钥随 release 产物一起放在 `dist/`、不入 git。
 >
-> 仓库自带的默认口令（`airferry`）仅供自托管分发；正式上架 Play Store 等商店时，请生成强口令的专用 keystore 并替换此文件。无此文件时构建自动回退 debug 签名，不会硬失败。
+> 示例口令仅供本地说明；正式分发必须生成强口令的专用 keystore。缺少文件、字段或 keystore 时 `assembleRelease` 会直接失败，绝不会回退到 debug key。根脚本还会用 `apksigner` 验证证书并拒绝 Android Debug 签名；可设置 `AIRFERRY_ANDROID_CERT_SHA256` 固定预期证书指纹。
 
 ## 安装到设备
 
@@ -100,18 +98,18 @@ APK 包含三个原生库：
 | 库 | 来源 | 用途 |
 |----|------|------|
 | `libtransfer_engine.so` | Rust → cargo-ndk | RaptorQ 编解码（JNI） |
-| `libairferry_zxing.so` | ZXing-C++ → CMake | QR 码解码（JNI） |
+| `libairferry_zxing.so` | 共享 ZXing-C++ 核心 → CMake/JNI | QR 全帧/多 ROI 解码；算法与 Windows 相同 |
 | `libimage_processing_util_jni.so` | CameraX | 图像处理工具 |
 
 ## ZXing-C++ 构建
 
-ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（pinned v3.0.2），首次构建时自动编译。
+ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。实际识别逻辑位于仓库级 `core/zxing-decoder/`，Android 的 `scan_jni.cpp` 仅做 JNI 桥接；Windows C ABI 复用同一核心。
 
 ```cmake
 # app/src/main/cpp/CMakeLists.txt
 FetchContent_Declare(zxing
     GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
-    GIT_TAG v3.0.2
+    GIT_TAG 8dd1cf5c4fd6fb6211bb96713db926ac6f2cf825
 )
 ```
 
@@ -158,7 +156,7 @@ apps/scanner/
         ├── AndroidManifest.xml
         ├── cpp/
         │   ├── CMakeLists.txt    # ZXing-C++ 构建
-        │   └── scan_jni.cpp      # ZXing JNI 桥接
+        │   └── scan_jni.cpp      # 共享 ZXing-C++ 核心的 JNI 薄桥
         ├── java/com/airferry/app/
         │   ├── nativelib/
         │   │   └── NativeBridge.kt       # Rust JNI 绑定

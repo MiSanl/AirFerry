@@ -8,7 +8,6 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -29,6 +28,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.airferry.app.scan.CreateNamedDocument
+import com.airferry.app.scan.FileTransfer
+import com.airferry.app.scan.TextLike
+import java.io.File
 
 private val BgDark = Color(0xFF0F172A)
 private val CardBg = Color(0xFF1E293B)
@@ -47,7 +50,8 @@ private val Error = Color(0xFFEF4444)
  * it as a `.txt`. CRC verification is shown the same way as a file.
  *
  * Invoked from [com.airferry.app.ui.ScanActivity.recoverAndStage] with intent
- * extras: `TEXT` (String), `CRC32`/`CRC32_RECEIVED`/`CRC32_UNKNOWN`.
+ * extras: `FILE_PATH`, `CRC32`/`CRC32_RECEIVED`/`CRC32_UNKNOWN`. Text is loaded
+ * from the staged file to avoid Android Binder's transaction-size limit.
  */
 class ReceiveTextActivity : ComponentActivity() {
 
@@ -61,7 +65,7 @@ class ReceiveTextActivity : ComponentActivity() {
     private var saveFileName: String = "文字消息.txt"
 
     private val createDocument = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("text/plain")
+        CreateNamedDocument()
     ) { uri: Uri? ->
         if (uri != null) saveToUri(uri)
     }
@@ -69,7 +73,16 @@ class ReceiveTextActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        text = intent.getStringExtra("TEXT") ?: ""
+        text = intent.getStringExtra("TEXT") ?: intent.getStringExtra("FILE_PATH")
+            ?.let { path ->
+                try {
+                    val file = File(path)
+                    if (!file.isFile || !TextLike.fitsTextUi(file.length())) null
+                    else TextLike.decodeUtf8Strict(file.readBytes())
+                } catch (_: Exception) {
+                    null
+                }
+            }.orEmpty()
         expectedCrc = readCrcExtra(intent, "CRC32")
         receivedCrc = readCrcExtra(intent, "CRC32_RECEIVED")
         crcUnknown = intent.getBooleanExtra("CRC32_UNKNOWN", true)
@@ -236,11 +249,27 @@ class ReceiveTextActivity : ComponentActivity() {
         clipboard.setPrimaryClip(ClipData.newPlainText("", text))
     }
 
-    /** Share the text via ACTION_SEND with type text/plain and EXTRA_TEXT only. */
+    /** Share small text inline; large text uses the logically named ContentStore URI. */
     private fun shareText() {
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, text)
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        val shareIntent = if (bytes.size <= 256 * 1024) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+            }
+        } else {
+            val file = intent.getStringExtra("FILE_PATH")?.let(::File)
+            if (file == null || !file.isFile) {
+                Toast.makeText(this, "分享文件不可用", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val uri = FileTransfer.shareUri(this, file, saveFileName)
+            Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_TITLE, FileTransfer.displayName(saveFileName))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
         }
         startActivity(Intent.createChooser(shareIntent, "分享文字"))
     }

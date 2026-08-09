@@ -39,7 +39,7 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 
 每帧 = `[Header 60B][Payload T B][Footer 4B]`，**T = symbol_size**。所有多字节整数**大端序**。
 
-- 一次会话内 T 恒定。浏览器默认 **1400**（`apps/sender/src/types.ts` `DEFAULT_CONFIG.symbolSize`，激进预设；整帧 **1464B → QR V27 125×125**）；核心库默认 **1024**（`DEFAULT_SYMBOL_SIZE`，整帧 1088B → QR V23 109×109）。接收端从帧头 `symbol_size` 自适应。预设另有 512/896/1008/1900/2400，见 [qr-frame-format.md](qr-frame-format.md)。
+- 一次会话内 T 恒定，合法域为 64..=65528 且必须 8 字节对齐。浏览器默认 **1400**；核心库默认 **1024**。接收端从帧头自适应。预设另有 512/896/1008/1904/2400。
 - magic `0x4554`（ASCII "ET"），version `1`。
 
 ### Header（60 字节）
@@ -75,7 +75,7 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 |----|-----|
 | Rust 构/析 | `core/qr-protocol/src/frame.rs`：`build` / `to_bytes` / `from_bytes` |
 | 常量 | `frame.rs:13-22`：`MAGIC=0x4554`、`PROTOCOL_VERSION=1`、`FLAG_DESCRIPTOR=0x01`、头 60 / 尾 4 |
-| Kotlin 帧头解析 | `apps/scanner/.../scan/ReceiverSessionManager.kt:98` `parseHeader`（镜像上述布局） |
+| Kotlin 帧头解析 | `apps/scanner/.../scan/ReceiverSessionManager.kt:99` `parseHeader`（镜像上述布局） |
 
 ---
 
@@ -157,10 +157,10 @@ offset  size   field
 ```
 
 - **无 per-field CRC**：整段文字受 transfer-level CRC32（descriptor）+ RaptorQ + 双层帧 CRC 保护，与单文件完全一致。
-- **descriptor 字段**：`filename = "文字消息.txt"`、`original_size = 8 + len(utf8)`、其余字段照常。老接收端不认 ETTEXTv1 → 落到单文件兜底（③），存成 `.txt` 仍可正常打开（向后兼容）。
-- **会话 ID 派生**：name=`"文字消息.txt"`、size=`8+len`、mtime=`Date.now()`（发送时刻，替代文件的 `lastModified`）、fingerprint=内容指纹（头/尾 1024B）。
-- **发送端何时走 ETTEXTv1（UI）**：选择页统一列表里**恰好 1 条文字、0 文件**时 `compressWorker.postMessage({ text })` → `processText`。混发 / 多条文字 → 文字物化为命名 `.txt` 进 `ETBUNDL1`（无 ETTEXTv1 魔数）。
-- **收端 UI（不改 wire 格式）**：① ETTEXTv1 → `ReceiveText`；② 单文件/打包条目若扩展名属文本类（`TextLike` / `FileNameUtil.IsTextLikeName`：txt/md/json/源码…）且为严格 UTF-8 → 同样进 `ReceiveText` 可复制；非法 UTF-8 回退文件页。
+- **descriptor 字段**：`filename` = 选择页用户命名（`normalizeDraftFilename`，默认 `文字消息.txt`）、`original_size = 8 + len(utf8)`、其余字段照常。老接收端不认 ETTEXTv1 → 落到单文件兜底（③），按 descriptor 名存成 `.txt` 仍可打开（向后兼容）。
+- **会话 ID 派生**：name=上述 filename、size=`8+len`、mtime=`Date.now()`（发送时刻，替代文件的 `lastModified`）、fingerprint=内容指纹（头/尾 1024B）。
+- **发送端何时走 ETTEXTv1（UI）**：选择页统一列表里**恰好 1 条文字、0 文件**时 `compressWorker.postMessage({ text, name })` → `processText`（`name` 写入 descriptor / session 派生；空则默认 `文字消息.txt`）。混发 / 多条文字 → 文字物化为命名 `.txt` 进 `ETBUNDL1`（无 ETTEXTv1 魔数）。
+- **收端 UI（不改 wire 格式）**：① ETTEXTv1 → `ReceiveText`，保存/展示名优先 descriptor `fileName()`（Android `ScanActivity` / Windows `StageEtText`），勿再写死 `文字消息.txt`；② 单文件/打包条目若扩展名属文本类（`TextLike` / `FileNameUtil.IsTextLikeName`：txt/md/json/源码…）且为严格 UTF-8 → 同样进 `ReceiveText` 可复制；非法 UTF-8 回退文件页。
 
 ### 权威源
 
@@ -209,14 +209,14 @@ offset  size   field
 
 ### 解压（接收端）
 
-按描述符 `compression` 标签解压。**炸弹防护**：`core/qr-protocol/src/compress.rs:97 decompress_with_limit` 把输出上限封顶到描述符 `original_size`，超限即判失败，防 OOM。
+按描述符 `compression` 标签解压。**炸弹防护**：`core/qr-protocol/src/compress.rs:107 decompress_with_limit` 把输出上限封顶到描述符 `original_size`，超限即判失败，防 OOM。
 
 ### 权威源
 
 | 端 | 源 |
 |----|-----|
-| Rust 分发 | `core/qr-protocol/src/compress.rs:68` `compress_with` / `decompress_with` / `:97` `decompress_with_limit` |
-| 标签常量 | `compress.rs:28-30`：`COMPRESSION_NONE=0`/`ZSTD=1`/`XZ=2` |
+| Rust 分发 | `core/qr-protocol/src/compress.rs:76` `compress_with` / `decompress_with` / `:107` `decompress_with_limit` |
+| 标签常量 | `compress.rs:27-29`：`COMPRESSION_NONE=0`/`ZSTD=1`/`XZ=2` |
 | 浏览器 (TS) | `apps/sender/src/wasm/compress.ts:49` `CompressionAlgorithm` 枚举（镜像） |
 
 ---
@@ -226,7 +226,7 @@ offset  size   field
 | 符号类型 | ESI 范围 | 说明 |
 |---------|---------|------|
 | 源符号 | `[0, K_block)` | 原始数据符号 |
-| 修复符号 | `[K_block, ∞)` | 喷泉码生成，无限可生成 |
+| 修复符号 | `[K_block, 2²⁴−1]` | 喷泉码按需生成；到协议 ESI 上限后明确停止 |
 
 - **SBN**：u8（0–255），源块号。
 - **ESI**：u24（0–16777215）。
@@ -236,13 +236,13 @@ offset  size   field
 ### 发射策略（发送端，消除 coupon-collector 拖尾）
 
 1. **源符号阶段（仅一遍）**：所有源符号跨块轮询（esi-major）输出——先每块 esi=0，再每块 esi=1……突发丢帧被均摊到所有块。
-2. **无限新鲜修复阶段**：源符号发完后持续生成修复符号，跨块轮询，每块修复 ESI **单调递增、永不重复**（block_b 第 m 轮 ESI = K_b + m）。
+2. **持续新鲜修复阶段**：源符号发完后持续生成修复符号，跨块轮询，每块修复 ESI **单调递增、永不重复**（block_b 第 m 轮 ESI = K_b + m）；若下一 ESI 将达到 `2²⁴`，发送端返回耗尽错误，不调用上游也不回绕。
 
 → 源符号发完后**每一帧都是接收端从未见过的新符号**，进度近似线性。`redundancy_pct`（5–50，默认 25）**仅用于 UI 时长估算**，不限制实际修复符号数。
 
 ### 权威源
 
-`core/raptorq-core/src/encoder.rs:63,73`（源/修复符号）、`core/transfer-engine/src/sender.rs:164` `next_frame` / `:235` `next_symbol_id`。
+`core/raptorq-core/src/encoder.rs:67,77`（源/修复符号）、`core/transfer-engine/src/sender.rs:169` `next_frame` / `:246` `next_symbol_id`。
 
 ---
 
@@ -252,10 +252,13 @@ offset  size   field
 
 | 防线 | 位置 | 作用 |
 |------|------|------|
-| OTI 校验 | `core/raptorq-core/src/meta.rs:97` `ObjectMeta::validate` | 接收前校验 symbol_size、OTI 一致性、块数、K 范围、`block_length == K*symbol_size`；非法则按损坏帧丢弃，绝不构建非法解码器 |
+| OTI 校验 | `core/raptorq-core/src/meta.rs` `ObjectMeta::validate` | 校验 T 的范围/对齐、OTI reserved/sub-block/alignment/整除关系、canonical SBN、块数/K/长度及本地资源预算；非法绝不构建解码器 |
 | 坐标守卫 | decoder 入参检查 + `ReceiverSession::ingest` | 拒绝 ESI≥2²⁴ / 载荷≠symbol_size |
-| 解压炸弹 | `compress.rs:97 decompress_with_limit` | 输出封顶到 `original_size` |
+| 解压炸弹 | `compress.rs` + `receiver.rs` | XZ 解码器内存 128 MiB；输出与对象均封顶 32 MiB，并要求结果长度精确等于 `original_size`；32 MiB 产品预算为跨 FFI/解压/落盘的重叠缓冲留余量 |
 | 帧校验 | `Frame::from_bytes` | magic/version/双层 CRC |
+| 预描述符缓存封顶 | `receiver.rs` `PRE_META_SYMBOL_CACHE_MAX`（12000） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM |
+| 描述符冻结 | `receiver.rs` `descriptor_seen` | 首个通过全部校验的 descriptor 确立 OTI、文件元数据与压缩算法；同 session 后续描述符只可完全一致，禁止中途替换解码参数 |
+| WASM symbol_size | `wasm.rs` `Config::new(symbol_size)` | 仅接受 64..=65528 的 8 字节倍数，禁止按字段构造绕过 |
 
 > 接收端扫描的是**任意屏幕**的二维码，描述符/帧元数据均**不可信**。CRC32 仅保完整性、不认证——上述参数校验才是真正防线。
 
@@ -283,8 +286,8 @@ offset  size   field
 
 | 端 | 源 |
 |----|-----|
-| Rust 打包 | `core/transfer-engine/src/jni.rs:68` `receiverIngest` / `:130` `pack_ingest_status` |
-| Kotlin 解包 | `apps/scanner/.../scan/ReceiverSessionManager.kt:67` `IngestStatus.unpack` |
+| Rust 打包 | `core/transfer-engine/src/jni.rs:67` `receiverIngest` / `:142` `pack_ingest_status` |
+| Kotlin 解包 | `apps/scanner/.../scan/ReceiverSessionManager.kt:68` `IngestStatus.unpack` |
 
 > 改位布局时两端必须同步。
 
@@ -319,7 +322,7 @@ offset  size   field
 | 1008（`extreme`） | 1072 | V22 | 105×105 |
 | 1024（核心库默认） | 1088 | V23 | 109×109 |
 | 1400（浏览器默认，`aggressive`） | **1464** | **V27** | **125×125** |
-| 1900（`turbo`） / 2400（`max`） | 1964 / 2464 | 动态最小 | 见 `min_version_for` |
+| 1904（`turbo`） / 2400（`max`） | 1968 / 2464 | V34 / V39 | 153×153 / 173×173 |
 
 > 历史教训：曾强制 V40（177×177），模块过密致数据帧无法解码、收端卡 0%。改最小版本后稳定。完整预设表见 [qr-frame-format.md](qr-frame-format.md)。
 
@@ -346,11 +349,11 @@ offset  size   field
 
 | 源 | 当前 |
 |----|------|
-| `Cargo.toml` `[workspace.package] version` | `1.1.3` |
-| `apps/sender/package.json` `version` + `manifest.version` | `1.1.3` |
-| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.1.3` / `8` |
-| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.1.3` |
-| `.github/workflows/windows.yml` `env.VER`（Windows 发版 zip 名 + release tag） | `1.1.3` |
+| `Cargo.toml` `[workspace.package] version` | `1.1.4` |
+| `apps/sender/package.json` `version` + `manifest.version` | `1.1.4` |
+| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.1.4` / `9` |
+| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.1.4` |
+| `.github/workflows/windows.yml` `env.VER`（Windows 发版 zip 名 + release tag） | `1.1.4` |
 
 `scripts/build-all.sh` 的 release 打包文件名版本号由 `read_version()` 从 `apps/sender/package.json` 动态读取，与 `manifest.version` 同源，**无需在脚本里手改**。Windows 发版 zip 名由 workflow 的 `VER` 控制，**须与上表同步**。
 
@@ -367,13 +370,14 @@ offset  size   field
 | 描述符 magic | `0xD5` | `descriptor.rs:95` |
 | 描述符版本 | `3` | `descriptor.rs:96` |
 | 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3） | `descriptor.rs:97-102` |
-| 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:28-30` |
+| 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:27-29` |
 | Zstd level（浏览器） | `1` | `compress.ts:56` |
 | XZ level（浏览器） | `9` | `compress.ts:58` |
 | early-exit 阈值 | `0.70`（70%） | `compress.ts:64` |
 | MAX_SOURCE_SYMBOLS_PER_BLOCK | `56403` | `meta.rs:6` |
 | MAX_SOURCE_BLOCKS | `256` | `meta.rs:8` |
+| MAX_OBJECT_BYTES | `32 MiB` | `meta.rs:15` |
 | ESI 上限 | `2²⁴`（u24） | raptorq-core decoder 守卫 |
-| ingest 错误哨兵 | `received_symbols == u32::MAX` | `jni.rs:130` / `ReceiverSessionManager.kt:64` |
+| ingest 错误哨兵 | `received_symbols == u32::MAX` | `jni.rs:142` / `ReceiverSessionManager.kt:68` |
 | 默认 symbol_size（浏览器/核心库） | 1400 / 1024 | `apps/sender/src/types.ts` `DEFAULT_CONFIG.symbolSize` / `config.rs:8` `DEFAULT_SYMBOL_SIZE` |
 | QR EC 级 / 版本 | L / 动态最小 | `qr_render::encode` / `min_version_for` |

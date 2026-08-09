@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace AirFerry.Windows.Scan;
 
 /// <summary>
@@ -34,5 +36,21 @@ public static class Crc32
             crc = (crc >> 8) ^ Table[(crc ^ b) & 0xFF];
         }
         return (crc ^ 0xFFFF_FFFFu);
+    }
+
+    /// <summary>Compute CRC32 without loading an entire stored file into memory.</summary>
+    public static ulong Compute(Stream stream)
+    {
+        uint crc = 0xFFFF_FFFFu;
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            for (int i = 0; i < read; i++)
+            {
+                crc = (crc >> 8) ^ Table[(crc ^ buffer[i]) & 0xFF];
+            }
+        }
+        return crc ^ 0xFFFF_FFFFu;
     }
 }

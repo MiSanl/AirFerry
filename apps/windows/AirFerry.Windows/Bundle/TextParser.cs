@@ -30,6 +30,8 @@ namespace AirFerry.Windows.Bundle;
 /// </remarks>
 public static class TextParser
 {
+    private static readonly UTF8Encoding StrictUtf8 =
+        new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     public static ReadOnlySpan<byte> Magic => "ETTEXTv1"u8;
 
     /// <summary>True if bytes starts with the 8-byte text magic.</summary>
@@ -56,7 +58,7 @@ public static class TextParser
         }
         try
         {
-            return Encoding.UTF8.GetString(bytes[8..]);
+            return StrictUtf8.GetString(bytes[8..]);
         }
         catch
         {

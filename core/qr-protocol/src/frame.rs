@@ -64,7 +64,9 @@ impl Frame {
     /// Total serialized length: header + payload + footer.
     #[inline]
     pub fn wire_size(symbol_size: u32) -> usize {
-        FRAME_HEADER_SIZE + symbol_size as usize + FRAME_FOOTER_SIZE
+        FRAME_HEADER_SIZE
+            .saturating_add(symbol_size as usize)
+            .saturating_add(FRAME_FOOTER_SIZE)
     }
 
     /// Build a frame from a payload + header fields, computing both CRCs.
@@ -108,7 +110,8 @@ impl Frame {
 
     /// Serialize to a byte buffer (header + payload + footer).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len() + FRAME_FOOTER_SIZE);
+        let mut buf =
+            Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len() + FRAME_FOOTER_SIZE);
         self.header.write_bytes(&mut buf);
         buf.extend_from_slice(&self.payload);
         buf.extend_from_slice(&self.frame_crc32.to_be_bytes());
@@ -130,28 +133,30 @@ impl Frame {
         }
         let (header, _) = FrameHeader::read_bytes(bytes)?;
         let symbol_size = header.symbol_size as usize;
-        let total = FRAME_HEADER_SIZE + symbol_size + FRAME_FOOTER_SIZE;
-        if bytes.len() != total {
+        // Compare against the already-bounded input length before performing
+        // additions. On wasm32, a hostile u32::MAX symbol_size would otherwise
+        // overflow usize while computing header + payload + footer.
+        let actual_payload_size = bytes.len() - need;
+        if symbol_size != actual_payload_size {
             // Distinguish "too short" from "too long" via a clearer error than
             // the old BufferTooShort, which was returned even when the input
             // carried extra trailing bytes.
             return Err(Error::LengthMismatch {
-                expected: total,
+                expected: symbol_size.saturating_add(need),
                 actual: bytes.len(),
             });
         }
-        let payload = &bytes[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + symbol_size];
-        let footer = &bytes[FRAME_HEADER_SIZE + symbol_size..];
+        let payload_end = FRAME_HEADER_SIZE + symbol_size;
+        let payload = &bytes[FRAME_HEADER_SIZE..payload_end];
+        let footer = &bytes[payload_end..];
         // Payload CRC.
         if crc32(payload) != header.payload_crc32 {
             return Err(Error::PayloadCrcMismatch);
         }
         // Whole-frame CRC over header+payload.
         let mut crc = Crc32::new();
-        crc.update(&bytes[..FRAME_HEADER_SIZE + symbol_size]);
-        let expected_frame_crc = u32::from_be_bytes([
-            footer[0], footer[1], footer[2], footer[3],
-        ]);
+        crc.update(&bytes[..payload_end]);
+        let expected_frame_crc = u32::from_be_bytes([footer[0], footer[1], footer[2], footer[3]]);
         if crc.finalize() != expected_frame_crc {
             return Err(Error::FrameCrcMismatch);
         }
@@ -258,7 +263,18 @@ mod tests {
     #[test]
     fn round_trip_frame() {
         let payload = sample_payload(1024);
-        let frame = Frame::build(0x1122334455667788, 0, 2, 7, 4, 256, 1024, 999, 123456, &payload);
+        let frame = Frame::build(
+            0x1122334455667788,
+            0,
+            2,
+            7,
+            4,
+            256,
+            1024,
+            999,
+            123456,
+            &payload,
+        );
         let bytes = frame.to_bytes();
         assert_eq!(bytes.len(), Frame::wire_size(1024));
         let parsed = Frame::from_bytes(&bytes).unwrap();
@@ -304,5 +320,15 @@ mod tests {
     fn rejects_too_short() {
         let err = Frame::from_bytes(&[0u8; 10]).unwrap_err();
         assert!(matches!(err, Error::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn rejects_huge_declared_symbol_size_without_overflow() {
+        let mut bytes = Frame::build(1, 0, 0, 0, 1, 1, 0, 0, 0, &[]).to_bytes();
+        bytes[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            Frame::from_bytes(&bytes).unwrap_err(),
+            Error::LengthMismatch { .. }
+        ));
     }
 }

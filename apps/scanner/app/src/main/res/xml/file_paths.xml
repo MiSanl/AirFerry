@@ -2,6 +2,8 @@
 <paths>
     <!-- ContentStore blobs under getExternalFilesDir(null)/store/ -->
     <external-files-path name="store" path="store/" />
+    <!-- ContentStore falls back here when external app storage is unavailable. -->
+    <files-path name="internal_store" path="store/" />
     <!-- Legacy: older builds used cache recovered_* / share staging -->
     <cache-path name="cache" path="." />
     <cache-path name="share" path="share/" />

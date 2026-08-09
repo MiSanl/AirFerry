@@ -1,4 +1,6 @@
 using OpenCvSharp;
+using System.Buffers;
+using System.Runtime.InteropServices;
 
 namespace AirFerry.Windows.Scan;
 
@@ -6,8 +8,8 @@ namespace AirFerry.Windows.Scan;
 /// Frames a single video device for the scan pipeline. The Windows counterpart
 /// of Android's <c>CameraX + QrStreamAnalyzer</c>: bind a webcam or capture
 /// card (DirectShow backend), pull frames at a target resolution, and hand the
-/// decoder a grayscale luminance image — the same modality Android's Y plane
-/// provides, so <see cref="ZxingDecoder"/> is fed identically on both hosts.
+/// decoder a grayscale luminance image while exposing an occasional managed
+/// BGR24 snapshot for preview. Both outputs come from the same device read.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -23,9 +25,9 @@ namespace AirFerry.Windows.Scan;
 /// as CameraX does.
 /// </para>
 /// <para>
-/// <b>Threading</b>: <see cref="ReadGray"/> / <see cref="ReadBgr"/> are
-/// <b>not</b> thread-safe — only the single producer thread in
-/// <see cref="QrDecodePool"/> calls them.
+/// <b>Threading</b>: <see cref="ReadGray"/> and <see cref="SnapshotBgr"/> are
+/// <b>not</b> thread-safe. Only the producer thread in <c>ScanViewModel</c>
+/// calls them; the WPF dispatcher never reads from the device.
 /// </para>
 /// </remarks>
 public sealed class VideoCapture : IDisposable
@@ -81,23 +83,49 @@ public sealed class VideoCapture : IDisposable
     }
 
     /// <summary>
-    /// Read one frame in BGR (for the preview overlay). Like <see cref="ReadGray"/>
-    /// the returned Mat is reused — clone it if you need to keep it.
+    /// Copy the BGR image produced by the latest <see cref="ReadGray"/> call
+    /// into a compact managed BGR24 snapshot for the UI. Must be called on the
+    /// same producer thread before the next camera read.
     /// </summary>
-    public Mat? ReadBgr()
+    public PreviewFrame? SnapshotBgr()
     {
-        if (_disposed || !_cap.IsOpened())
+        if (_disposed || _bgr.Empty() || _bgr.Channels() != 3)
         {
             return null;
         }
-        bool ok = _cap.Read(_bgr);
-        if (!ok || _bgr.Empty())
+
+        int width = _bgr.Width;
+        int height = _bgr.Height;
+        int rowBytes = checked(width * 3);
+        int length = checked(rowBytes * height);
+        int sourceStride = checked((int)_bgr.Step());
+        if (sourceStride < rowBytes)
         {
             return null;
         }
-        Width = _bgr.Width;
-        Height = _bgr.Height;
-        return _bgr;
+        byte[] pixels = ArrayPool<byte>.Shared.Rent(length);
+
+        try
+        {
+            if (sourceStride == rowBytes)
+            {
+                Marshal.Copy(_bgr.Data, pixels, 0, length);
+            }
+            else
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    Marshal.Copy(IntPtr.Add(_bgr.Data, checked(y * sourceStride)),
+                        pixels, checked(y * rowBytes), rowBytes);
+                }
+            }
+            return new PreviewFrame(pixels, width, height, rowBytes, length);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(pixels);
+            throw;
+        }
     }
 
     public void Dispose()

@@ -5,7 +5,8 @@
 //! - [`SenderSession`] holds the (already compressed) payload, owns a
 //!   `raptorq-core` encoder, and produces a stream of [`Frame`]s. It
 //!   interleaves source symbols with repair symbols to reach a target
-//!   redundancy ratio, and loops forever so a receiver can rejoin at any time.
+//!   redundancy ratio, and emits fresh repair symbols until the RFC 24-bit ESI
+//!   space is exhausted so a receiver can rejoin at any practical time.
 //! - [`ReceiverSession`] ingests decoded QR payloads as frames, feeds the
 //!   RaptorQ decoder, tracks per-block progress, and reassembles the file once
 //!   complete. Checkpoint via [`ReceiverSession::save_state`] /
@@ -17,13 +18,16 @@
 
 // `cffi` (Windows/.NET P/Invoke, like `jni`) takes raw pointers across the FFI
 // boundary, so it must be exempt from `forbid(unsafe_code)` along with `jni`.
-#![cfg_attr(not(any(feature = "jni", feature = "cffi")), forbid(unsafe_code))]
+#![cfg_attr(
+    not(any(feature = "jni", feature = "cffi", feature = "wasm")),
+    forbid(unsafe_code)
+)]
 
-pub mod sender;
-pub mod receiver;
-pub mod progress;
-pub mod resume;
 pub mod descriptor;
+pub mod progress;
+pub mod receiver;
+pub mod resume;
+pub mod sender;
 pub mod time;
 
 // Platform bindings are gated on BOTH their feature flag AND their target, so
@@ -33,10 +37,10 @@ pub mod time;
 // present under `target_os = "android"`). The feature flag remains the on/off
 // switch the build matrix controls; the target gate just keeps non-portable
 // code out of foreign targets.
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-pub mod wasm;
 #[cfg(all(feature = "jni", target_os = "android"))]
 pub mod jni;
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod wasm;
 // Plain C ABI for the Windows client (.NET P/Invoke). No platform gate: the
 // binding is pure C (`extern "C"`) with no host-specific dependency, so it
 // compiles on any target the host chooses to build the DLL on. The `cffi`
@@ -44,11 +48,11 @@ pub mod jni;
 #[cfg(feature = "cffi")]
 pub mod cffi;
 
+pub use descriptor::{DescriptorInfo, FileMeta};
 pub use progress::{Progress, Stats};
 pub use receiver::ReceiverSession;
-pub use sender::{SenderConfig, SenderSession};
 pub use resume::ResumeState;
-pub use descriptor::{DescriptorInfo, FileMeta};
+pub use sender::{SenderConfig, SenderSession};
 
 // Re-export the wire-frame helpers so downstream code (tests, JNI host, the
 // browser bridge) can parse/validate frames without depending on qr-protocol
@@ -81,6 +85,10 @@ pub enum Error {
     InvalidRedundancy(u8),
     #[error("compression error: {0}")]
     Compress(String),
+    #[error("RaptorQ's 24-bit encoding-symbol id space is exhausted")]
+    SymbolIdSpaceExhausted,
+    #[error("invalid resume state: {0}")]
+    InvalidResume(&'static str),
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;

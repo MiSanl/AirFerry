@@ -11,14 +11,15 @@
  *
  * The two WASM variants are pre-built by scripts/build-wasm.cjs into
  * wasm-pkg-legacy/ (MV2, Chrome87-safe, no SIMD) and wasm-pkg-simd/ (MV3,
- * wasm-bindgen 0.2.125 + SIMD). The loader (src/wasm/loader.ts) imports from a
- * fixed path `../../wasm-pkg/`, so before each `plasmo build` we copy the
- * appropriate variant into `wasm-pkg/`. This keeps the loader path static
- * (Vite/Plasmo bundling is unchanged) while still shipping per-target wasm.
+ * wasm-bindgen 0.2.125 + SIMD). The loader uses the `@airferry-wasm` alias,
+ * which Plasmo resolves to `wasm-pkg/`; before each build we copy the matching
+ * variant there. This keeps application imports static while still shipping
+ * per-target WASM.
  */
 const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { acquireWasmLock } = require("./wasm-lock.cjs");
 
 const root = path.resolve(__dirname, "..");
 
@@ -28,6 +29,14 @@ const targets = [
   "firefox-mv3",
   "firefox-mv2",
 ];
+const requested = process.argv.slice(2);
+const selectedTargets = requested.length === 0 ? targets : requested;
+for (const target of selectedTargets) {
+  if (!targets.includes(target)) {
+    console.error(`Unknown target: ${target}`);
+    process.exit(2);
+  }
+}
 
 function run(cmd) {
   console.log(`\n▶ ${cmd}`);
@@ -54,20 +63,29 @@ function useWasmPkg(variant) {
   console.log(`   (wasm: ${variant})`);
 }
 
-// Build each target. MV3 → SIMD variant; MV2 → legacy (Chrome87-safe) variant.
-for (const target of targets) {
-  const isMV3 = target.endsWith("mv3");
-  useWasmPkg(isMV3 ? "simd" : "legacy");
-  const outDir = `${target}-prod`;
-  run(
-    `plasmo build --target=${target} && ` +
-      `node scripts/fix-manifest.cjs ${outDir} && ` +
-      `cp node_modules/@foxglove/wasm-zstd/dist/wasm-zstd.wasm build/${outDir}/wasm-zstd.wasm`
-  );
+// Hold the same lock used by build-wasm and web preparation for the entire
+// consumer build. No publisher can replace a variant while Parcel is reading
+// it, and no second target build can switch the shared wasm-pkg underneath us.
+const releaseLock = acquireWasmLock(root);
+try {
+  // Build each target. MV3 → SIMD variant; MV2 → legacy (Chrome87-safe) variant.
+  for (const target of selectedTargets) {
+    const isMV3 = target.endsWith("mv3");
+    useWasmPkg(isMV3 ? "simd" : "legacy");
+    const outDir = `${target}-prod`;
+    run(`plasmo build --target=${target}`);
+    run(`node scripts/fix-manifest.cjs ${outDir}`);
+    fs.copyFileSync(
+      path.join(root, "node_modules/@foxglove/wasm-zstd/dist/wasm-zstd.wasm"),
+      path.join(root, `build/${outDir}/wasm-zstd.wasm`)
+    );
+  }
+} finally {
+  releaseLock();
 }
 
 console.log("\n✅ All targets built:");
-for (const target of targets) {
+for (const target of selectedTargets) {
   const variant = target.endsWith("mv3") ? "simd" : "legacy";
   console.log(`   build/${target}-prod/  (wasm: ${variant})`);
 }

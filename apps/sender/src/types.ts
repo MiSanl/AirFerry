@@ -44,11 +44,8 @@ export interface TransferConfig {
  * harder for a phone camera to resolve — so each step up also assumes a cleaner
  * scanning setup.
  *
- * fps = 0 means "unlimited" (driven by setTimeout(0) instead of rAF throttle);
- * this can exceed the display refresh rate (60Hz) when the WASM encode +
- * putImageData path is fast enough, pushing more QR symbols per second through
- * the optical channel. Useful for high-refresh-rate displays (120/144Hz) or
- * when the bottleneck is encode speed rather than display cadence.
+ * fps = 0 means "match every visible display refresh". Advancing more than
+ * once between paints only discards optical symbols and inflates statistics.
  */
 export type SpeedPreset = "stable" | "fast" | "extreme" | "aggressive" | "turbo" | "max"
 
@@ -92,8 +89,8 @@ export const SPEED_PRESETS: SpeedPresetDef[] = [
   },
   {
     id: "turbo",
-    label: "极速（1900B）",
-    symbolSize: 1900,
+    label: "极速（1904B）",
+    symbolSize: 1904,
     fps: 60,
     blurb: "V34，码密度极高",
   },
@@ -144,7 +141,7 @@ export function loadConfig(): TransferConfig {
     const saved = JSON.parse(raw) as Partial<TransferConfig>
     // Merge over the defaults so a new field added in a later version picks up
     // its default instead of leaking through as undefined.
-    return { ...DEFAULT_CONFIG, ...saved }
+    return normalizeConfig({ ...DEFAULT_CONFIG, ...saved })
   } catch {
     return { ...DEFAULT_CONFIG }
   }
@@ -157,8 +154,30 @@ export function loadConfig(): TransferConfig {
  */
 export function saveConfig(config: TransferConfig): void {
   try {
-    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config))
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(normalizeConfig(config)))
   } catch {
     /* ignore storage failures */
+  }
+}
+
+/** Reject malformed/stale localStorage values before they reach Rust/WASM. */
+export function normalizeConfig(config: TransferConfig): TransferConfig {
+  const integer = (value: number, fallback: number, min: number, max: number) =>
+    Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback
+  const redundancyPct = integer(config.redundancyPct, DEFAULT_CONFIG.redundancyPct, 5, 50)
+  const fps = integer(config.fps, DEFAULT_CONFIG.fps, 0, 240)
+  const rawSymbol = integer(config.symbolSize, DEFAULT_CONFIG.symbolSize, 64, 2400)
+  const symbolSize = rawSymbol % 8 === 0 ? rawSymbol : DEFAULT_CONFIG.symbolSize
+  const brightness = Number.isFinite(config.brightness)
+    ? Math.min(1.5, Math.max(1, config.brightness))
+    : DEFAULT_CONFIG.brightness
+  return {
+    redundancyPct,
+    fps,
+    symbolSize,
+    brightness,
+    autoOptimize: config.autoOptimize === true,
+    multiQr: config.multiQr === 4 ? 4 : 1,
+    ditherJitter: config.ditherJitter === true,
   }
 }

@@ -20,15 +20,18 @@
 #![forbid(unsafe_code)]
 
 mod config;
-mod encoder;
 mod decoder;
-mod symbol;
+mod encoder;
 mod meta;
+mod symbol;
 
-pub use config::Config;
-pub use encoder::Encoder;
+pub use config::{Config, MAX_SYMBOL_SIZE, MIN_SYMBOL_SIZE};
 pub use decoder::Decoder;
-pub use meta::{ObjectMeta, SourceBlockMeta};
+pub use encoder::Encoder;
+pub use meta::{
+    ObjectMeta, SourceBlockMeta, MAX_OBJECT_BYTES, MAX_SOURCE_BLOCKS, MAX_SOURCE_SYMBOLS_PER_BLOCK,
+    MAX_TOTAL_SOURCE_SYMBOLS,
+};
 pub use symbol::{Symbol, SymbolId};
 
 /// Errors returned by the codec.
@@ -36,8 +39,10 @@ pub use symbol::{Symbol, SymbolId};
 pub enum Error {
     #[error("data is empty")]
     EmptyData,
-    #[error("symbol size must be > 0")]
+    #[error("symbol size must be 8-byte aligned and between 64 and 65528 bytes")]
     InvalidSymbolSize,
+    #[error("invalid object metadata: {0}")]
+    InvalidObjectMeta(&'static str),
     #[error("source block {sbn} out of range (have {total})")]
     BlockOutOfRange { sbn: u32, total: u32 },
     #[error("source block {sbn} is not yet decodable (need more symbols)")]

@@ -13,6 +13,10 @@ val keystoreProperties = Properties().apply {
         f.inputStream().use { load(it) }
     }
 }
+val releaseSigningKeys = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+val releaseSigningReady = releaseSigningKeys.all {
+    !keystoreProperties.getProperty(it).isNullOrBlank()
+} && keystoreProperties.getProperty("storeFile")?.let { rootProject.file(it).isFile } == true
 
 android {
     namespace = "com.airferry.app"
@@ -22,8 +26,8 @@ android {
         applicationId = "com.airferry.app"
         minSdk = 29          // Android 10+
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.1.3"
+        versionCode = 9
+        versionName = "1.1.4"
 
         // Native build: ZXing-C++ via CMake + JNI bridge.
         externalNativeBuild {
@@ -41,10 +45,9 @@ android {
         create("release") {
             // Read the keystore location + credentials from keystore.properties
             // (git-ignored). The keystore ships under dist/ so it stays out of
-            // git while remaining alongside release artifacts. Falls back to the
-            // debug signing config when the properties file is absent (e.g. CI
-            // without secrets) so the build never hard-fails on signing setup.
-            if (!keystoreProperties.isEmpty) {
+            // git while remaining alongside release artifacts. Release tasks
+            // fail closed below when any credential or the keystore is absent.
+            if (releaseSigningReady) {
                 // Resolve the storeFile path relative to the Gradle rootProject
                 // (apps/scanner/), not the module dir (app/), so the keystore
                 // path in keystore.properties is relative to apps/scanner/.
@@ -59,13 +62,12 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Sign with the dedicated release keystore (see signingConfigs above)
-            // when keystore.properties is present; otherwise fall back to debug
-            // signing so the build still produces an installable APK.
-            signingConfig = if (!keystoreProperties.isEmpty) {
+            // Sign only with the dedicated release keystore. The task-graph
+            // guard below rejects release builds without a complete config.
+            signingConfig = if (releaseSigningReady) {
                 signingConfigs.getByName("release")
             } else {
-                signingConfigs.getByName("debug")
+                null
             }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -99,6 +101,19 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+}
+
+// A release artifact must never silently fall back to the public debug key.
+gradle.taskGraph.whenReady {
+    val buildsRelease = allTasks.any { task ->
+        task.project == project && task.name.contains("release", ignoreCase = true)
+    }
+    if (buildsRelease && !releaseSigningReady) {
+        throw GradleException(
+            "Release signing is not configured. Provide apps/scanner/keystore.properties " +
+                "with storeFile/storePassword/keyAlias/keyPassword and an existing keystore."
+        )
     }
 }
 
@@ -136,4 +151,7 @@ dependencies {
 
     // JSON parsing (for JNI progress payloads).
     implementation("org.json:json:20240303")
+
+    // Pure JVM protocol/helper tests (no device or native library required).
+    testImplementation("junit:junit:4.13.2")
 }

@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use transfer_engine::receiver::ReceiverSession;
 use transfer_engine::descriptor;
+use transfer_engine::receiver::ReceiverSession;
 
 fn script_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts")
@@ -79,7 +79,7 @@ fn wasm_frames_recover_in_native_receiver() {
     }
 
     let info = meta_opt.expect("no descriptor frame observed in the dump");
-    let mut rx = ReceiverSession::new_confirmed(session_id, info.meta);
+    let mut rx = ReceiverSession::new_confirmed(session_id, info.meta).unwrap();
 
     let mut seen: HashSet<(u32, u32)> = HashSet::new();
     let mut ingested = 0usize;

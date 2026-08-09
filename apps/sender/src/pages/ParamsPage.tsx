@@ -5,7 +5,7 @@ import { SPEED_PRESETS, presetForSymbolSize } from "@/types"
 interface Props {
   /** Pending items that were staged (files + text). */
   items: PendingItem[]
-  /** Display name for the transfer (single name, "文字消息.txt", or "N个文件打包"). */
+  /** Display name for the transfer (filename, text name, or "N个文件打包"). */
   displayName: string
   /** Total original (pre-compression) byte count of the transfer unit. */
   originalSize: number
@@ -66,7 +66,7 @@ export function ParamsPage({
   // Total frames ≈ source symbols × (1 + redundancy) + descriptor overhead.
   const totalSymbols = Math.ceil(compressedSize / config.symbolSize)
   const totalFrames = Math.ceil(totalSymbols * (1 + config.redundancyPct / 100))
-  const effectiveFps = config.fps > 0 ? config.fps : 120 // estimate for "unlimited"
+  const effectiveFps = config.fps > 0 ? config.fps : 60 // conservative display-refresh estimate
   const estimatedSeconds = totalFrames / effectiveFps
 
   // Show the item list (collapsible-ish: first few + "还有 N 个" for bundles).
@@ -118,7 +118,7 @@ export function ParamsPage({
             <td>预计传输时间</td>
             <td>
               <strong>{formatDuration(estimatedSeconds)}</strong>
-              <span className="muted"> ({config.fps > 0 ? config.fps + "fps" : "无限制"}, {config.redundancyPct}% 冗余)</span>
+              <span className="muted"> ({config.fps > 0 ? config.fps + "fps" : "跟随屏幕刷新"}, {config.redundancyPct}% 冗余)</span>
             </td>
           </tr>
         </tbody>
@@ -180,7 +180,7 @@ export function ParamsPage({
           <option value={60}>60 FPS（高速）</option>
           <option value={90}>90 FPS（高刷屏）</option>
           <option value={120}>120 FPS（高刷屏）</option>
-          <option value={0}>无限制（最大化吞吐）</option>
+          <option value={0}>跟随屏幕刷新（不跳过可见帧）</option>
         </select>
       </div>
 

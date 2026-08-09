@@ -26,12 +26,14 @@ namespace AirFerry.Windows.Scan;
 /// a later one is clean.
 /// </para>
 /// <para>
-/// <b>Not thread-safe</b>: the underlying Rust handle must be accessed by one
-/// thread at a time. The scan pool serializes all calls with a single lock.
+/// Every access to the native handle is serialized by this wrapper. Callers may
+/// poll progress while ingest is running and may dispose only after producers
+/// have been stopped.
 /// </para>
 /// </remarks>
 public sealed class ReceiverSession : IDisposable
 {
+    private readonly object _gate = new();
     private IntPtr _handle = IntPtr.Zero;
     private ulong _sessionIdLo;
     private ulong _sessionIdHi;
@@ -41,9 +43,9 @@ public sealed class ReceiverSession : IDisposable
     private int _mismatchStreak;
     private bool _everAccepted;
 
-    public bool IsInitialized => _initialized;
-    public int EstimatedTotalSymbols => _estimatedTotalSymbols;
-    public uint SymbolSizeBytes => _symbolSize;
+    public bool IsInitialized { get { lock (_gate) return _initialized; } }
+    public int EstimatedTotalSymbols { get { lock (_gate) return _estimatedTotalSymbols; } }
+    public uint SymbolSizeBytes { get { lock (_gate) return _symbolSize; } }
 
     /// <summary>
     /// Ingest a decoded QR payload. Returns a lightweight
@@ -53,6 +55,8 @@ public sealed class ReceiverSession : IDisposable
     /// </summary>
     public IngestStatus? Ingest(byte[] frameBytes)
     {
+        lock (_gate)
+        {
         FrameHeader? header = FrameHeader.Parse(frameBytes);
         if (header is null)
         {
@@ -116,6 +120,7 @@ public sealed class ReceiverSession : IDisposable
         }
 
         return s;
+        }
     }
 
     /// <summary>
@@ -125,6 +130,8 @@ public sealed class ReceiverSession : IDisposable
     /// </summary>
     public ProgressSnapshot? Progress()
     {
+        lock (_gate)
+        {
         if (!_initialized || _handle == IntPtr.Zero)
         {
             return null;
@@ -136,7 +143,11 @@ public sealed class ReceiverSession : IDisposable
         {
             return null;
         }
-        byte[] buf = new byte[needed];
+        if (needed > int.MaxValue)
+        {
+            return null;
+        }
+        byte[] buf = new byte[(int)needed];
         nuint written = NativeBridge.ReceiverProgressJson(_handle, buf, (nuint)buf.Length);
         if (written == 0 || written > (nuint)buf.Length)
         {
@@ -150,35 +161,54 @@ public sealed class ReceiverSession : IDisposable
         }
         string json = Encoding.UTF8.GetString(buf, 0, len);
         return ProgressSnapshot.Parse(json);
+        }
     }
 
-    public bool IsComplete => _initialized && NativeBridge.ReceiverIsComplete(_handle) == 1;
+    public bool IsComplete
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _initialized && NativeBridge.ReceiverIsComplete(_handle) == 1;
+            }
+        }
+    }
 
     /// <summary>Original filename from the descriptor, or empty.</summary>
     public string FileName()
     {
+        lock (_gate)
+        {
         if (!_initialized)
         {
             return string.Empty;
         }
         return ReadCString(NativeBridge.ReceiverFileName);
+        }
     }
 
     /// <summary>Original file size, or 0.</summary>
-    public ulong FileSize() =>
-        _initialized ? NativeBridge.ReceiverFileSize(_handle) : 0UL;
+    public ulong FileSize()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverFileSize(_handle) : 0UL;
+    }
 
     /// <summary>Expected CRC32 (unsigned 32-bit in a ulong), or 0.</summary>
-    public ulong Crc32() =>
-        _initialized ? NativeBridge.ReceiverCrc32(_handle) : 0UL;
+    public ulong Crc32()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverCrc32(_handle) : 0UL;
+    }
 
     /// <summary>
     /// True if the descriptor supplied a real CRC32 (so the receiver should
     /// verify it). Use this — NOT <c>Crc32() == 0</c> — to decide whether to
     /// verify: CRC32 can legitimately be 0.
     /// </summary>
-    public bool Crc32Known() =>
-        _initialized && NativeBridge.ReceiverCrc32Known(_handle) == 1;
+    public bool Crc32Known()
+    {
+        lock (_gate) return _initialized && NativeBridge.ReceiverCrc32Known(_handle) == 1;
+    }
 
     /// <summary>
     /// Recover the assembled file bytes, trimming RaptorQ zero-padding back to
@@ -192,6 +222,8 @@ public sealed class ReceiverSession : IDisposable
     /// </remarks>
     public byte[]? Assemble()
     {
+        lock (_gate)
+        {
         if (!_initialized)
         {
             return null;
@@ -199,6 +231,11 @@ public sealed class ReceiverSession : IDisposable
         int ok = NativeBridge.ReceiverAssemble(_handle, out IntPtr buf, out nuint len);
         if (ok == 0 || buf == IntPtr.Zero || len == 0)
         {
+            return null;
+        }
+        if (len > int.MaxValue)
+        {
+            NativeBridge.BufferFree(buf, len);
             return null;
         }
         try
@@ -223,14 +260,18 @@ public sealed class ReceiverSession : IDisposable
             // Always release the Rust allocation, even on exception.
             NativeBridge.BufferFree(buf, len);
         }
+        }
     }
 
     /// <summary>Session id as a lowercase hex string (high||low, 32 chars).</summary>
     public string SessionIdHex()
     {
-        string lo = _sessionIdLo.ToString("x16");
-        string hi = _sessionIdHi.ToString("x16");
-        return hi + lo;
+        lock (_gate)
+        {
+            string lo = _sessionIdLo.ToString("x16");
+            string hi = _sessionIdHi.ToString("x16");
+            return hi + lo;
+        }
     }
 
     /// <summary>Create (or re-create) the native receiver from a parsed header.</summary>
@@ -258,7 +299,11 @@ public sealed class ReceiverSession : IDisposable
         {
             return string.Empty;
         }
-        byte[] buf = new byte[needed];
+        if (needed > int.MaxValue)
+        {
+            return string.Empty;
+        }
+        byte[] buf = new byte[(int)needed];
         nuint written = reader(_handle, buf, (nuint)buf.Length);
         if (written == 0)
         {
@@ -271,11 +316,14 @@ public sealed class ReceiverSession : IDisposable
 
     public void Destroy()
     {
+        lock (_gate)
+        {
         if (_initialized && _handle != IntPtr.Zero)
         {
             NativeBridge.ReceiverDestroy(_handle);
             _handle = IntPtr.Zero;
             _initialized = false;
+        }
         }
     }
 

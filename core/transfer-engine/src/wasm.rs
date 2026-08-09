@@ -27,7 +27,14 @@ pub fn _start() {
 #[wasm_bindgen]
 pub struct SenderSessionWasm {
     inner: SenderSession,
+    /// Stable, pre-sized WASM-owned output used by the browser hot path.
+    qr_scratch: Vec<u8>,
 }
+
+const MAX_QR_SIDE: usize = 177;
+const MAX_QR_MODULES: usize = MAX_QR_SIDE * MAX_QR_SIDE;
+const MAX_UI_QR_COUNT: usize = 4;
+const QR_SCRATCH_BYTES: usize = 4 + MAX_UI_QR_COUNT * (4 + MAX_QR_MODULES);
 
 #[wasm_bindgen]
 impl SenderSessionWasm {
@@ -51,8 +58,11 @@ impl SenderSessionWasm {
     ) -> Result<SenderSessionWasm, JsValue> {
         _start();
         let sid = SessionId(((session_id_hi as u64 as u128) << 64) | session_id_lo as u64 as u128);
+        // Enforce the public range/alignment contract before the value reaches
+        // RaptorQ's MTU arithmetic.
+        let codec = Config::new(symbol_size).map_err(|e| JsValue::from_str(&format!("{e}")))?;
         let cfg = SenderConfig {
-            codec: Config { symbol_size },
+            codec,
             redundancy_pct,
         };
         let file_meta = crate::descriptor::FileMeta {
@@ -64,8 +74,12 @@ impl SenderSessionWasm {
             compressed_size_known: true,
             crc32_known: true,
         };
-        let inner = SenderSession::new(compressed_payload, sid, cfg, file_meta).map_err(err_to_js)?;
-        Ok(SenderSessionWasm { inner })
+        let inner =
+            SenderSession::new(compressed_payload, sid, cfg, file_meta).map_err(err_to_js)?;
+        Ok(SenderSessionWasm {
+            inner,
+            qr_scratch: vec![0; QR_SCRATCH_BYTES],
+        })
     }
 
     /// Produce the next frame's raw bytes (header + payload + footer).
@@ -89,9 +103,8 @@ impl SenderSessionWasm {
         }
         let frame = self.inner.next_frame().map_err(err_to_js)?;
         let bytes = frame.to_bytes();
-        let matrix = qr_protocol::qr_render::encode(&bytes).map_err(|e| {
-            JsValue::from_str(&format!("qr encode failed: {e:?}"))
-        })?;
+        let matrix = qr_protocol::qr_render::encode(&bytes)
+            .map_err(|e| JsValue::from_str(&format!("qr encode failed: {e:?}")))?;
         out_side[0] = matrix.size as u32;
         Ok(matrix.modules.iter().map(|&dark| dark as u8).collect())
     }
@@ -107,9 +120,8 @@ impl SenderSessionWasm {
     ///   `[u32 count_actual][for each matrix: u32 side + side*side bytes]`
     /// where each module byte is 1=dark / 0=light, row-major. `count_actual`
     /// may be less than `count` if the session could not produce that many
-    /// (it should always be able to, since repair symbols are unbounded, but
-    /// we clamp defensively). An empty buffer / count_actual == 0 signals
-    /// failure.
+    /// (normally equal to `count`; it may be lower at the RFC 24-bit ESI
+    /// boundary). An empty buffer / count_actual == 0 signals failure.
     pub fn next_qr_multi(&mut self, count: u32) -> Result<Vec<u8>, JsValue> {
         // Cap at a sane maximum to bound allocation; the UI only offers 2/4.
         let n = count.min(8) as usize;
@@ -142,19 +154,15 @@ impl SenderSessionWasm {
         Ok(out)
     }
 
-    /// Zero-allocation variant of [`Self::next_qr`]: writes the matrix into the
-    /// caller-supplied `out_modules` buffer instead of returning a fresh
-    /// `Vec<u8>` that wasm-bindgen would deep-copy into a new JS `Uint8Array`.
+    /// Compatibility buffer variant of [`Self::next_qr`]. wasm-bindgen may copy
+    /// JS-owned slices at the ABI boundary; new renderers should use
+    /// [`Self::next_qr_scratch`] + [`Self::qr_scratch_view`] for true zero-copy.
     ///
     /// The caller must size `out_modules` to at least `side*side` bytes — the
     /// largest possible QR is Version 40 (177×177 = 31329 B), so a 32 KiB
     /// buffer is always safe. `out_side[0]` is set to the matrix side length.
     /// Returns the number of module bytes written (= `side*side`).
     ///
-    /// Because the buffer is JS-owned (`&mut [u8]` is exposed as a `Uint8Array`
-    /// view), writes land directly in the caller's `ArrayBuffer` with no
-    /// per-frame allocation — this is the hot-path win for the render loop
-    /// (240 encodes/s at 4-code×60fps).
     pub fn next_qr_into(
         &mut self,
         out_modules: &mut [u8],
@@ -181,9 +189,8 @@ impl SenderSessionWasm {
         Ok(n as u32)
     }
 
-    /// Zero-allocation variant of [`Self::next_qr_multi`]: writes the flat
-    /// little-endian buffer into the caller-supplied `out_buf` instead of
-    /// returning a fresh `Vec<u8>`.
+    /// Compatibility multi-buffer variant. New renderers should prefer the
+    /// WASM-owned scratch API to avoid wasm-bindgen slice copies.
     ///
     /// Buffer layout (same as `next_qr_multi`):
     ///   `[u32 count_actual][for each matrix: u32 side + side*side bytes]`
@@ -240,6 +247,45 @@ impl SenderSessionWasm {
         Ok(pos as u32)
     }
 
+    /// Encode 1..=4 fresh matrices into stable WASM-owned scratch memory.
+    /// Call [`Self::qr_scratch_view`] immediately afterwards to obtain a
+    /// zero-copy JavaScript view of the first returned byte count.
+    pub fn next_qr_scratch(&mut self, count: u32) -> Result<u32, JsValue> {
+        let n = count.clamp(1, MAX_UI_QR_COUNT as u32) as usize;
+        let mut pos = 4usize;
+        let mut produced = 0u32;
+        for _ in 0..n {
+            let frame = self.inner.next_frame().map_err(err_to_js)?;
+            let matrix = qr_protocol::qr_render::encode(&frame.to_bytes())
+                .map_err(|e| JsValue::from_str(&format!("qr encode failed: {e:?}")))?;
+            let need = 4 + matrix.modules.len();
+            if pos + need > self.qr_scratch.len() {
+                return Err(JsValue::from_str("internal QR scratch buffer overflow"));
+            }
+            self.qr_scratch[pos..pos + 4].copy_from_slice(&(matrix.size as u32).to_le_bytes());
+            pos += 4;
+            for (dst, &dark) in self.qr_scratch[pos..pos + matrix.modules.len()]
+                .iter_mut()
+                .zip(matrix.modules.iter())
+            {
+                *dst = dark as u8;
+            }
+            pos += matrix.modules.len();
+            produced += 1;
+        }
+        self.qr_scratch[..4].copy_from_slice(&produced.to_le_bytes());
+        Ok(pos as u32)
+    }
+
+    /// Return a JavaScript `Uint8Array` view over the stable WASM scratch.
+    /// The view is valid until the next call into WASM and must not be retained.
+    pub fn qr_scratch_view(&self) -> js_sys::Uint8Array {
+        // SAFETY: `qr_scratch` is allocated at its final size in the constructor
+        // and is never resized. JS consumes the view synchronously before its
+        // next WASM call, as required by `Uint8Array::view`.
+        unsafe { js_sys::Uint8Array::view(&self.qr_scratch) }
+    }
+
     /// Session id (low 64 bits).
     pub fn session_id_lo(&self) -> u64 {
         self.inner.session_id() as u64
@@ -288,9 +334,8 @@ pub fn encode_qr(frame_bytes: &[u8], out_side: &mut [u32]) -> Result<Vec<u8>, Js
     if out_side.is_empty() {
         return Err(JsValue::from_str("out_side buffer empty"));
     }
-    let matrix = qr_protocol::qr_render::encode(frame_bytes).map_err(|e| {
-        JsValue::from_str(&format!("qr encode failed: {e:?}"))
-    })?;
+    let matrix = qr_protocol::qr_render::encode(frame_bytes)
+        .map_err(|e| JsValue::from_str(&format!("qr encode failed: {e:?}")))?;
     out_side[0] = matrix.size as u32;
     Ok(matrix.modules.iter().map(|&dark| dark as u8).collect())
 }

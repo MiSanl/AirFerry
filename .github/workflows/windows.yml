@@ -27,13 +27,13 @@ jobs:
     name: Rust C ABI (cffi)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -52,16 +52,16 @@ jobs:
         run: cargo build -p transfer-engine --features cffi --release
 
   # ── Job 2: C# 协议层单元测试（跨平台）────────────────────────────────────
-  # 只测纯 C# 逻辑（IngestStatus/FrameHeader/BundleParser/FileNameUtil/Progress），
-  # 不依赖 P/Invoke，net8.0 TFM 可在 ubuntu 上跑。
+  # 只测纯 C# 逻辑（含 native packed 结果的托管解析），不实际加载 P/Invoke DLL，
+  # net8.0 TFM 可在 ubuntu 上跑。
   csharp-tests:
     name: C# protocol tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup .NET 8 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
 
@@ -73,19 +73,20 @@ jobs:
   # ── Job 3: Windows 端完整构建（仅 Windows runner）─────────────────────────
   # WPF (net8.0-windows TFM) 只能在 Windows 上构建。对标 build-windows.ps1：
   # ① cargo build --features cffi → transfer_engine.dll
-  # ② dotnet build → AirFerry.exe（含 runtime/ DLL 拷贝）
+  # ② CMake → airferry_zxing.dll（与 Android 共用解码核心）
+  # ③ dotnet build → AirFerry.exe（含 runtime/ DLL 拷贝）
   # 不在此 job 跑 dotnet test（协议层测试已在 csharp-tests job 跑过，避免重复）。
   windows-build:
-    name: Windows build (WPF + Rust DLL)
+    name: Windows build (WPF + native DLLs)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -95,12 +96,12 @@ jobs:
           restore-keys: ${{ runner.os }}-cffi-
 
       - name: Setup .NET 8 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
 
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.nuget/packages
           key: ${{ runner.os }}-nuget-${{ hashFiles('apps/windows/**/*.csproj') }}
@@ -118,6 +119,20 @@ jobs:
           Copy-Item $dll apps/windows/AirFerry.Windows/runtime/transfer_engine.dll -Force
           Write-Host "Copied $dll -> runtime/"
 
+      - name: Build shared ZXing-C++ decoder
+        shell: pwsh
+        run: |
+          cmake -S apps/windows/native -B apps/windows/native/build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ CMake configure failed" }
+          cmake --build apps/windows/native/build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ build failed" }
+          ctest --test-dir apps/windows/native/build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ tests failed" }
+          $dll = Get-ChildItem apps/windows/native/build -Recurse -File -Filter airferry_zxing.dll |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($null -eq $dll) { throw "airferry_zxing.dll not found" }
+          Copy-Item $dll.FullName apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll -Force
+
       - name: dotnet restore
         run: dotnet restore apps/windows/AirFerry.sln
 
@@ -127,9 +142,10 @@ jobs:
   # ── Job 4: Windows 发布打包 + 上传到 GitHub release ──────────────────────
   # 镜像 build-windows.ps1 -Pack：
   # ① cargo build --features cffi → transfer_engine.dll → runtime/
-  # ② dotnet publish -r win-x64 single-file self-contained=false → publish/
-  # ③ Compress publish/ → airferry-windows-x64-v${VER}.zip
-  # ④ gh release upload 到 v${VER}（tag 已存在，--clobber 覆盖同名 asset）
+  # ② CMake → airferry_zxing.dll → runtime/
+  # ③ dotnet publish -r win-x64 single-file self-contained=false → publish/
+  # ④ Compress publish/ → airferry-windows-x64-v${VER}.zip
+  # ⑤ gh release upload 到 v${VER}（tag 已存在，--clobber 覆盖同名 asset）
   # 只在 workflow_dispatch + 打包后手动触发上传（避免每次 push 都发 release）。
   # 版本号与 apps/sender/package.json、build.gradle.kts、Cargo.toml、csproj 四处
   # 手动保持同步（AGENTS.md §2.7 关键依赖顺序第 5 条）。发版时改这一处即可。
@@ -145,15 +161,15 @@ jobs:
       # Keep in sync with apps/sender/package.json, build.gradle.kts,
       # Cargo.toml workspace version, AirFerry.Windows.csproj <Version>
       # (AGENTS.md §2.8 版本号同步 + Windows 发版).
-      VER: '1.1.3'
+      VER: '1.1.4'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -163,12 +179,12 @@ jobs:
           restore-keys: ${{ runner.os }}-cffi-
 
       - name: Setup .NET 8 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
 
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.nuget/packages
           key: ${{ runner.os }}-nuget-${{ hashFiles('apps/windows/**/*.csproj') }}
@@ -185,6 +201,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path apps/windows/AirFerry.Windows/runtime | Out-Null
           Copy-Item $dll apps/windows/AirFerry.Windows/runtime/transfer_engine.dll -Force
           Write-Host "Copied $dll -> runtime/"
+
+      - name: Build shared ZXing-C++ decoder
+        shell: pwsh
+        run: |
+          cmake -S apps/windows/native -B apps/windows/native/build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ CMake configure failed" }
+          cmake --build apps/windows/native/build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ build failed" }
+          ctest --test-dir apps/windows/native/build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "ZXing-C++ tests failed" }
+          $dll = Get-ChildItem apps/windows/native/build -Recurse -File -Filter airferry_zxing.dll |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($null -eq $dll) { throw "airferry_zxing.dll not found" }
+          Copy-Item $dll.FullName apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll -Force
 
       - name: dotnet restore
         run: dotnet restore apps/windows/AirFerry.sln
@@ -214,7 +244,13 @@ jobs:
           }
           $PublishDir = $publishDirs[-1].FullName
           Write-Host "=== publish 目录: $PublishDir ==="
-          # 列出产物清单（便于日志核对：应含 AirFerry.exe + transfer_engine.dll + OpenCV native DLLs）
+          foreach ($required in @("transfer_engine.dll", "airferry_zxing.dll")) {
+            if (-not (Test-Path (Join-Path $PublishDir $required))) {
+              throw "publish output missing native dependency: $required"
+            }
+          }
+          # 列出产物清单（应含 AirFerry.exe + transfer_engine.dll +
+          # airferry_zxing.dll + OpenCV native DLLs）
           Write-Host "=== publish 内容 ==="
           Get-ChildItem $PublishDir | Select-Object Name, Length | Format-Table -AutoSize
           $ZipName = "airferry-windows-x64-v${env:VER}.zip"
@@ -240,4 +276,3 @@ jobs:
           # --clobber：覆盖同名 asset（覆盖式发布）。
           gh release upload $Tag $ZipName --clobber
           Write-Host "已上传 $ZipName 到 release $Tag"
-

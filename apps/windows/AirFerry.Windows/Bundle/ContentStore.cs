@@ -44,6 +44,10 @@ public static class ContentStore
     public static string BlobPath(string hash)
     {
         string h = hash.ToLowerInvariant();
+        if (h.Length != 64 || h.Any(c => !Uri.IsHexDigit(c)))
+        {
+            throw new ArgumentException("Invalid SHA-256 hash", nameof(hash));
+        }
         string dir = Path.Combine(RootDir, "blobs", h[..2]);
         Directory.CreateDirectory(dir);
         return Path.Combine(dir, h);
@@ -66,13 +70,17 @@ public static class ContentStore
     {
         lock (Gate)
         {
+            // Fail closed before writing a blob. Treating a corrupt index as an
+            // empty history would make the next receive overwrite every logical
+            // entry and orphan otherwise-valid content-addressed blobs.
+            var all = LoadIndex();
             Directory.CreateDirectory(RootDir);
             string hash = Sha256Hex(bytes);
             string path = BlobPath(hash);
-            bool deduped = File.Exists(path) && new FileInfo(path).Length == bytes.LongLength;
+            bool deduped = FileMatchesHash(path, hash, bytes.LongLength);
             if (!deduped)
             {
-                File.WriteAllBytes(path, bytes);
+                WriteAllBytesAtomic(path, bytes);
             }
             var entry = new Entry(
                 Id: Guid.NewGuid().ToString("N"),
@@ -85,7 +93,6 @@ public static class ContentStore
                 CreatedAt: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 BundleId: bundleId,
                 BundleTitle: bundleTitle);
-            var all = LoadIndex();
             all.Add(entry);
             SaveIndex(all);
             return new PutResult(entry, path, deduped);
@@ -166,11 +173,31 @@ public static class ContentStore
         try
         {
             string json = File.ReadAllText(IndexPath, Encoding.UTF8);
-            return JsonSerializer.Deserialize<List<Entry>>(json, JsonOpts) ?? [];
+            List<Entry> entries = JsonSerializer.Deserialize<List<Entry>>(json, JsonOpts)
+                ?? throw new InvalidDataException("ContentStore index is null");
+            if (entries.Any(e => e is null || e.Size < 0 || e.Hash is null ||
+                                 e.Hash.Length != 64 || !e.Hash.All(Uri.IsHexDigit)))
+            {
+                throw new InvalidDataException("ContentStore index contains an invalid entry");
+            }
+            return entries;
         }
-        catch
+        catch (Exception ex)
         {
-            return [];
+            string backup = Path.Combine(
+                RootDir,
+                $"index.corrupt.{File.GetLastWriteTimeUtc(IndexPath).Ticks}.json");
+            try
+            {
+                if (!File.Exists(backup)) File.Copy(IndexPath, backup, overwrite: false);
+            }
+            catch
+            {
+                // Preserve the original index in place even if the backup copy
+                // cannot be created (disk full/permissions).
+            }
+            throw new InvalidDataException(
+                $"接收历史索引已损坏，已停止写入以保护现有数据。备份: {backup}", ex);
         }
     }
 
@@ -178,6 +205,60 @@ public static class ContentStore
     {
         Directory.CreateDirectory(RootDir);
         string json = JsonSerializer.Serialize(entries, JsonOpts);
-        File.WriteAllText(IndexPath, json, Encoding.UTF8);
+        string temp = Path.Combine(RootDir, $"index.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            byte[] encoded = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+                .GetBytes(json);
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 64 * 1024, FileOptions.WriteThrough))
+            {
+                stream.Write(encoded);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, IndexPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    private static bool FileMatchesHash(string path, string expectedHash, long expectedSize)
+    {
+        if (!File.Exists(path) || new FileInfo(path).Length != expectedSize) return false;
+        try
+        {
+            using FileStream stream = File.OpenRead(path);
+            string actual = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            return CryptographicOperations.FixedTimeEquals(
+                Encoding.ASCII.GetBytes(actual), Encoding.ASCII.GetBytes(expectedHash));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void WriteAllBytesAtomic(string path, byte[] bytes)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (dir is null) throw new IOException("Blob path has no directory");
+        Directory.CreateDirectory(dir);
+        string temp = Path.Combine(dir, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 64 * 1024, FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
     }
 }

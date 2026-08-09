@@ -43,7 +43,10 @@ fn run_android_path(size: usize, redundancy: u8, label: &str) {
     let mut sender = SenderSession::new(
         &data,
         sid,
-        SenderConfig { codec: Config::default(), redundancy_pct: redundancy },
+        SenderConfig {
+            codec: Config::default(),
+            redundancy_pct: redundancy,
+        },
         fm,
     )
     .unwrap();
@@ -82,7 +85,7 @@ fn run_android_path(size: usize, redundancy: u8, label: &str) {
                 parsed.header.total_symbols,
                 parsed.header.symbol_size,
             );
-            rx = Some(ReceiverSession::new(parsed.header.session_id, meta));
+            rx = Some(ReceiverSession::new(parsed.header.session_id, meta).unwrap());
         }
         let r = rx.as_mut().unwrap();
         let _ = r.ingest(parsed);

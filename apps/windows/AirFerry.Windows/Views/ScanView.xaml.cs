@@ -3,18 +3,16 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using AirFerry.Windows.Scan;
 using AirFerry.Windows.ViewModels;
-using CvPoint = OpenCvSharp.Point;
-using CvSize = OpenCvSharp.Size;
-using CvVideoCapture = OpenCvSharp.VideoCapture;
-using Mat = OpenCvSharp.Mat;
 
 namespace AirFerry.Windows.Views;
 
 /// <summary>
 /// Scan page code-behind — owns the <see cref="ScanViewModel"/> and renders its
 /// state into the WPF surface. The preview is a <see cref="WriteableBitmap"/>
-/// refreshed off the producer thread (camera → BGR → WriteableBitmap → Image).
+/// fed by managed BGR snapshots from the VM's single camera producer; the WPF
+/// dispatcher never opens or reads a video device.
 /// A <see cref="DispatcherTimer"/> polls the VM for progress at ~7 Hz (mirrors
 /// Android's UI refresh cadence).
 /// </summary>
@@ -22,14 +20,19 @@ public partial class ScanView : Page
 {
     private readonly ScanViewModel _vm;
     private readonly DispatcherTimer _progressTimer;
-    private readonly DispatcherTimer _previewTimer;
-    private AirFerry.Windows.Scan.VideoCapture? _previewCapture;
+    private readonly object _stopGate = new();
+    private Task _stopTask = Task.CompletedTask;
+    private PreviewFrame? _latestPreview;
+    private int _previewRenderScheduled;
+    private int _activationEpoch;
+    private volatile bool _pageActive;
 
     public ScanView(int deviceIndex)
     {
         InitializeComponent();
         _vm = new ScanViewModel();
         _vm.TransferCompleted += OnTransferCompleted;
+        _vm.PreviewFrameReady += OnPreviewFrameReady;
 
         // Progress poll at 7 Hz (same as Android's ~7Hz UI refresh). Also syncs
         // the VM's observable fields into the WPF text controls each tick.
@@ -37,9 +40,7 @@ public partial class ScanView : Page
             DispatcherPriority.Normal, (_, _) =>
             {
                 _vm.RefreshProgress();
-                StatusText.Text = _vm.StatusText;
-                ProgressText.Text = $"{_vm.ReceivedSymbolsText} / {_vm.TotalSymbolsText}";
-                DrawProgressRing(_vm.Progress);
+                SyncUiFromViewModel();
                 if (!string.IsNullOrEmpty(_vm.RecoveryStageText))
                 {
                     RecoveryStageText.Text = _vm.RecoveryStageText;
@@ -54,74 +55,117 @@ public partial class ScanView : Page
             IsEnabled = false,
         };
 
-        // Preview refresh at ~15 Hz (lighter than decode path to keep UI responsive).
-        _previewTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(66),
-            DispatcherPriority.Render, (_, _) => RenderPreview(), Dispatcher)
-        {
-            IsEnabled = false,
-        };
-
-        Loaded += (_, _) => Start(deviceIndex);
-        Unloaded += (_, _) => Cleanup();
+        Loaded += async (_, _) => await StartAsync(deviceIndex);
+        Unloaded += async (_, _) => await CleanupAsync();
     }
 
-    private void Start(int deviceIndex)
+    private async Task StartAsync(int deviceIndex)
     {
+        int epoch = Interlocked.Increment(ref _activationEpoch);
+        _pageActive = true;
+        Task pendingStop;
+        lock (_stopGate)
+        {
+            pendingStop = _stopTask;
+        }
+        try
+        {
+            await pendingStop;
+        }
+        catch (Exception ex)
+        {
+            _vm.StatusText = $"停止设备失败: {ex.Message}";
+            SyncUiFromViewModel();
+            return;
+        }
+        if (!_pageActive || epoch != Volatile.Read(ref _activationEpoch))
+        {
+            return;
+        }
+
         DrawProgressRing(0);
         _vm.StartScan(deviceIndex);
         _progressTimer.Start();
-        // Open a SEPARATE capture for preview only — the VM's capture feeds the
-        // decode pool; this one feeds the UI. Two handles to the same device work
-        // under DirectShow (one read, one read) as long as the driver allows it.
-        // If the driver is exclusive, the preview simply won't update and the
-        // scan still works — the preview is cosmetic.
+        StopButton.Content = _vm.IsScanning ? "⏹ 停止" : "▶ 重试";
+    }
+
+    private void OnPreviewFrameReady(PreviewFrame frame)
+    {
+        if (!_pageActive)
+        {
+            frame.Dispose();
+            return;
+        }
+        PreviewFrame? replaced = Interlocked.Exchange(ref _latestPreview, frame);
+        replaced?.Dispose();
+        SchedulePreviewRender();
+    }
+
+    private void SchedulePreviewRender()
+    {
+        if (Interlocked.Exchange(ref _previewRenderScheduled, 1) != 0)
+        {
+            return;
+        }
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            Interlocked.Exchange(ref _previewRenderScheduled, 0);
+            Interlocked.Exchange(ref _latestPreview, null)?.Dispose();
+            return;
+        }
         try
         {
-            _previewCapture = new AirFerry.Windows.Scan.VideoCapture(deviceIndex, 960, 540, 30);
+            _ = Dispatcher.BeginInvoke(DispatcherPriority.Render,
+                new Action(RenderLatestPreview));
         }
         catch
         {
-            _previewCapture = null;
+            Interlocked.Exchange(ref _previewRenderScheduled, 0);
+            Interlocked.Exchange(ref _latestPreview, null)?.Dispose();
         }
-        _previewTimer.Start();
     }
 
-    private void RenderPreview()
+    private void RenderLatestPreview()
     {
-        if (_previewCapture is null || !_previewCapture.IsOpen)
+        PreviewFrame? frame = Interlocked.Exchange(ref _latestPreview, null);
+        if (frame is not null)
+        {
+            try
+            {
+                if (_pageActive)
+                {
+                    RenderPreview(frame);
+                }
+            }
+            finally
+            {
+                frame.Dispose();
+            }
+        }
+        Interlocked.Exchange(ref _previewRenderScheduled, 0);
+        if (_pageActive && Volatile.Read(ref _latestPreview) is not null)
+        {
+            SchedulePreviewRender();
+        }
+    }
+
+    private void RenderPreview(PreviewFrame frame)
+    {
+        if (frame.Width <= 0 || frame.Height <= 0 ||
+            frame.Stride < frame.Width * 3 ||
+            frame.Length < frame.Stride * frame.Height)
         {
             return;
         }
-        Mat? bgr = _previewCapture.ReadBgr();
-        if (bgr is null || bgr.Empty())
-        {
-            return;
-        }
-        // Convert BGR Mat → WriteableBitmap. Recreate the bitmap only when the
-        // frame size changes (typical: stable across frames).
         if (PreviewImage.Source is not WriteableBitmap wb ||
-            wb.PixelWidth != bgr.Width || wb.PixelHeight != bgr.Height)
+            wb.PixelWidth != frame.Width || wb.PixelHeight != frame.Height)
         {
-            wb = new WriteableBitmap(bgr.Width, bgr.Height, 96, 96, PixelFormats.Bgr24, null);
+            wb = new WriteableBitmap(frame.Width, frame.Height, 96, 96,
+                PixelFormats.Bgr24, null);
             PreviewImage.Source = wb;
         }
-        // Write the Mat's bytes into the bitmap. WriteableBitmap expects Bgr24
-        // (3 bytes/pixel) which matches OpenCV's BGR Mat.
-        int stride = bgr.Width * 3;
-        wb.Lock();
-        try
-        {
-            unsafe
-            {
-                Buffer.MemoryCopy((void*)bgr.Data, (void*)wb.BackBuffer,
-                    stride * bgr.Height, stride * bgr.Height);
-            }
-            wb.AddDirtyRect(new Int32Rect(0, 0, bgr.Width, bgr.Height));
-        }
-        finally
-        {
-            wb.Unlock();
-        }
+        wb.WritePixels(new Int32Rect(0, 0, frame.Width, frame.Height),
+            frame.Pixels, frame.Stride, 0);
     }
 
     /// <summary>Draw the circular progress ring (0..100) on the overlay canvas.</summary>
@@ -189,14 +233,20 @@ public partial class ScanView : Page
     {
         Dispatcher.BeginInvoke(() =>
         {
+            if (!_pageActive)
+            {
+                return;
+            }
             DrawProgressRing(100);
             if (result.IsText)
             {
-                // Prefer original filename for text-like docs (readme.md…);
-                // ETTEXTv1 has no path — ReceiveTextView defaults to 文字消息.txt.
-                string? suggested = result.SingleFilePath is not null
-                    ? System.IO.Path.GetFileName(result.SingleFilePath)
-                    : null;
+                // Prefer descriptor / staged display name; else path basename;
+                // ReceiveTextView falls back to 文字消息.txt when still empty.
+                string? suggested = !string.IsNullOrWhiteSpace(result.DisplayName)
+                    ? result.DisplayName
+                    : result.SingleFilePath is not null
+                        ? System.IO.Path.GetFileName(result.SingleFilePath)
+                        : null;
                 NavigationService?.Navigate(new ReceiveTextView(result, suggested));
             }
             else if (result.IsBundle && result.Bundle is not null)
@@ -213,27 +263,95 @@ public partial class ScanView : Page
     // Bind VM properties → UI on each progress tick (simpler than full INotifyPropertyChanged hookup).
     // Called via the VM's RefreshProgress indirectly: we poll VM fields here.
 
-    private void Back_Click(object sender, RoutedEventArgs e) => CleanupAndGoBack();
+    private async void Back_Click(object sender, RoutedEventArgs e) =>
+        await CleanupAndGoBackAsync();
 
-    private void Stop_Click(object sender, RoutedEventArgs e) => _vm.StopScan();
+    private async void Stop_Click(object sender, RoutedEventArgs e)
+    {
+        StopButton.IsEnabled = false;
+        try
+        {
+            if (_vm.IsScanning)
+            {
+                _progressTimer.Stop();
+                StatusText.Text = "正在停止设备…";
+                await StopPipelineAsync();
+                if (_pageActive)
+                {
+                    SyncUiFromViewModel();
+                    StopButton.Content = "▶ 继续";
+                }
+            }
+            else
+            {
+                await StartAsync(_vm.SelectedDeviceIndex);
+            }
+        }
+        catch (Exception ex)
+        {
+            _vm.StatusText = $"设备操作失败: {ex.Message}";
+            SyncUiFromViewModel();
+        }
+        StopButton.IsEnabled = true;
+    }
 
     private void FileList_Click(object sender, RoutedEventArgs e)
     {
         NavigationService?.Navigate(new FileListView());
     }
 
-    private void Cleanup()
+    private Task StopPipelineAsync()
     {
-        _progressTimer.Stop();
-        _previewTimer.Stop();
-        _previewCapture?.Dispose();
-        _previewCapture = null;
+        lock (_stopGate)
+        {
+            if (!_vm.IsScanning && _stopTask.IsCompleted)
+            {
+                return Task.CompletedTask;
+            }
+            if (_stopTask.IsCompleted)
+            {
+                // StopScan waits for producer/workers before disposing native
+                // handles. Run that safe wait off the WPF dispatcher.
+                _stopTask = Task.Run(_vm.StopScan);
+            }
+            return _stopTask;
+        }
     }
 
-    private void CleanupAndGoBack()
+    private async Task CleanupAsync()
     {
-        Cleanup();
+        _pageActive = false;
+        Interlocked.Increment(ref _activationEpoch);
+        _progressTimer.Stop();
+        Interlocked.Exchange(ref _latestPreview, null)?.Dispose();
+        try
+        {
+            await StopPipelineAsync();
+        }
+        catch
+        {
+            // The page is leaving; the next activation will surface a failed
+            // stop before attempting to reopen the device.
+        }
+    }
+
+    private async Task CleanupAndGoBackAsync()
+    {
+        await CleanupAsync();
+        _vm.PreviewFrameReady -= OnPreviewFrameReady;
+        _vm.TransferCompleted -= OnTransferCompleted;
         _vm.Dispose();
         NavigationService?.GoBack();
+    }
+
+    private void SyncUiFromViewModel()
+    {
+        StatusText.Text = _vm.StatusText;
+        FileSummaryText.Text = _vm.FileSummaryText;
+        ProgressText.Text = $"{_vm.ReceivedSymbolsText} / {_vm.TotalSymbolsText}";
+        ScanMetricsText.Text = _vm.ScanMetricsText;
+        TransferMetricsText.Text = _vm.TransferMetricsText;
+        CodeStatusText.Text = _vm.CodeStatusText;
+        DrawProgressRing(_vm.Progress);
     }
 }

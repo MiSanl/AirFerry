@@ -6,7 +6,6 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -34,8 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.airferry.app.scan.ContentStore
+import com.airferry.app.scan.CreateNamedDocument
+import com.airferry.app.scan.FileTransfer
 import com.airferry.app.scan.TextLike
 import java.io.File
 
@@ -75,9 +75,10 @@ class FileListActivity : ComponentActivity() {
 
     private val saveQueue = ArrayDeque<Pair<File, String>>()
     private var pendingSave: Pair<File, String>? = null
+    private var indexErrorShown = false
 
     private val createDocument = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("application/octet-stream")
+        CreateNamedDocument()
     ) { uri: Uri? ->
         val job = pendingSave
         pendingSave = null
@@ -288,7 +289,17 @@ class FileListActivity : ComponentActivity() {
     }
 
     private fun loadRows(bundleFilter: String?): List<Row> {
-        val all = ContentStore.listEntries(this)
+        val all = try {
+            ContentStore.listEntries(this)
+        } catch (e: IllegalStateException) {
+            if (!indexErrorShown) {
+                indexErrorShown = true
+                window.decorView.post {
+                    Toast.makeText(this, e.message ?: "接收历史索引损坏", Toast.LENGTH_LONG).show()
+                }
+            }
+            return emptyList()
+        }
         if (bundleFilter != null) {
             return all.filter { it.bundleId == bundleFilter }
                 .sortedByDescending { it.createdAt }
@@ -349,11 +360,10 @@ class FileListActivity : ComponentActivity() {
         val pairs = flatten(rows)
         if (pairs.isEmpty()) return
         try {
-            val authority = "${packageName}.fileprovider"
+            val shared = pairs.filter { it.first.exists() }
             val uris = ArrayList<Uri>()
-            for ((file, _) in pairs) {
-                if (!file.exists()) continue
-                uris.add(FileProvider.getUriForFile(this, authority, file))
+            for ((file, name) in shared) {
+                uris.add(FileTransfer.shareUri(this, file, name))
             }
             if (uris.isEmpty()) {
                 Toast.makeText(this, "没有可分享的文件", Toast.LENGTH_SHORT).show()
@@ -362,7 +372,7 @@ class FileListActivity : ComponentActivity() {
             val shareIntent = Intent(
                 if (uris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
             ).apply {
-                type = "application/octet-stream"
+                type = FileTransfer.commonMimeType(shared.map { it.second })
                 if (uris.size > 1) putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
                 else putExtra(Intent.EXTRA_STREAM, uris[0])
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -430,7 +440,6 @@ class FileListActivity : ComponentActivity() {
                     val expectedCrc = e.crcHex.toLongOrNull(16) ?: 0L
                     startActivity(
                         Intent(this, ReceiveTextActivity::class.java).apply {
-                            putExtra("TEXT", text)
                             putExtra("FILE_PATH", file.absolutePath)
                             putExtra("FILE_NAME", e.name)
                             putExtra("ENTRY_ID", e.id)

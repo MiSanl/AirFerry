@@ -1,7 +1,7 @@
 /**
  * Page 1: content selection — one unified pending list.
  *
- *  - 添加文件：dropzone / click / folder walk → append file items
+ *  - 添加文件：full-page drop / click / folder walk → append file items
  *  - 添加文字：modal → text item (keeps content string; not just a File)
  *  - 发送：explicit confirm → parent stages (single pure text → ETTEXTv1;
  *    otherwise files + text-as-.txt → processFiles / ETBUNDL1 when ≥2)
@@ -125,9 +125,16 @@ async function walkEntry(entry: FileSystemEntry): Promise<File[]> {
     files.push(file)
   } else if (entry.isDirectory) {
     const reader = (entry as FileSystemDirectoryEntry).createReader()
-    const entries = await new Promise<FileSystemEntry[]>((resolve, reject) =>
-      reader.readEntries(resolve, reject)
-    )
+    const entries: FileSystemEntry[] = []
+    // Chromium returns directory entries in batches (commonly 100). Keep
+    // reading until an empty batch or large folders are silently truncated.
+    while (true) {
+      const batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
+        reader.readEntries(resolve, reject)
+      )
+      if (batch.length === 0) break
+      entries.push(...batch)
+    }
     for (const child of entries) {
       files.push(...(await walkEntry(child)))
     }
@@ -141,17 +148,40 @@ function previewText(content: string, max = 40): string {
   return [...oneLine].slice(0, max).join("") + "…"
 }
 
+function isFileDrag(dataTransfer: DataTransfer | null): boolean {
+  if (!dataTransfer) return false
+  return Array.from(dataTransfer.types).includes("Files")
+}
+
 export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const dragDepthRef = useRef(0)
+  const mountedRef = useRef(true)
+  const activeDropReadsRef = useRef(0)
+  const itemsRef = useRef(items)
+  itemsRef.current = items
   const [dragging, setDragging] = useState(false)
+  const [isReadingDrop, setIsReadingDrop] = useState(false)
+  const [dropError, setDropError] = useState<string | null>(null)
   const [textOpen, setTextOpen] = useState(false)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const appendIncomingFiles = useCallback(
     (incoming: File[]) => {
-      if (incoming.length === 0) return
-      onItemsChange(appendFiles(items, incoming))
+      if (!mountedRef.current || incoming.length === 0) return
+      const next = appendFiles(itemsRef.current, incoming)
+      // Publish immediately so overlapping async picker/drop completions append
+      // to the newest list even before React has rendered the parent update.
+      itemsRef.current = next
+      onItemsChange(next)
     },
-    [items, onItemsChange]
+    [onItemsChange]
   )
 
   const handleFiles = useCallback(
@@ -167,45 +197,121 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
     [appendIncomingFiles]
   )
 
-  const handleDrop = useCallback(
-    async (e: React.DragEvent) => {
-      e.preventDefault()
-      setDragging(false)
+  const ingestDrop = useCallback(
+    async (dataTransfer: DataTransfer) => {
+      const dataItems = dataTransfer.items
+      const snapshots: Array<{ entry: FileSystemEntry | null; file: File | null }> = []
+      const plainFiles = Array.from(dataTransfer.files)
+      let hasDirectory = false
 
-      const dataItems = e.dataTransfer.items
-      let hasDir = false
       if (dataItems && dataItems.length > 0) {
         for (let i = 0; i < dataItems.length; i++) {
-          const entry = dataItems[i].webkitGetAsEntry()
-          if (entry && entry.isDirectory) {
-            hasDir = true
-            break
-          }
+          const item = dataItems[i]
+          const getEntry = item.webkitGetAsEntry
+          const entry = typeof getEntry === "function" ? getEntry.call(item) : null
+          // Snapshot the fallback File before the first await. Browsers may put
+          // the drag data store into protected mode once the drop event returns.
+          snapshots.push({ entry, file: item.getAsFile() })
+          if (entry?.isDirectory) hasDirectory = true
         }
       }
 
-      if (hasDir) {
-        const allFiles: File[] = []
-        for (let i = 0; i < dataItems.length; i++) {
-          const entry = dataItems[i].webkitGetAsEntry()
-          if (entry) allFiles.push(...(await walkEntry(entry)))
-        }
-        appendIncomingFiles(allFiles)
-      } else {
-        handleFiles(e.dataTransfer.files)
+      if (!hasDirectory) {
+        appendIncomingFiles(plainFiles)
+        return
       }
+
+      const allFiles: File[] = []
+      for (const { entry, file } of snapshots) {
+        if (entry) {
+          allFiles.push(...(await walkEntry(entry)))
+        } else if (file) {
+          // Firefox may expose a file item without Chromium's entry API.
+          allFiles.push(file)
+        }
+      }
+      appendIncomingFiles(allFiles)
     },
-    [handleFiles, appendIncomingFiles]
+    [appendIncomingFiles]
   )
+
+  useEffect(() => {
+    const clearDragState = () => {
+      dragDepthRef.current = 0
+      setDragging(false)
+    }
+    const onDragEnter = (event: DragEvent) => {
+      if (!isFileDrag(event.dataTransfer)) return
+      event.preventDefault()
+      dragDepthRef.current += 1
+      setDragging(true)
+    }
+    const onDragOver = (event: DragEvent) => {
+      if (!isFileDrag(event.dataTransfer)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"
+      if (dragDepthRef.current === 0) dragDepthRef.current = 1
+      setDragging(true)
+    }
+    const onDragLeave = (event: DragEvent) => {
+      if (dragDepthRef.current === 0) return
+      if (event.relatedTarget === null) {
+        clearDragState()
+        return
+      }
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+      if (dragDepthRef.current === 0) setDragging(false)
+    }
+    const onDrop = (event: DragEvent) => {
+      if (dragDepthRef.current === 0 && !isFileDrag(event.dataTransfer)) return
+      event.preventDefault()
+      const dataTransfer = event.dataTransfer
+      clearDragState()
+      if (dataTransfer) {
+        setDropError(null)
+        activeDropReadsRef.current += 1
+        setIsReadingDrop(true)
+        void ingestDrop(dataTransfer)
+          .catch((error) => {
+            console.warn("Unable to read dropped files:", error)
+            if (mountedRef.current) {
+              setDropError("无法读取拖入的文件或文件夹，请重试或使用「添加文件」。")
+            }
+          })
+          .finally(() => {
+            activeDropReadsRef.current = Math.max(0, activeDropReadsRef.current - 1)
+            if (mountedRef.current && activeDropReadsRef.current === 0) {
+              setIsReadingDrop(false)
+            }
+          })
+      }
+    }
+
+    document.addEventListener("dragenter", onDragEnter, true)
+    document.addEventListener("dragover", onDragOver, true)
+    document.addEventListener("dragleave", onDragLeave, true)
+    document.addEventListener("drop", onDrop, true)
+    window.addEventListener("blur", clearDragState)
+    return () => {
+      document.removeEventListener("dragenter", onDragEnter, true)
+      document.removeEventListener("dragover", onDragOver, true)
+      document.removeEventListener("dragleave", onDragLeave, true)
+      document.removeEventListener("drop", onDrop, true)
+      window.removeEventListener("blur", clearDragState)
+    }
+  }, [ingestDrop])
 
   const removeItem = useCallback(
     (id: string) => {
-      onItemsChange(items.filter((it) => it.id !== id))
+      const next = itemsRef.current.filter((it) => it.id !== id)
+      itemsRef.current = next
+      onItemsChange(next)
     },
-    [items, onItemsChange]
+    [onItemsChange]
   )
 
   const clearAll = useCallback(() => {
+    itemsRef.current = []
     onItemsChange([])
   }, [onItemsChange])
 
@@ -233,23 +339,41 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
     (name: string, content: string) => {
       const filename =
         normalizeDraftFilename(name) || normalizeDraftFilename(suggestTextFilename(content))
-      const used = new Set(items.map(itemName))
+      const current = itemsRef.current
+      const used = new Set(current.map(itemName))
       const unique = uniqueName(used, filename)
-      onItemsChange([
-        ...items,
+      const next: PendingItem[] = [
+        ...current,
         { id: newId(), kind: "text", name: unique, content },
-      ])
+      ]
+      itemsRef.current = next
+      onItemsChange(next)
       setTextOpen(false)
     },
-    [items, onItemsChange]
+    [onItemsChange]
   )
 
-  const canSend = items.length > 0
+  const canSend = items.length > 0 && !isReadingDrop
   const sendLabel =
-    !canSend ? "发送" : items.length > 1 ? `发送（${items.length} 项）` : "发送"
+    isReadingDrop
+      ? "正在读取拖入内容…"
+      : !canSend
+        ? "发送"
+        : items.length > 1
+          ? `发送（${items.length} 项）`
+          : "发送"
 
   return (
     <div className="page">
+      {dragging && (
+        <div className="page-drop-overlay" role="status" aria-live="polite">
+          <div className="page-drop-overlay-card">
+            <span className="page-drop-overlay-icon" aria-hidden="true">📥</span>
+            <strong>松开即可添加</strong>
+            <span>文件或文件夹可拖到网页任意位置</span>
+          </div>
+        </div>
+      )}
       <h2>选择要发送的内容</h2>
       <p className="hint" style={{ marginTop: 0, marginBottom: 16 }}>
         添加文件或文字到列表，确认后发送（多项会打包为一次传输）
@@ -266,12 +390,6 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
 
       <div
         className={`dropzone ${dragging ? "drag" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault()
-          setDragging(true)
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
         onClick={handleBrowseClick}
       >
         <input
@@ -295,10 +413,17 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
               <span className="muted">点击或拖拽可继续追加</span>
             </>
           ) : (
-            "拖拽文件或文件夹到此处，或点击「添加文件」"
+            "拖拽文件或文件夹到网页任意位置，或点击「添加文件」"
           )}
         </p>
       </div>
+
+      {isReadingDrop && (
+        <p className="drop-read-status" role="status">
+          正在读取拖入的文件或文件夹，请稍候…
+        </p>
+      )}
+      {dropError && <p className="error" role="alert">{dropError}</p>}
 
       {items.length > 0 && (
         <>
@@ -436,7 +561,7 @@ function AddTextModal({
           style={{ display: "block", marginTop: 12, marginBottom: 6 }}
           htmlFor="text-item-name"
         >
-          保存为文件名（混发打包时使用）
+          保存为文件名（收端展示/落盘名）
         </label>
         <div className="text-draft-filename-field">
           <input

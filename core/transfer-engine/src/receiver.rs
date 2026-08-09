@@ -2,9 +2,15 @@
 
 use crate::{progress::Progress, Error, Result};
 use qr_protocol::{frame::SessionIdRaw, Frame};
-use raptorq_core::{Decoder, ObjectMeta, Symbol};
+use raptorq_core::{Decoder, ObjectMeta, Symbol, MAX_OBJECT_BYTES};
 use std::collections::{HashMap, HashSet};
 use std::vec::Vec;
+
+/// Hard cap on pre-descriptor bootstrap symbols held in [`ReceiverSession`]'s
+/// replay cache. Fountain codes tolerate drops; bounding the cache prevents a
+/// CRC-valid hostile stream that never supplies a descriptor from OOM-killing
+/// the receiver process. At T≈1400 this is ~16 MiB of payload storage.
+pub const PRE_META_SYMBOL_CACHE_MAX: usize = 12_000;
 
 /// A receiver session.
 ///
@@ -28,6 +34,9 @@ pub struct ReceiverSession {
     decoder: Option<Decoder>,
     /// Whether `meta` came from an authoritative descriptor frame.
     meta_confirmed: bool,
+    /// Whether the first valid descriptor has been accepted. Once set, both
+    /// object and file metadata are immutable for the lifetime of the session.
+    descriptor_seen: bool,
     /// File metadata learned from the descriptor frame (filename, size, CRC32).
     file_meta: crate::descriptor::FileMeta,
     received: Vec<HashSet<u32>>,
@@ -37,6 +46,10 @@ pub struct ReceiverSession {
     /// O(n²) over a full transfer — a real slowdown on large files). Index is
     /// block position, matching `meta.blocks` / `received`.
     source_recv: Vec<u32>,
+    /// Pre-descriptor bootstrap cache. Keyed by (sbn, esi); drained into the
+    /// decoder once a validated descriptor confirms OTI. Hard-capped by
+    /// [`PRE_META_SYMBOL_CACHE_MAX`] so a CRC-valid hostile stream without a
+    /// descriptor cannot grow RAM without bound.
     symbol_cache: HashMap<(u32, u32), Vec<u8>>,
     progress: Progress,
     /// Consecutive session-mismatch count (reset on successful ingest).
@@ -53,28 +66,31 @@ impl ReceiverSession {
     ///
     /// `meta` is normally reconstructed from the first frame's totals; see
     /// [`ReceiverSession::from_first_frame`].
-    pub fn new(session_id: SessionIdRaw, meta: ObjectMeta) -> Self {
-        Self::with_confirmed_meta(session_id, Some(meta))
+    pub fn new(session_id: SessionIdRaw, meta: ObjectMeta) -> Result<Self> {
+        Self::new_confirmed(session_id, meta)
     }
 
     /// Create a receiver with **confirmed** (authoritative) metadata — data
     /// frames will be decoded immediately instead of buffered. Used when the
     /// caller already has the real OTI (e.g. from a descriptor).
-    pub fn new_confirmed(session_id: SessionIdRaw, meta: ObjectMeta) -> Self {
-        let mut rx = Self::with_confirmed_meta(session_id, Some(meta));
-        rx.meta_confirmed = true;
-        rx
+    pub fn new_confirmed(session_id: SessionIdRaw, meta: ObjectMeta) -> Result<Self> {
+        let decoder = Decoder::new(meta.clone())?;
+        Ok(Self::build(session_id, Some(meta), Some(decoder), true))
     }
 
     /// Build a fully-confirmed session from authoritative metadata.
-    fn with_confirmed_meta(session_id: SessionIdRaw, meta: Option<ObjectMeta>) -> Self {
+    fn build(
+        session_id: SessionIdRaw,
+        meta: Option<ObjectMeta>,
+        decoder: Option<Decoder>,
+        meta_confirmed: bool,
+    ) -> Self {
         let total_symbols = meta
             .as_ref()
             .map(|m| m.blocks.iter().map(|b| b.num_source_symbols).sum())
             .unwrap_or(0);
         let total_blocks = meta.as_ref().map(|m| m.blocks.len() as u32).unwrap_or(0);
         let symbol_size = meta.as_ref().map(|m| m.symbol_size).unwrap_or(0);
-        let decoder = meta.clone().map(Decoder::new);
         let received = meta
             .as_ref()
             .map(|m| m.blocks.iter().map(|_| HashSet::new()).collect())
@@ -92,7 +108,8 @@ impl ReceiverSession {
             session_id,
             meta,
             decoder,
-            meta_confirmed: false,
+            meta_confirmed,
+            descriptor_seen: false,
             file_meta: crate::descriptor::FileMeta::default(),
             received,
             source_recv,
@@ -116,14 +133,14 @@ impl ReceiverSession {
     /// the old heuristic `derive_meta_from_totals`, which produced a wrong
     /// per-block layout for multi-block objects.
     pub fn from_first_frame(frame: &Frame) -> Self {
-        Self::with_confirmed_meta(frame.header.session_id, None)
+        Self::build(frame.header.session_id, None, None, false)
     }
 
     /// Create a "cache-only" receiver — no metadata yet, data frames buffered
     /// until the first descriptor arrives. Used by JNI (`receiverCreate`) and
     /// [`from_first_frame`] when no authoritative OTI is known.
     pub fn new_pending(session_id: SessionIdRaw) -> Self {
-        Self::with_confirmed_meta(session_id, None)
+        Self::build(session_id, None, None, false)
     }
 
     pub fn session_id(&self) -> SessionIdRaw {
@@ -175,25 +192,40 @@ impl ReceiverSession {
                 // controllable); invalid OTI/block params make raptorq panic
                 // (divide-by-zero / assert / slice OOB) or allocate gigabytes,
                 // and `panic = "abort"` would crash the whole receiver.
-                if info.meta.validate().is_err() {
+                let file_meta_invalid =
+                    !qr_protocol::compress::is_known_compression_tag(info.file_meta.compression)
+                        || info.file_meta.original_size > MAX_OBJECT_BYTES
+                        || (info.file_meta.compressed_size_known
+                            && info.file_meta.compressed_size > info.meta.transfer_length);
+                if info.meta.validate().is_err() || file_meta_invalid {
                     self.progress.frames_corrupt += 1;
                     return Ok(self.is_complete());
                 }
-                // Only rebuild when the authoritative layout differs from what
-                // we currently hold (or we had none at all).
-                let needs_rebuild = match &self.meta {
-                    None => true,
-                    Some(cur) => *cur != info.meta,
-                };
-                if needs_rebuild {
-                    self.apply_meta(info.meta.clone());
+
+                // A session's descriptor is immutable. Accept the first valid
+                // one, then ignore mismatching repeats instead of resetting a
+                // live decoder or changing the filename/checksum at completion.
+                if self.descriptor_seen {
+                    if self.meta.as_ref() != Some(&info.meta) || self.file_meta != info.file_meta {
+                        self.progress.frames_corrupt += 1;
+                    }
+                    return Ok(self.is_complete());
+                }
+
+                match &self.meta {
+                    None => self.apply_meta(info.meta.clone())?,
+                    Some(cur) if *cur != info.meta => {
+                        self.progress.frames_corrupt += 1;
+                        return Ok(self.is_complete());
+                    }
+                    Some(_) => {}
                 }
                 self.meta_confirmed = true;
+                self.descriptor_seen = true;
                 // The replay cache is only needed while the OTI is unknown;
                 // once confirmed, no future rebuild can happen — drop it so it
                 // doesn't grow unboundedly for the rest of the transfer.
                 self.symbol_cache.clear();
-                // Always update file metadata.
                 self.file_meta = info.file_meta;
             } else {
                 // Descriptor flag set but payload is not a parseable descriptor
@@ -209,11 +241,22 @@ impl ReceiverSession {
         // exactly that and corrupted multi-block recovery). The cache is keyed
         // by (sbn, esi); on descriptor arrival `apply_meta` replays it into the
         // correct decoder. RaptorQ is a fountain code, so holding symbols in the
-        // cache (vs decoding immediately) costs no information.
+        // cache (vs decoding immediately) costs no information — and drops past
+        // PRE_META_SYMBOL_CACHE_MAX are also safe (fresh repair will refill).
         if !self.meta_confirmed {
             self.pending_symbol_size = frame.header.symbol_size;
-            self.symbol_cache
-                .insert((frame.header.sbn, frame.header.esi), frame.payload);
+            let key = (frame.header.sbn, frame.header.esi);
+            if self.symbol_cache.contains_key(&key) {
+                // Duplicate while bootstrapping — keep the first copy.
+                self.progress.frames_duplicate += 1;
+            } else if self.symbol_cache.len() >= PRE_META_SYMBOL_CACHE_MAX {
+                // Cap reached: refuse new keys so RAM stays bounded. Count as
+                // corrupt so hosts can surface "waiting for descriptor / cache
+                // full" rather than silent progress.
+                self.progress.frames_corrupt += 1;
+            } else {
+                self.symbol_cache.insert(key, frame.payload);
+            }
             // Approximate progress from cache size (capped by UI).
             self.progress.received_symbols = self.symbol_cache.len() as u32;
             self.progress.decoded_symbols = 0;
@@ -265,7 +308,10 @@ impl ReceiverSession {
 
     /// Replace object metadata + decoder, replaying every stored symbol so no
     /// progress is lost when the authoritative layout arrives.
-    fn apply_meta(&mut self, meta: ObjectMeta) {
+    fn apply_meta(&mut self, meta: ObjectMeta) -> Result<()> {
+        // Validate and allocate before changing any existing session state, so
+        // a hostile descriptor cannot leave a partially-reset receiver.
+        let decoder = Decoder::new(meta.clone())?;
         // Save the cached symbols before we reset state.
         let cached_symbols = std::mem::take(&mut self.symbol_cache);
 
@@ -276,7 +322,7 @@ impl ReceiverSession {
         self.progress.total_blocks = meta.blocks.len() as u32;
         self.received = meta.blocks.iter().map(|_| HashSet::new()).collect();
         self.source_recv = vec![0u32; meta.blocks.len()];
-        self.decoder = Some(Decoder::new(meta));
+        self.decoder = Some(decoder);
 
         // Replay all cached symbols into the new decoder. We do NOT re-cache
         // them: once the authoritative OTI is applied the caller sets
@@ -284,21 +330,25 @@ impl ReceiverSession {
         // can occur, so keeping the bytes around would just leak memory.
         for ((sbn, esi), data) in cached_symbols {
             let bi = sbn as usize;
-            // Validate the symbol still fits in the new layout.
-            if bi < self.received.len() {
-                // Re-insert into received set and decoder.
-                if self.received[bi].insert(esi) {
-                    // Keep the O(1) source counter in sync with the replay.
-                    if let Some(meta) = self.meta.as_ref() {
-                        if esi < meta.blocks[bi].num_source_symbols {
-                            self.source_recv[bi] += 1;
-                        }
-                    }
-                    let symbol = Symbol::new(sbn, esi, data);
-                    // Ignore errors during replay; the symbol might not fit the new layout.
-                    if let Some(dec) = self.decoder.as_mut() {
-                        let _ = dec.add_symbol(&symbol);
-                    }
+            // Cache entries predate the authoritative descriptor. Validate all
+            // descriptor-dependent coordinates before counting or replaying
+            // them so malformed bootstrap frames cannot inflate progress.
+            if bi >= self.received.len()
+                || esi >= (1 << 24)
+                || data.len() != meta.symbol_size as usize
+            {
+                self.progress.frames_corrupt += 1;
+                continue;
+            }
+
+            let symbol = Symbol::new(sbn, esi, data);
+            if let Some(dec) = self.decoder.as_mut() {
+                dec.add_symbol(&symbol)?;
+            }
+            if self.received[bi].insert(esi) {
+                // Keep the O(1) source counter in sync with the replay.
+                if esi < meta.blocks[bi].num_source_symbols {
+                    self.source_recv[bi] += 1;
                 }
             }
         }
@@ -308,6 +358,7 @@ impl ReceiverSession {
 
         // Refresh progress counters after replay.
         self.refresh_decoded_counts();
+        Ok(())
     }
 
     fn refresh_decoded_counts(&mut self) {
@@ -379,7 +430,9 @@ impl ReceiverSession {
         // length" from "we never learned it" (e.g. a receiver built without a
         // descriptor) — operating on the raw padded bytes in the latter case.
         if self.file_meta.compressed_size_known {
-            let len = self.file_meta.compressed_size as usize;
+            let len = usize::try_from(self.file_meta.compressed_size).map_err(|_| {
+                Error::Compress("descriptor compressed_size does not fit this platform".into())
+            })?;
             // A corrupt/overflowing descriptor should never claim more than we
             // actually recovered; clamp rather than panic.
             if len <= raw.len() {
@@ -403,16 +456,37 @@ impl ReceiverSession {
             // Bound the decompressed output against a decompression bomb in the
             // untrusted payload. The descriptor's original_size is the exact
             // expected output; fall back to a conservative ceiling when unknown.
+            let max_decompressed_bytes = usize::try_from(MAX_OBJECT_BYTES).unwrap_or(usize::MAX);
             let cap = if self.file_meta.original_size > 0 {
-                self.file_meta.original_size as usize
+                let expected = usize::try_from(self.file_meta.original_size).map_err(|_| {
+                    Error::Compress("descriptor original_size does not fit this platform".into())
+                })?;
+                if expected > max_decompressed_bytes {
+                    let msg = "descriptor original_size exceeds receiver limit".to_string();
+                    self.last_assemble_error = Some(msg.clone());
+                    return Err(Error::Compress(msg));
+                }
+                expected
             } else {
-                256 * 1024 * 1024
+                max_decompressed_bytes
             };
             match qr_protocol::compress::decompress_with_limit(
                 &raw,
                 self.file_meta.compression,
                 cap,
             ) {
+                Ok(v)
+                    if self.file_meta.original_size > 0
+                        && v.len() as u64 != self.file_meta.original_size =>
+                {
+                    let msg = format!(
+                        "decompressed size mismatch: expected {}, got {}",
+                        self.file_meta.original_size,
+                        v.len()
+                    );
+                    self.last_assemble_error = Some(msg.clone());
+                    Err(Error::Compress(msg))
+                }
                 Ok(v) => {
                     self.last_assemble_error = None;
                     Ok(Some(v))
@@ -464,11 +538,15 @@ impl ReceiverSession {
     /// Rebuilds the decoder from stored metadata and replays any persisted symbol
     /// payloads. Received ESI sets from the snapshot are merged as symbols are
     /// replayed.
-    pub fn restore(state: crate::ResumeState) -> Self {
-        let mut rx = Self::new_confirmed(state.session_id, state.meta);
+    pub fn restore(state: crate::ResumeState) -> Result<Self> {
+        state.validate().map_err(Error::InvalidResume)?;
+        let mut rx = Self::new_confirmed(state.session_id, state.meta)?;
         for (sbn, esi, data) in state.symbols {
             let bi = sbn as usize;
-            if bi < rx.received.len() && rx.received[bi].insert(esi) {
+            let valid = bi < rx.received.len()
+                && esi < (1 << 24)
+                && data.len() as u32 == rx.pending_symbol_size;
+            if valid && rx.received[bi].insert(esi) {
                 if let Some(meta) = &rx.meta {
                     if esi < meta.blocks[bi].num_source_symbols {
                         rx.source_recv[bi] += 1;
@@ -476,6 +554,10 @@ impl ReceiverSession {
                 }
                 let symbol = Symbol::new(sbn, esi, data);
                 if let Some(dec) = rx.decoder.as_mut() {
+                    // A checkpoint may contain a redundant/decode-complete
+                    // replay. Validation above guarantees safe coordinates;
+                    // an individual upstream rejection must not discard the
+                    // rest of an otherwise usable checkpoint.
                     let _ = dec.add_symbol(&symbol);
                 }
             }
@@ -484,13 +566,15 @@ impl ReceiverSession {
         for (i, set) in state.received.into_iter().enumerate() {
             if i < rx.received.len() {
                 for esi in set {
-                    rx.received[i].insert(esi);
+                    if esi < (1 << 24) {
+                        rx.received[i].insert(esi);
+                    }
                 }
             }
         }
         rx.progress.received_symbols = rx.received.iter().map(|s| s.len() as u32).sum();
         rx.refresh_decoded_counts();
-        rx
+        Ok(rx)
     }
 }
 
@@ -587,7 +671,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta);
+        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta).unwrap();
         let total = sender.total_k();
         // Emit enough frames: one full source pass + a few repair rounds.
         let frames_needed = (total + total * redundancy as u32 / 100 + 10) as usize;
@@ -759,6 +843,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn first_valid_descriptor_is_immutable() {
+        let data = payload(20_000);
+        let sid = SessionId::derive("immutable", data.len() as u64, 0, &[]);
+        let sender = SenderSession::new(
+            &data,
+            sid,
+            SenderConfig::default(),
+            crate::descriptor::FileMeta::default(),
+        )
+        .unwrap();
+        let meta = sender.meta().clone();
+        let first_meta = crate::descriptor::FileMeta {
+            filename: "first.bin".into(),
+            original_size: data.len() as u64,
+            compressed_size: data.len() as u64,
+            compressed_size_known: true,
+            ..Default::default()
+        };
+        let mut changed_meta = first_meta.clone();
+        changed_meta.filename = "changed.exe".into();
+
+        let mut rx = ReceiverSession::new_pending(sid.into());
+        rx.ingest(crate::descriptor::build_frame(&meta, &first_meta, sid.into(), 1, 0).unwrap())
+            .unwrap();
+        let corrupt_before = rx.progress().frames_corrupt;
+        rx.ingest(crate::descriptor::build_frame(&meta, &changed_meta, sid.into(), 2, 0).unwrap())
+            .unwrap();
+
+        assert_eq!(rx.file_meta().filename, "first.bin");
+        assert!(rx.progress().frames_corrupt > corrupt_before);
+    }
+
+    /// Pre-descriptor bootstrap cache must refuse growth past
+    /// [`PRE_META_SYMBOL_CACHE_MAX`] so a hostile CRC-valid stream cannot OOM.
+    #[test]
+    fn pre_meta_symbol_cache_is_bounded() {
+        let sid = SessionId::derive("cache-cap", 1, 0, &[]).into();
+        let mut rx = ReceiverSession::new_pending(sid);
+        let payload = vec![0u8; 64];
+        // Fill to the hard cap with distinct (sbn, esi) keys.
+        for i in 0..PRE_META_SYMBOL_CACHE_MAX {
+            let f = Frame::build(sid, 0, 0, i as u32, 1, 1, 64, 1, 0, &payload);
+            let _ = rx.ingest(f).unwrap();
+        }
+        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
+        assert_eq!(
+            rx.progress().received_symbols as usize,
+            PRE_META_SYMBOL_CACHE_MAX
+        );
+        let corrupt_before = rx.progress().frames_corrupt;
+        // One more distinct key must be dropped, not stored.
+        let overflow = Frame::build(
+            sid,
+            0,
+            0,
+            PRE_META_SYMBOL_CACHE_MAX as u32,
+            1,
+            1,
+            64,
+            1,
+            0,
+            &payload,
+        );
+        let _ = rx.ingest(overflow).unwrap();
+        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
+        assert!(rx.progress().frames_corrupt > corrupt_before);
+        // A duplicate of an already-cached key must not grow the cache either.
+        let dup = Frame::build(sid, 0, 0, 0, 1, 1, 64, 1, 0, &payload);
+        let dup_before = rx.progress().frames_duplicate;
+        let _ = rx.ingest(dup).unwrap();
+        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
+        assert!(rx.progress().frames_duplicate > dup_before);
+    }
+
     /// A data frame whose ESI exceeds RFC 6330's 24-bit space (which would panic
     /// raptorq's PayloadId) must be dropped without panic or acceptance.
     #[test]
@@ -774,7 +933,7 @@ mod tests {
         .unwrap()
         .meta()
         .clone();
-        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta.clone());
+        let mut rx = ReceiverSession::new_confirmed(sid.into(), meta.clone()).unwrap();
 
         let payload_bytes = vec![0u8; meta.symbol_size as usize];
         let f = Frame::build(

@@ -32,11 +32,11 @@
 
 #![forbid(unsafe_code)]
 
-pub mod frame;
-pub mod compress;
 pub mod chunker;
-pub mod session;
+pub mod compress;
+pub mod frame;
 pub mod qr_render;
+pub mod session;
 
 pub use frame::{Frame, FrameHeader, FLAG_DESCRIPTOR, FRAME_FOOTER_SIZE, FRAME_HEADER_SIZE, MAGIC};
 pub use session::SessionId;

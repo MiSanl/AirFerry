@@ -9,6 +9,11 @@ namespace AirFerry.Windows.Models;
 /// non-null: the sender emits either a single-file transfer, a multi-file
 /// bundle (ETBUNDL1 magic), or a text message (ETTEXTv1 magic).
 /// </summary>
+/// <param name="DisplayName">
+/// Original filename from the descriptor (or staged store name). Used by the
+/// text receive page for save-as; optional for pure in-memory ETTEXTv1 results
+/// that never wrote a path.
+/// </param>
 public sealed record RecoveryResult(
     string? SingleFilePath,
     ulong? SingleFileSize,
@@ -17,8 +22,9 @@ public sealed record RecoveryResult(
     ulong? ReceivedCrc32,
     IReadOnlyList<BundleFile>? Bundle,
     string? BundleDir,
-    string? Text = null)
+    string? Text = null,
+    string? DisplayName = null)
 {
     public bool IsBundle => Bundle is not null && Bundle.Count > 0;
-    public bool IsText => !string.IsNullOrEmpty(Text);
+    public bool IsText => Text is not null;
 }

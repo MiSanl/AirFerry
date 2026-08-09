@@ -106,12 +106,17 @@ const DESC_V3_TAIL_FIXED: usize = 9;
 pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>> {
     let symbol_size = meta.symbol_size as usize;
 
-    // Truncate filename if needed so the whole payload fits in one symbol.
+    // Truncate filename if needed so the whole payload fits in one symbol, but
+    // never split a multi-byte UTF-8 scalar: the receiver deliberately uses a
+    // strict decoder and would reject an invalid descriptor.
     let blocks_len = meta.blocks.len() * 16;
     let available_for_filename = symbol_size
         .saturating_sub(DESC_FIXED_OVERHEAD + blocks_len + DESC_V2_TAIL_FIXED + DESC_V3_TAIL_FIXED);
     let filename_bytes = file_meta.filename.as_bytes();
-    let filename_len = filename_bytes.len().min(available_for_filename).min(255);
+    let mut filename_len = filename_bytes.len().min(available_for_filename).min(255);
+    while !file_meta.filename.is_char_boundary(filename_len) {
+        filename_len -= 1;
+    }
     let filename_slice = &filename_bytes[..filename_len];
 
     // body = fixed overhead + blocks + (filename_len byte + filename) + v2 tail
@@ -163,16 +168,9 @@ pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>>
 
 /// Parse a descriptor payload. Accepts v1, v2, and v3 descriptors.
 ///
-/// **Forward-compatibility by length + content, not version byte alone.** The
-/// version field is only a hint. The catch: a descriptor payload is *always*
-/// zero-padded up to a full symbol, so a genuine v2 sender (which stops writing
-/// after the v2 crc32 field) leaves 9+ trailing zero bytes — exactly the size of
-/// the v3 tail. A naive "are there ≥ 9 trailing bytes?" check would therefore
-/// read that all-zero padding as a v3 tail (`compression=0, compressed_size=0`),
-/// and because `compressed_size_known` would be set true, the receiver would
-/// `truncate(0)` the recovered payload into an empty file. We guard against this
-/// by treating the v3 tail as present only when the version byte claims ≥ 3 *or*
-/// the tail is not the all-zero pattern a v2 sender's padding produces.
+/// Extension parsing is gated by the explicit version byte. Descriptor symbols
+/// are zero-padded, so using payload length to infer a newer version would parse
+/// v1/v2 padding as real fields and could truncate a recovered file to zero.
 ///
 /// Returns `None` only if the payload is not a descriptor at all (bad magic or
 /// truncated below the fixed header + declared block table).
@@ -181,6 +179,9 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
         return None;
     }
     let version = payload[1];
+    if !(1..=DESC_VERSION).contains(&version) {
+        return None;
+    }
 
     let num_blocks = u16::from_be_bytes([payload[2], payload[3]]) as usize;
     let blocks_end = DESC_FIXED_OVERHEAD + num_blocks * 16;
@@ -216,35 +217,30 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
         blocks,
     };
 
-    // v2 extension: filename_len + filename + original_size + crc32.
-    // Parsed purely on availability of trailing bytes (not on the version
-    // byte), so this stays compatible with any future version that preserves
-    // the v1/v2 layout prefix.
-    let file_meta = if payload.len() > o {
+    // v1 ends at the block table regardless of symbol padding.
+    let file_meta = if version == 1 {
+        FileMeta::default()
+    } else {
+        // v2 extension: filename_len + filename + original_size + crc32.
+        if payload.len() <= o {
+            return None;
+        }
         let fn_len = payload[o] as usize;
         o += 1;
-        // Need filename bytes + u64 original_size + u32 crc32 = fn_len + 12.
         if payload.len() < o + fn_len + 12 {
-            // Truncated v2 extension — return empty file meta.
-            FileMeta::default()
+            return None;
         } else {
-            let filename = String::from_utf8_lossy(&payload[o..o + fn_len]).to_string();
+            let filename = String::from_utf8(payload[o..o + fn_len].to_vec()).ok()?;
             o += fn_len;
             let original_size = u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
             o += 8;
             let crc32 = u32::from_be_bytes(payload[o..o + 4].try_into().unwrap());
             o += 4;
 
-            // v3 extension: compression + compressed_size. The descriptor is
-            // always zero-padded to a full symbol, so a genuine v2 sender leaves
-            // an all-zero region here that a pure length-check would mistake for
-            // "compressed_size = 0" (→ receiver truncates to empty). Only treat
-            // the tail as a real v3 extension when the version byte advertises it
-            // (>= 3) OR the bytes are not the all-zero v2-padding signature.
-            let v3_present = payload.len() >= o + DESC_V3_TAIL_FIXED
-                && (version >= DESC_VERSION
-                    || payload[o..o + DESC_V3_TAIL_FIXED].iter().any(|&b| b != 0));
-            if v3_present {
+            if version >= DESC_VERSION {
+                if payload.len() < o + DESC_V3_TAIL_FIXED {
+                    return None;
+                }
                 let compression = payload[o];
                 o += 1;
                 let compressed_size = u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
@@ -275,9 +271,6 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
                 }
             }
         }
-    } else {
-        // v1 descriptor — no file metadata.
-        FileMeta::default()
     };
 
     Some(DescriptorInfo { meta, file_meta })
@@ -401,6 +394,42 @@ mod tests {
         assert!(info.file_meta.crc32_known);
     }
 
+    #[test]
+    fn descriptor_filename_truncation_preserves_utf8() {
+        let data = vec![7u8; 1_024];
+        let sender = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            FileMeta {
+                // 255 (the wire limit) falls in the middle of a four-byte
+                // scalar, so safe truncation must back up to byte 252.
+                filename: "😀".repeat(100),
+                original_size: data.len() as u64,
+                ..FileMeta::default()
+            },
+        )
+        .unwrap();
+        let payload = build_payload(sender.meta(), sender.file_meta()).unwrap();
+        let parsed = parse_payload(&payload).expect("truncated name remains valid UTF-8");
+        assert_eq!(parsed.file_meta.filename.len(), 252);
+    }
+
+    #[test]
+    fn rejects_unknown_descriptor_version() {
+        let data = vec![9u8; 1_024];
+        let sender = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            FileMeta::default(),
+        )
+        .unwrap();
+        let mut payload = build_payload(sender.meta(), sender.file_meta()).unwrap();
+        payload[1] = DESC_VERSION + 1;
+        assert!(parse_payload(&payload).is_none());
+    }
+
     /// A genuine v2 descriptor — exactly what a real legacy v2 sender transmits:
     /// the v2 body (through crc32) followed by an all-zero padded tail. This must
     /// NOT be misread as a v3 tail with `compressed_size = 0` (which would make
@@ -445,6 +474,33 @@ mod tests {
             info.file_meta.compressed_size, 1_234,
             "v2 descriptor must fall back to compressed_size == original_size, not 0"
         );
+    }
+
+    #[test]
+    fn padded_v1_descriptor_does_not_parse_padding_as_v2() {
+        let data = vec![7u8; 8_000];
+        let sender = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            FileMeta {
+                filename: "must-not-appear.txt".into(),
+                original_size: data.len() as u64,
+                crc32: 123,
+                compression: qr_protocol::compress::COMPRESSION_NONE,
+                compressed_size: data.len() as u64,
+                compressed_size_known: true,
+                crc32_known: true,
+            },
+        )
+        .unwrap();
+        let mut payload = build_payload(sender.meta(), sender.file_meta()).unwrap();
+        let v1_end = DESC_FIXED_OVERHEAD + sender.meta().blocks.len() * 16;
+        payload[1] = 1;
+        payload[v1_end..].fill(0);
+
+        let parsed = parse_payload(&payload).unwrap();
+        assert_eq!(parsed.file_meta, FileMeta::default());
     }
 
     /// Regression for the full bug: a receiver fed a real v2 descriptor must

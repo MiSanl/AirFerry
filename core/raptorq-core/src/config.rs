@@ -7,6 +7,14 @@ use crate::Result;
 /// module density low and dramatically improves scan reliability.
 pub const DEFAULT_SYMBOL_SIZE: u32 = 1024;
 
+/// Smallest payload accepted by AirFerry. Keeping the payload at least 64
+/// bytes and 8-byte aligned makes the public size exactly match RaptorQ's OTI
+/// symbol size.
+pub const MIN_SYMBOL_SIZE: u32 = 64;
+/// Largest aligned payload for which `payload + PayloadId` still fits the
+/// upstream `u16` MTU.
+pub const MAX_SYMBOL_SIZE: u32 = 65_528;
+
 /// RaptorQ MTU includes the 4-byte `PayloadId` header the underlying crate
 /// prepends to every packet. Our public symbol size is the *payload* size, so
 /// the internal MTU = symbol_size + 4.
@@ -19,7 +27,7 @@ const PAYLOAD_ID_SIZE: u16 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Config {
-    pub symbol_size: u32,
+    symbol_size: u32,
 }
 
 impl Default for Config {
@@ -32,20 +40,24 @@ impl Default for Config {
 
 impl Config {
     pub fn new(symbol_size: u32) -> Result<Self> {
-        if symbol_size == 0 {
-            return Err(crate::Error::InvalidSymbolSize);
-        }
-        // raptorq stores symbol_size as u16.
-        if symbol_size > u16::MAX as u32 {
+        if !(MIN_SYMBOL_SIZE..=MAX_SYMBOL_SIZE).contains(&symbol_size) || symbol_size % 8 != 0 {
             return Err(crate::Error::InvalidSymbolSize);
         }
         Ok(Self { symbol_size })
     }
 
+    #[inline]
+    pub fn symbol_size(self) -> u32 {
+        self.symbol_size
+    }
+
     /// MTU as expected by `raptorq::Encoder::with_defaults` (payload + PayloadId).
     #[inline]
-    pub(crate) fn mtu(&self) -> u16 {
-        self.symbol_size as u16 + PAYLOAD_ID_SIZE
+    pub(crate) fn mtu(self) -> Result<u16> {
+        self.symbol_size
+            .checked_add(u32::from(PAYLOAD_ID_SIZE))
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or(crate::Error::InvalidSymbolSize)
     }
 }
 
@@ -55,7 +67,7 @@ mod tests {
 
     #[test]
     fn default_is_1024() {
-        assert_eq!(Config::default().symbol_size, 1024);
+        assert_eq!(Config::default().symbol_size(), 1024);
     }
 
     #[test]
@@ -67,5 +79,14 @@ mod tests {
     fn rejects_huge_symbol_size() {
         assert!(Config::new(0x1_0000).is_err());
         assert!(Config::new(1024).is_ok());
+    }
+
+    #[test]
+    fn rejects_unaligned_and_overflowing_sizes() {
+        assert!(Config::new(63).is_err());
+        assert!(Config::new(65).is_err());
+        assert!(Config::new(1900).is_err());
+        assert!(Config::new(MAX_SYMBOL_SIZE).is_ok());
+        assert!(Config::new(MAX_SYMBOL_SIZE + 1).is_err());
     }
 }

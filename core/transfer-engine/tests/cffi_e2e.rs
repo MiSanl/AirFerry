@@ -34,16 +34,8 @@ extern "C" {
         out_len: *mut usize,
     ) -> i32;
     fn airferry_buffer_free(ptr: *mut u8, len: usize);
-    fn airferry_receiver_progress_json(
-        handle: *const c_void,
-        out: *mut u8,
-        cap: usize,
-    ) -> usize;
-    fn airferry_receiver_file_name(
-        handle: *const c_void,
-        out: *mut u8,
-        cap: usize,
-    ) -> usize;
+    fn airferry_receiver_progress_json(handle: *const c_void, out: *mut u8, cap: usize) -> usize;
+    fn airferry_receiver_file_name(handle: *const c_void, out: *mut u8, cap: usize) -> usize;
     fn airferry_receiver_file_size(handle: *const c_void) -> u64;
     fn airferry_receiver_crc32(handle: *const c_void) -> u64;
     fn airferry_receiver_crc32_known(handle: *const c_void) -> i32;
@@ -53,7 +45,9 @@ const INGEST_ERROR: u64 = 0xFFFF_FFFFu64 << 32;
 const TEST_FILENAME: &str = "hello.txt";
 
 fn pseudo_random(n: usize) -> Vec<u8> {
-    (0..n).map(|i| ((i * 1103515245 + 12345) & 0xff) as u8).collect()
+    (0..n)
+        .map(|i| ((i * 1103515245 + 12345) & 0xff) as u8)
+        .collect()
 }
 
 #[test]
@@ -100,8 +94,7 @@ fn cffi_end_to_end_recovery() {
 
     // Create the C-ABI receiver with the split session id (low + high u64),
     // exactly as the Windows host will.
-    let handle =
-        unsafe { airferry_receiver_create(sid_u128 as u64, (sid_u128 >> 64) as u64) };
+    let handle = unsafe { airferry_receiver_create(sid_u128 as u64, (sid_u128 >> 64) as u64) };
     assert!(!handle.is_null());
 
     // Drain frames from the sender, round-tripping through the wire format,
@@ -156,8 +149,7 @@ fn cffi_end_to_end_recovery() {
     // Assemble the recovered bytes (Rust allocates; host frees).
     let mut out_buf: *mut u8 = std::ptr::null_mut();
     let mut out_len: usize = 0;
-    let ok =
-        unsafe { airferry_receiver_assemble(handle, &mut out_buf, &mut out_len) };
+    let ok = unsafe { airferry_receiver_assemble(handle, &mut out_buf, &mut out_len) };
     assert_eq!(ok, 1, "assemble must succeed once complete");
     assert!(!out_buf.is_null());
     // RaptorQ zero-pads to a symbol boundary; trim back to the descriptor's
@@ -189,7 +181,11 @@ fn crc32_of(data: &[u8]) -> u32 {
     for i in 0..256u32 {
         let mut c = i;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         table[i as usize] = c;
     }

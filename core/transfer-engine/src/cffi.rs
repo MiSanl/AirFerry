@@ -51,7 +51,7 @@ fn pack_ingest_status(
     }
     let streak16 = (mismatch_streak & 0xFFFF) as u64;
     bits |= streak16 << 8;
-    let recv32 = (received_symbols & 0xFFFF_FFFF) as u64;
+    let recv32 = received_symbols as u64;
     bits |= recv32 << 32;
     bits
 }
@@ -70,8 +70,12 @@ pub extern "C" fn airferry_receiver_create(sid_lo: u64, sid_hi: u64) -> *mut Rec
 
 /// Destroy a receiver created by [`airferry_receiver_create`]. Passing null is
 /// a no-op. After this returns, the handle is invalid and must not be reused.
+///
+/// # Safety
+/// `handle` must be null or a live handle returned by create, exclusively owned
+/// by the caller, and it must never be used again after this call.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_destroy(handle: *mut ReceiverSession) {
+pub unsafe extern "C" fn airferry_receiver_destroy(handle: *mut ReceiverSession) {
     if handle.is_null() {
         return;
     }
@@ -94,8 +98,12 @@ pub extern "C" fn airferry_receiver_destroy(handle: *mut ReceiverSession) {
 /// Returns `INGEST_ERROR` (`received_symbols == u32::MAX`) on a null handle or
 /// a frame that fails wire validation (bad magic / CRC / version); the host
 /// treats this as "frame rejected, nothing to do".
+///
+/// # Safety
+/// `handle` must be a live, exclusively borrowed receiver and `frame_bytes`
+/// must point to `frame_len` readable bytes for the duration of this call.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_ingest(
+pub unsafe extern "C" fn airferry_receiver_ingest(
     handle: *mut ReceiverSession,
     frame_bytes: *const u8,
     frame_len: usize,
@@ -136,8 +144,12 @@ pub extern "C" fn airferry_receiver_ingest(
 
 /// Return 1 if the object is fully decoded, 0 otherwise (including a null
 /// handle).
+///
+/// # Safety
+/// A non-null `handle` must refer to a live receiver and must not be mutated
+/// concurrently for the duration of this call.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_is_complete(handle: *const ReceiverSession) -> i32 {
+pub unsafe extern "C" fn airferry_receiver_is_complete(handle: *const ReceiverSession) -> i32 {
     if handle.is_null() {
         return 0;
     }
@@ -157,17 +169,30 @@ pub extern "C" fn airferry_receiver_is_complete(handle: *const ReceiverSession) 
 /// This single-call contract replaces the JNI-era two-step `length` + `fill`
 /// pattern (which raced on large files); see [`ReceiverSession::assemble_result`]
 /// for the decompression semantics.
+///
+/// # Safety
+/// `handle` must be live and exclusively borrowed. Non-null out parameters must
+/// be writable. The returned buffer must be freed exactly once with its length.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_assemble(
-    handle: *const ReceiverSession,
+pub unsafe extern "C" fn airferry_receiver_assemble(
+    handle: *mut ReceiverSession,
     out_buf: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return 0;
+    }
+    // SAFETY: both output pointers were checked and the caller guarantees they
+    // are writable. Initialize them before every failure path.
+    unsafe {
+        *out_buf = std::ptr::null_mut();
+        *out_len = 0;
+    }
     if handle.is_null() {
         return 0;
     }
     // SAFETY: shared borrow; caller guarantees the handle is valid.
-    let session = unsafe { &mut *(handle as *mut ReceiverSession) };
+    let session = unsafe { &mut *handle };
     let data = match session.assemble_result() {
         Ok(Some(d)) => d,
         Ok(None) => return 0,
@@ -180,15 +205,9 @@ pub extern "C" fn airferry_receiver_assemble(
     let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
     // SAFETY: `out_buf`/`out_len` are caller-provided out-params; writing to
     // them is the documented contract.
-    if !out_buf.is_null() {
-        unsafe {
-            *out_buf = ptr;
-        }
-    }
-    if !out_len.is_null() {
-        unsafe {
-            *out_len = len;
-        }
+    unsafe {
+        *out_buf = ptr;
+        *out_len = len;
     }
     1
 }
@@ -196,9 +215,13 @@ pub extern "C" fn airferry_receiver_assemble(
 /// Release a buffer returned by [`airferry_receiver_assemble`]. `ptr`/`len`
 /// must be exactly the values the assemble call wrote. Passing null/0 is a
 /// no-op. Do NOT call this on any pointer the host allocated itself.
+///
+/// # Safety
+/// A non-null `ptr` and `len` must be the exact, still-owned pair returned by
+/// `airferry_receiver_assemble`, and may be freed only once.
 #[no_mangle]
-pub extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
+pub unsafe extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
         return;
     }
     // SAFETY: `ptr` came from `Box::into_raw(slice.into_boxed_slice())` in
@@ -219,8 +242,12 @@ pub extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
 ///   bytes written.
 ///
 /// On a null handle, returns 0 (nothing to write).
+///
+/// # Safety
+/// A non-null handle must be live. A non-null `out` must point to `cap`
+/// writable bytes and must not overlap receiver storage.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_progress_json(
+pub unsafe extern "C" fn airferry_receiver_progress_json(
     handle: *const ReceiverSession,
     out: *mut u8,
     cap: usize,
@@ -236,8 +263,12 @@ pub extern "C" fn airferry_receiver_progress_json(
 /// Write the recovered file name (UTF-8 + NUL) into the caller buffer using
 /// the same length-query protocol as [`airferry_receiver_progress_json`].
 /// Empty string when no descriptor has been received yet.
+///
+/// # Safety
+/// A non-null handle must be live. A non-null `out` must point to `cap`
+/// writable bytes.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_file_name(
+pub unsafe extern "C" fn airferry_receiver_file_name(
     handle: *const ReceiverSession,
     out: *mut u8,
     cap: usize,
@@ -251,8 +282,11 @@ pub extern "C" fn airferry_receiver_file_name(
 }
 
 /// Original file size in bytes (0 if no descriptor received / null handle).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_file_size(handle: *const ReceiverSession) -> u64 {
+pub unsafe extern "C" fn airferry_receiver_file_size(handle: *const ReceiverSession) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -264,8 +298,11 @@ pub extern "C" fn airferry_receiver_file_size(handle: *const ReceiverSession) ->
 /// unsigned 32-bit range survives — mirroring the JNI layer's decision to use
 /// `jlong` instead of `jint` (CRC32 values like `0xDEADBEEF` would otherwise
 /// look negative as a signed 32-bit int).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_crc32(handle: *const ReceiverSession) -> u64 {
+pub unsafe extern "C" fn airferry_receiver_crc32(handle: *const ReceiverSession) -> u64 {
     if handle.is_null() {
         return 0;
     }
@@ -276,8 +313,11 @@ pub extern "C" fn airferry_receiver_crc32(handle: *const ReceiverSession) -> u64
 /// Return 1 if the descriptor supplied a real CRC32 (so the host should verify
 /// it against the recovered bytes), or 0 if the CRC is unknown and must NOT be
 /// compared. CRC32 can legitimately be 0, so `crc32() == 0` is not a safe test.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
 #[no_mangle]
-pub extern "C" fn airferry_receiver_crc32_known(handle: *const ReceiverSession) -> i32 {
+pub unsafe extern "C" fn airferry_receiver_crc32_known(handle: *const ReceiverSession) -> i32 {
     if handle.is_null() {
         return 0;
     }
@@ -386,40 +426,89 @@ mod tests {
     fn create_destroy_roundtrip_does_not_leak() {
         let h = airferry_receiver_create(42, 0);
         assert!(!h.is_null());
-        // Null frame pointer → INGEST_ERROR, no crash.
-        assert_eq!(airferry_receiver_ingest(h, std::ptr::null(), 0), INGEST_ERROR);
-        // Accessors on a fresh (no-descriptor) session report empty/zero.
-        assert_eq!(airferry_receiver_is_complete(h), 0);
-        assert_eq!(airferry_receiver_file_size(h), 0);
-        assert_eq!(airferry_receiver_crc32(h), 0);
-        assert_eq!(airferry_receiver_crc32_known(h), 0);
-        // progress_json first returns the required length when the buffer is
-        // too small, then writes a `{`-prefixed JSON + NUL when it fits.
-        let mut tiny = [0u8; 8];
-        let needed = airferry_receiver_progress_json(h, tiny.as_mut_ptr(), tiny.len());
-        assert!(needed > tiny.len(), "JSON must be longer than the tiny buffer");
-        let mut buf = vec![0u8; needed];
-        let written = airferry_receiver_progress_json(h, buf.as_mut_ptr(), buf.len());
-        assert_eq!(written, needed);
-        assert_eq!(buf[0], b'{');
-        assert_eq!(buf[written - 1], 0); // NUL terminator
-        airferry_receiver_destroy(h);
+        // SAFETY: this test owns `h` exclusively and all temporary buffers live
+        // across each call.
+        unsafe {
+            // Null frame pointer → INGEST_ERROR, no crash.
+            assert_eq!(
+                airferry_receiver_ingest(h, std::ptr::null(), 0),
+                INGEST_ERROR
+            );
+            // Accessors on a fresh (no-descriptor) session report empty/zero.
+            assert_eq!(airferry_receiver_is_complete(h), 0);
+            assert_eq!(airferry_receiver_file_size(h), 0);
+            assert_eq!(airferry_receiver_crc32(h), 0);
+            assert_eq!(airferry_receiver_crc32_known(h), 0);
+            // progress_json first returns the required length when the buffer is
+            // too small, then writes a `{`-prefixed JSON + NUL when it fits.
+            let mut tiny = [0u8; 8];
+            let needed = airferry_receiver_progress_json(h, tiny.as_mut_ptr(), tiny.len());
+            assert!(
+                needed > tiny.len(),
+                "JSON must be longer than the tiny buffer"
+            );
+            let mut buf = vec![0u8; needed];
+            let written = airferry_receiver_progress_json(h, buf.as_mut_ptr(), buf.len());
+            assert_eq!(written, needed);
+            assert_eq!(buf[0], b'{');
+            assert_eq!(buf[written - 1], 0); // NUL terminator
+            airferry_receiver_destroy(h);
+        }
     }
 
     #[test]
     fn null_handle_is_safe_everywhere() {
-        assert_eq!(airferry_receiver_ingest(std::ptr::null_mut(), std::ptr::null(), 0), INGEST_ERROR);
-        assert_eq!(airferry_receiver_is_complete(std::ptr::null()), 0);
-        let mut out_buf: *mut u8 = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        assert_eq!(airferry_receiver_assemble(std::ptr::null(), &mut out_buf, &mut out_len), 0);
-        assert_eq!(airferry_receiver_progress_json(std::ptr::null(), std::ptr::null_mut(), 0), 0);
-        assert_eq!(airferry_receiver_file_name(std::ptr::null(), std::ptr::null_mut(), 0), 0);
-        assert_eq!(airferry_receiver_file_size(std::ptr::null()), 0);
-        assert_eq!(airferry_receiver_crc32(std::ptr::null()), 0);
-        assert_eq!(airferry_receiver_crc32_known(std::ptr::null()), 0);
-        // destroy/free are no-ops on null.
-        airferry_receiver_destroy(std::ptr::null_mut());
-        airferry_buffer_free(std::ptr::null_mut(), 0);
+        // SAFETY: the C contract explicitly permits null handles/pointers in
+        // these no-op/error paths.
+        unsafe {
+            assert_eq!(
+                airferry_receiver_ingest(std::ptr::null_mut(), std::ptr::null(), 0),
+                INGEST_ERROR
+            );
+            assert_eq!(airferry_receiver_is_complete(std::ptr::null()), 0);
+            let mut out_buf: *mut u8 = std::ptr::null_mut();
+            let mut out_len: usize = 0;
+            assert_eq!(
+                airferry_receiver_assemble(std::ptr::null_mut(), &mut out_buf, &mut out_len),
+                0
+            );
+            assert_eq!(
+                airferry_receiver_progress_json(std::ptr::null(), std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                airferry_receiver_file_name(std::ptr::null(), std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(airferry_receiver_file_size(std::ptr::null()), 0);
+            assert_eq!(airferry_receiver_crc32(std::ptr::null()), 0);
+            assert_eq!(airferry_receiver_crc32_known(std::ptr::null()), 0);
+            // destroy/free are no-ops on null.
+            airferry_receiver_destroy(std::ptr::null_mut());
+            airferry_buffer_free(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn assemble_requires_both_output_parameters() {
+        let handle = airferry_receiver_create(7, 0);
+        assert!(!handle.is_null());
+        let mut out_buf = 1usize as *mut u8;
+        let mut out_len = usize::MAX;
+        // SAFETY: this test owns the live handle. Null output pointers are
+        // explicitly rejected without allocating or touching the session.
+        unsafe {
+            assert_eq!(
+                airferry_receiver_assemble(handle, std::ptr::null_mut(), &mut out_len),
+                0
+            );
+            assert_eq!(out_len, usize::MAX);
+            assert_eq!(
+                airferry_receiver_assemble(handle, &mut out_buf, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(out_buf, 1usize as *mut u8);
+            airferry_receiver_destroy(handle);
+        }
     }
 }

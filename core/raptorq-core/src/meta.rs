@@ -6,6 +6,16 @@ use raptorq::ObjectTransmissionInformation;
 pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
 /// RFC 6330 ceiling on the number of source blocks (Z_max).
 pub const MAX_SOURCE_BLOCKS: usize = 256;
+/// Local receiver budget. RFC maxima describe the wire format, not what a
+/// phone or browser process can safely hold while RaptorQ state, decompressed
+/// output, an FFI copy and persistence buffers overlap. 32 MiB is deliberately
+/// conservative: a QR transfer of this size is already very long, while the
+/// previous 256 MiB allowance could exhaust a normal Android heap on a fully
+/// valid transfer.
+pub const MAX_OBJECT_BYTES: u64 = 32 * 1024 * 1024;
+/// Bound the eager `Vec<Option<Symbol>>` allocations made by the upstream
+/// decoder independently from the encoded byte length.
+pub const MAX_TOTAL_SOURCE_SYMBOLS: u64 = 524_288;
 
 /// Metadata describing how an object was split into RaptorQ source blocks.
 ///
@@ -59,7 +69,7 @@ impl ObjectMeta {
                 // K = number of source symbols the encoder was built with.
                 // The underlying field is private; derive K from source_packets().
                 let k = enc.source_packets().len() as u32;
-                let block_length = u64::from(k) * u64::from(config.symbol_size);
+                let block_length = u64::from(k) * u64::from(config.symbol_size());
                 SourceBlockMeta {
                     sbn: i as u32,
                     num_source_symbols: k,
@@ -70,7 +80,7 @@ impl ObjectMeta {
 
         ObjectMeta {
             transfer_length: data_len,
-            symbol_size: config.symbol_size,
+            symbol_size: config.symbol_size(),
             oti_bytes: oti.serialize(),
             blocks: block_metas,
         }
@@ -95,7 +105,7 @@ impl ObjectMeta {
     ///
     /// Returns `Ok(())` for valid metadata, or `Err(reason)` to reject.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.symbol_size == 0 || self.symbol_size > u16::MAX as u32 {
+        if Config::new(self.symbol_size).is_err() {
             return Err("symbol_size out of range");
         }
         // The decoder divides block_length by — and slices payloads using — the
@@ -105,25 +115,70 @@ impl ObjectMeta {
         if oti.symbol_size() == 0 || oti.symbol_size() as u32 != self.symbol_size {
             return Err("OTI symbol_size invalid or mismatched");
         }
-        if self.blocks.is_empty() || self.blocks.len() > MAX_SOURCE_BLOCKS {
+        if oti.transfer_length() != self.transfer_length {
+            return Err("OTI transfer_length mismatched");
+        }
+        if oti.sub_blocks() == 0 || oti.symbol_alignment() == 0 {
+            return Err("OTI sub-block/alignment must be non-zero");
+        }
+        if oti.symbol_size() % u16::from(oti.symbol_alignment()) != 0 {
+            return Err("OTI symbol_size is not alignment-divisible");
+        }
+        let aligned_units = oti.symbol_size() / u16::from(oti.symbol_alignment());
+        if oti.sub_blocks() > aligned_units {
+            return Err("OTI sub-block count exceeds aligned symbol units");
+        }
+        if self.oti_bytes[5] != 0 {
+            return Err("OTI reserved byte must be zero");
+        }
+        if self.transfer_length == 0 || self.transfer_length > MAX_OBJECT_BYTES {
+            return Err("transfer_length exceeds local receiver budget");
+        }
+        if self.blocks.is_empty()
+            || self.blocks.len() > MAX_SOURCE_BLOCKS
+            || self.blocks.len() > u8::MAX as usize
+        {
             return Err("source block count out of range");
         }
+        if usize::from(oti.source_blocks()) != self.blocks.len() {
+            return Err("OTI source block count mismatched");
+        }
         let mut total_block_len: u64 = 0;
-        for b in &self.blocks {
-            // block_progress indexes meta.blocks[sbn]; keep sbn in range.
-            if b.sbn as usize >= self.blocks.len() {
-                return Err("block sbn out of range");
+        let mut total_k: u64 = 0;
+        for (index, b) in self.blocks.iter().enumerate() {
+            if b.sbn != index as u32 {
+                return Err("block sbn must equal its canonical index");
             }
             if b.num_source_symbols == 0 || b.num_source_symbols > MAX_SOURCE_SYMBOLS_PER_BLOCK {
                 return Err("block K out of range");
             }
             // Invariant (see SourceBlockMeta): block_length == K * symbol_size.
             // This also bounds the decoder's `vec![None; K]` allocation.
-            let expect = b.num_source_symbols as u64 * self.symbol_size as u64;
+            let expect = u64::from(b.num_source_symbols)
+                .checked_mul(u64::from(self.symbol_size))
+                .ok_or("block_length overflow")?;
             if b.block_length != expect {
                 return Err("block_length inconsistent with K*symbol_size");
             }
-            total_block_len = total_block_len.saturating_add(b.block_length);
+            total_block_len = total_block_len
+                .checked_add(b.block_length)
+                .ok_or("total block length overflow")?;
+            total_k = total_k
+                .checked_add(u64::from(b.num_source_symbols))
+                .ok_or("total source symbol count overflow")?;
+        }
+        if total_k > MAX_TOTAL_SOURCE_SYMBOLS {
+            return Err("total source symbol count exceeds local receiver budget");
+        }
+        let padding_budget = u64::from(self.symbol_size)
+            .checked_mul(self.blocks.len() as u64)
+            .ok_or("padding budget overflow")?;
+        if total_block_len
+            > MAX_OBJECT_BYTES
+                .checked_add(padding_budget)
+                .ok_or("decoder byte budget overflow")?
+        {
+            return Err("decoder bytes exceed local receiver budget");
         }
         // assemble() reserves `transfer_length` bytes; it can never legitimately
         // exceed the bytes the blocks actually carry.
@@ -141,7 +196,10 @@ mod tests {
 
     fn real_meta() -> ObjectMeta {
         let data: Vec<u8> = (0..40_000).map(|i| (i & 0xff) as u8).collect();
-        Encoder::new(&data, Config::default()).unwrap().meta().clone()
+        Encoder::new(&data, Config::default())
+            .unwrap()
+            .meta()
+            .clone()
     }
 
     /// The legitimate encoder's metadata MUST pass validation — guards against
@@ -149,11 +207,15 @@ mod tests {
     /// confirms the OTI symbol_size == meta.symbol_size assumption the gate uses.
     #[test]
     fn real_meta_passes_validation() {
-        real_meta().validate().expect("legitimate meta must validate");
+        real_meta()
+            .validate()
+            .expect("legitimate meta must validate");
         // 512-byte symbols (the browser default) must validate too.
         let data: Vec<u8> = (0..40_000).map(|i| (i & 0xff) as u8).collect();
         let enc = Encoder::new(&data, Config::new(512).unwrap()).unwrap();
-        enc.meta().validate().expect("512-byte-symbol meta must validate");
+        enc.meta()
+            .validate()
+            .expect("512-byte-symbol meta must validate");
     }
 
     #[test]
@@ -190,6 +252,25 @@ mod tests {
     fn rejects_empty_blocks() {
         let mut m = real_meta();
         m.blocks.clear();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_oti_zero_alignment_and_sub_blocks() {
+        let mut m = real_meta();
+        m.oti_bytes[11] = 0;
+        assert!(m.validate().is_err());
+
+        let mut m = real_meta();
+        m.oti_bytes[9] = 0;
+        m.oti_bytes[10] = 0;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_noncanonical_sbn() {
+        let mut m = real_meta();
+        m.blocks[0].sbn = 1;
         assert!(m.validate().is_err());
     }
 }

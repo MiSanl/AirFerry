@@ -7,14 +7,14 @@ set -euo pipefail
 #   ./scripts/build-all.sh              # 构建全部（发送端 + 扫码端）
 #   ./scripts/build-all.sh sender       # 仅构建浏览器发送端
 #   ./scripts/build-all.sh scanner      # 仅构建 Android 扫码端
-#   ./scripts/build-all.sh windows      # 仅构建 Windows 端（须在 Windows + .NET 8 SDK 下）
+#   ./scripts/build-all.sh windows      # 仅构建 Windows 端（须 Windows + .NET 8 SDK + CMake/VS C++）
 #   ./scripts/build-all.sh wasm         # 仅构建 Rust WASM
 #   ./scripts/build-all.sh dist         # 仅打包：把已构建的产物复制/签名到 dist/
 #   ./scripts/build-all.sh release      # 构建 + 打包到 dist/（发送 crx/xpi/zip + APK）
 #
 # 产物（dist/，均 git-ignored，通过 GitHub Release 分发）:
 #   airferry-android-v<VER>.apk                 接收端 APK
-#   airferry-windows-x64-v<VER>.zip             Windows 端（WPF + Rust DLL + OpenCV）
+#   airferry-windows-x64-v<VER>.zip             Windows 端（WPF + Rust/ZXing-C++ DLL + OpenCV）
 #   airferry-sender-chrome-mv3-v<VER>.crx       Chrome/Edge MV3（已签名 Cr24）
 #   airferry-sender-chrome-mv3-v<VER>.zip       Chrome/Edge MV3（解压加载回退）
 #   airferry-sender-chrome-mv2-v<VER>.crx       Chrome/Edge MV2（已签名 Cr24）
@@ -47,6 +47,49 @@ VER="$(read_version)"
 # Chrome 二进制路径（macOS 标准安装位置）。找不到时跳过 crx 签名，仅留 zip。
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
+verify_apk_signature() {
+  local apk="$1"
+  local apksigner_bin=""
+  if command -v apksigner >/dev/null 2>&1; then
+    apksigner_bin="$(command -v apksigner)"
+  else
+    local sdk_root=""
+    local sdk_candidates=(
+      "${ANDROID_HOME:-}"
+      "${ANDROID_SDK_ROOT:-}"
+      "$HOME/Android/Sdk"
+      "$HOME/Library/Android/sdk"
+    )
+    local candidate
+    for candidate in "${sdk_candidates[@]}"; do
+      if [[ -n "$candidate" && -d "$candidate/build-tools" ]]; then
+        sdk_root="$candidate"
+        break
+      fi
+    done
+    if [[ -n "$sdk_root" ]]; then
+      # Lexicographic ordering is portable across BSD/GNU sort and is
+      # sufficient for Android build-tools' fixed-width modern versions.
+      apksigner_bin="$(find "$sdk_root/build-tools" -type f -name apksigner 2>/dev/null | sort | tail -1 || true)"
+    fi
+  fi
+  [[ -n "$apksigner_bin" ]] || error "找不到 apksigner，拒绝发布未验证签名的 APK"
+  local cert_info
+  cert_info="$("$apksigner_bin" verify --verbose --print-certs "$apk")" || \
+    error "APK 签名验证失败: $apk"
+  if grep -qiE 'CN=Android Debug|Android Debug' <<<"$cert_info"; then
+    error "检测到 Android debug 签名，拒绝发布: $apk"
+  fi
+  local actual_sha
+  actual_sha="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<<"$cert_info" | head -1 | tr '[:lower:]' '[:upper:]')"
+  [[ -n "$actual_sha" ]] || error "无法读取 APK 签名证书指纹"
+  if [[ -n "${AIRFERRY_ANDROID_CERT_SHA256:-}" ]] && \
+     [[ "$actual_sha" != "${AIRFERRY_ANDROID_CERT_SHA256^^}" ]]; then
+    error "APK 签名证书与 AIRFERRY_ANDROID_CERT_SHA256 不一致"
+  fi
+  info "APK 签名已验证 (SHA-256: $actual_sha)"
+}
+
 build_wasm() {
   info "编译 Rust WASM 双产物 (legacy=0.2.92/标量 → wasm-pkg-legacy/, simd=0.2.125+SIMD → wasm-pkg-simd/) ..."
   cd "$ROOT/apps/sender"
@@ -66,6 +109,8 @@ build_sender() {
 
 build_scanner() {
   info "构建 Android 扫码端 ..."
+  [[ ! -f "$ROOT/apps/scanner/keystore.properties" ]] || chmod 600 "$ROOT/apps/scanner/keystore.properties"
+  [[ ! -f "$ROOT/dist/airferry-release.keystore" ]] || chmod 600 "$ROOT/dist/airferry-release.keystore"
 
   # 设置 Android SDK / NDK 环境变量（cargo-ndk 需要 ANDROID_NDK_HOME）。
   # 优先使用用户已设的值，否则按常见路径自动探测。
@@ -104,11 +149,17 @@ build_scanner() {
 
   cd "$ROOT/apps/scanner"
   ./gradlew assembleRelease 2>&1 | tail -3 | while read -r line; do info "$line"; done
+  verify_apk_signature "$ROOT/apps/scanner/app/build/outputs/apk/release/app-release.apk"
   info "扫码端构建完成 → apps/scanner/app/build/outputs/apk/release/app-release.apk"
 }
 
 build_windows() {
-  info "构建 Windows 端 (WPF + Rust DLL) ..."
+  info "构建 Windows 端 (WPF + Rust DLL + ZXing-C++ DLL) ..."
+
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) error "Windows 端只能在 Windows 主机上构建；请运行 scripts/build-windows.ps1" ;;
+  esac
 
   # 先编译 Rust C ABI 库 (transfer_engine.dll) 到 C# runtime/。
   # 这一步必须在 dotnet build 之前：csproj 把 runtime/transfer_engine.dll
@@ -119,21 +170,25 @@ build_windows() {
 
   local runtime_dir="$ROOT/apps/windows/AirFerry.Windows/runtime"
   mkdir -p "$runtime_dir"
-  local dll_src
-  # Linux/macOS 产物是 libtransfer_engine.{so,dylib}，Windows 是 transfer_engine.dll。
-  # 仅在 Windows 上构建时产物才会是 .dll（这里构建主机须为 Windows）。
-  dll_src="$ROOT/target/release/transfer_engine.dll"
-  if [[ ! -f "$dll_src" ]]; then
-    # 回退：当前主机非 Windows，Rust 产物可能是 .so/.dylib。在非 Windows 上
-    # 这步会失败——Windows 端只能在 Windows 主机上完整构建。
-    dll_src="$(ls "$ROOT/target/release/"libtransfer_engine.{dll,so,dylib} 2>/dev/null | head -1 || true)"
-    if [[ -z "$dll_src" ]]; then
-      error "未找到 transfer_engine 产物。Windows 端必须在 Windows 主机上用 PowerShell 脚本构建: ./scripts/build-windows.ps1"
-    fi
-    warn "当前主机非 Windows，Rust 产物为 $(basename "$dll_src")（仅供 Rust 层冒烟测试，C# 端无法在非 Windows 上构建 WPF）"
-  fi
+  local dll_src="$ROOT/target/release/transfer_engine.dll"
+  [[ -f "$dll_src" ]] || error "未找到真实的 Windows DLL: $dll_src"
   cp "$dll_src" "$runtime_dir/transfer_engine.dll"
   info "Rust DLL → apps/windows/AirFerry.Windows/runtime/transfer_engine.dll"
+
+  # 与 Android 共用同一个 ZXing-C++ 解码核心；Windows C ABI 包装器产出
+  # airferry_zxing.dll。首次配置会按固定 commit 获取 zxing-cpp 源码。
+  command -v cmake >/dev/null 2>&1 || error "未找到 CMake 3.22+"
+  local native_src="$ROOT/apps/windows/native"
+  local native_build="$native_src/build"
+  cmake -S "$native_src" -B "$native_build" \
+    -G "Visual Studio 17 2022" -A x64 >/dev/null
+  cmake --build "$native_build" --config Release --parallel 2>&1 | tail -5
+  ctest --test-dir "$native_build" -C Release --output-on-failure
+  local zxing_dll
+  zxing_dll="$(find "$native_build" -type f -name airferry_zxing.dll | head -1 || true)"
+  [[ -n "$zxing_dll" ]] || error "未找到 airferry_zxing.dll"
+  cp "$zxing_dll" "$runtime_dir/airferry_zxing.dll"
+  info "ZXing-C++ DLL → apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll"
 
   # 构建 C# WPF（须 Windows + .NET 8 SDK）。在非 Windows 上 dotnet build
   # 会因 net8.0-windows TFM 失败——首选 scripts/build-windows.ps1。
@@ -146,10 +201,10 @@ build_windows() {
 
 build_web() {
   info "构建网页端 (apps/web → dist/) ..."
-  # npm run build 已内嵌 prebuild（prepare-wasm.cjs）：校验 apps/sender/wasm-pkg/
-  # 存在 + 拷贝 wasm-zstd.wasm 到 public/。web 不单独编译 Rust，复用 sender 的
-  # wasm-pkg（首次构建前须 cd apps/sender && npm run wasm）。wasm-pkg 缺失时
-  # prepare-wasm.cjs 非零退出，npm run build 失败，set -e 中断。
+  # npm run build 已内嵌 prebuild（prepare-wasm.cjs）：校验 sender 的现代
+  # wasm-pkg-simd，持锁复制到 web 自有 wasm-pkg/，再拷 wasm-zstd.wasm 到
+  # public/。首次构建前须 cd apps/sender && npm run wasm；产物缺失时脚本
+  # 非零退出，npm run build 失败，set -e 中断。
   cd "$ROOT/apps/web"
   npm run build 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done
   info "网页端构建完成 → apps/web/dist/"
@@ -184,6 +239,7 @@ pack_chrome_crx() {
       return 0
     }
     mv "$ROOT/apps/sender/build/${prod_dir}.pem" "$key" 2>/dev/null || true
+    [[ ! -f "$key" ]] || chmod 600 "$key"
     info "已生成 Chrome 签名私钥 → dist/airferry-extension.pem（请妥善保管）"
   fi
 
@@ -211,16 +267,20 @@ pack_dist() {
   # 扫码端 APK
   local apk_src="$ROOT/apps/scanner/app/build/outputs/apk/release/app-release.apk"
   [[ -f "$apk_src" ]] || error "找不到 APK：${apk_src}（先运行 build-all.sh scanner）"
+  verify_apk_signature "$apk_src"
   cp "$apk_src" "$ROOT/dist/airferry-android-v${VER}.apk"
   info "APK → dist/airferry-android-v${VER}.apk"
 
   # Windows 端 zip（仅当已构建时打包——Windows 端须在 Windows 上构建）
-  local win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/publish"
+  local win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/publish"
+  if [[ ! -d "$win_publish" ]]; then
+    win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/publish"
+  fi
   if [[ -d "$win_publish" ]]; then
     ( cd "$win_publish" && zip -r -q -X "$ROOT/dist/airferry-windows-x64-v${VER}.zip" . )
     info "Windows 端 → dist/airferry-windows-x64-v${VER}.zip"
   else
-    warn "未找到 Windows 端构建产物（${win_publish}）。如需打包 Windows 端，先在 Windows 上运行: ./scripts/build-windows.ps1 release"
+    warn "未找到 Windows 端 publish 产物。如需打包 Windows 端，请在 Windows 上运行: ./scripts/build-windows.ps1 -Pack"
   fi
 
   # 网页端 zip（纯静态站点，解压即可托管到任意静态服务器）。与 Windows 同样用
@@ -266,6 +326,7 @@ build_release() {
 case "$TARGET" in
   all)
     build_sender
+    build_web
     build_scanner
     ;;
   sender)
@@ -291,7 +352,7 @@ case "$TARGET" in
     ;;
   *)
     echo "用法: $0 [all|sender|scanner|windows|web|wasm|dist|release]"
-    echo "  windows 子命令须在 Windows + .NET 8 SDK 下运行（或用 scripts/build-windows.ps1）"
+    echo "  windows 子命令须在 Windows + .NET 8 SDK + CMake/VS C++ 下运行（或用 scripts/build-windows.ps1）"
     exit 1
     ;;
 esac

@@ -68,4 +68,11 @@ public class TextParserTests
         Assert.Null(TextParser.Parse("ETBUNDL1"u8.ToArray()));
         Assert.Null(TextParser.Parse(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }));
     }
+
+    [Fact]
+    public void Parse_Rejects_InvalidUtf8()
+    {
+        byte[] buf = "ETTEXTv1"u8.ToArray().Concat(new byte[] { 0x80 }).ToArray();
+        Assert.Null(TextParser.Parse(buf));
+    }
 }

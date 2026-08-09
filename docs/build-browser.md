@@ -19,13 +19,15 @@ npm run wasm
 | 产物目录 | wasm-bindgen 版本 | 特性 | 供哪个目标 |
 |---------|------------------|------|-----------|
 | `wasm-pkg-legacy/` | `=0.2.92`（默认锁定） | 标量、无 externref（Chrome 87+ 可加载） | MV2（`chrome-mv2` / `firefox-mv2`） |
-| `wasm-pkg-simd/` | `=0.2.125`（脚本临时升级） | `+simd128` SIMD + externref（Chrome 96+ / FF 116+） | MV3（`chrome-mv3` / `firefox-mv3`） |
+| `wasm-pkg-simd/` | `=0.2.125`（隔离副本升级） | `+simd128` SIMD + externref（Chrome 96+ / FF 116+） | MV3（`chrome-mv3` / `firefox-mv3`） |
 
-> **Cargo 文件还原**：构建 MV3 时脚本临时改写 `core/transfer-engine/Cargo.toml` 的 wasm-bindgen 版本到 0.2.125，并重算 workspace lockfile。脚本启动时已按字节快照 Cargo.toml/Cargo.lock，构建完在 `finally` 中逐字节恢复；不调用 `git checkout`，因此不会丢失运行前已有的未提交修改。详见 `apps/sender/scripts/build-wasm.cjs`。
+> **工作树隔离**：脚本把 workspace 复制到临时目录，只在副本中升级 wasm-bindgen 并重算 lockfile；源码 `Cargo.toml` / `Cargo.lock` 从不写入。`.wasm-build.lock` 还会阻止并发构建互相覆盖发布目录。详见 `apps/sender/scripts/build-wasm.cjs`。
 
 > **关于 SIMD 提速的实测结论**：`+simd128` 对当前纯标量的 `raptorq` crate **无性能收益**（实测 0.95×，反而因 wasm 变大略慢）；QR 编码现用 `fast_qr` crate（已替代旧 `qrcode`，Reed-Solomon 路径 ~7-9× 提速），同样无 wasm32 SIMD intrinsics。双产物机制的真实价值是「MV2 兼容老 Chrome（无 externref）+ MV3 用新工具链」的兼容性分离，并为未来引入 SIMD 化的库保留构建基础设施。详见 `AGENTS.md` §5 第6条。
 
 > `npm run build` 已内嵌此步骤，通常无需单独跑 `npm run wasm`。
+
+> **Plasmo/Parcel dev-server 安全补丁**：Plasmo 0.90.5 固定 Parcel 2.9.3；单独升级 Parcel 会破坏其私有 core adapter。`postinstall` 因此运行 `patch-parcel-dev-server.cjs`，把有风险的通配 CORS 回移为仅允许 `chrome-extension://` / `moz-extension://` 来源。`npm audit` 只按上游版本元数据判断，仍会列出该已回移修复的 4 条 moderate 链式记录；生产依赖审计为 0。升级 Plasmo/Parcel 时脚本会因版本不匹配硬失败，要求人工复核并删除补丁。
 
 ## 构建扩展
 
@@ -40,9 +42,9 @@ npm run build
 
 | 目标目录 | 支持浏览器 |
 |---------|-----------|
-| `chrome-mv3-prod` | Chrome / Edge（MV3，Chrome 88+ / Edge 88+） |
+| `chrome-mv3-prod` | Chrome / Edge（MV3，Chrome 96+ / Edge 96+） |
 | `chrome-mv2-prod` | Chrome / Edge（MV2 遗留，旧版浏览器） |
-| `firefox-mv3-prod` | Firefox（MV3，Firefox 109+） |
+| `firefox-mv3-prod` | Firefox（MV3，Firefox 116+） |
 | `firefox-mv2-prod` | Firefox（MV2 遗留，Firefox 91+） |
 
 ### 单独构建某个目标
@@ -54,7 +56,7 @@ npm run build:firefox-mv3   # Firefox MV3
 npm run build:firefox-mv2   # Firefox MV2
 ```
 
-每个目标的 build 脚本（见 `package.json`）链式完成：`extract-lzma-wasm` → `plasmo build --target=…` → `fix-manifest.cjs` → 复制 `wasm-zstd.wasm` 进产物目录。
+单目标脚本不重新编译 WASM；先运行一次 `npm run wasm`。随后脚本会明确选择对应的 `wasm-pkg-simd`（MV3）或 `wasm-pkg-legacy`（MV2），再执行 Plasmo、manifest 修正和 zstd 资源复制，不会复用上一次目标遗留的错误变体。WASM 构建、扩展目标切换和 web 快照复制共用 `.wasm-build.lock`；锁覆盖完整 Plasmo 构建窗口，防止并发任务切换正在读取的 glue/WASM。
 
 ### 构建后处理
 
@@ -65,6 +67,7 @@ npm run build:firefox-mv2   # Firefox MV2
 - MV3：补全 `action.default_title`
 - MV2：CSP 改为 `wasm-eval`（MV3 的 `wasm-unsafe-eval` 在 MV2 中不支持）
 - Firefox：添加 `browser_specific_settings.gecko.id`（`airferry@airferry.app`）
+- MV3：Chrome/Edge 写入最低版本 96；Firefox 写入最低版本 116（现代 wasm-bindgen 的 externref 下限）
 - 修补 HTML `<title>` 标签为「AirFerry · 无网文件传输」
 
 ## 打包发布产物
@@ -134,7 +137,7 @@ Plasmo 启动 HMR 开发服务器，自动重载扩展。
 ### 使用
 
 1. 点击工具栏 AirFerry 图标 → **直接在新标签页打开完整应用**（无 popup；`background` 监听 `onClicked`）
-2. **添加文件**（拖拽/点选/文件夹，追加到列表）和/或 **添加文字**（弹窗命名为 `.txt`）
+2. **添加文件**（文件或文件夹可拖到网页任意位置，也可点选；追加到列表）和/或 **添加文字**（弹窗命名为 `.txt`）
 3. 点 **「发送」** 才压缩并进入参数页 → 选速度预设 / 调参数 → 播放二维码视频流  
    - 恰好 1 条文字、0 文件 → `ETTEXTv1`  
    - ≥2 项（文件和/或文字）→ `ETBUNDL1` 打包
@@ -151,6 +154,7 @@ apps/sender/
 │   ├── build-wasm.cjs          # 双 wasm 产物（legacy + simd）
 │   ├── fix-manifest.cjs        # MV2/Firefox manifest + 图标修正 + 删 default_popup
 │   ├── prepare-plasmo-icon.cjs # clean build 用 icon.png
+│   ├── patch-parcel-dev-server.cjs # 2.9.3 dev-server 限制 CORS 的安全回移
 │   └── extract-lzma-wasm.cjs   # lzma-wasm base64 → .wasm 提取
 ├── src/
 │   ├── background/index.ts     # 图标 onClicked → 打开 options
@@ -162,7 +166,7 @@ apps/sender/
 │   │   ├── PlayPage.tsx
 │   │   └── StatsPage.tsx
 │   ├── components/
-│   │   ├── QrStream.tsx        # QR 视频流（next_qr_*_into + putImageData）
+│   │   ├── QrStream.tsx        # QR 视频流（scratch view + putImageData）
 │   │   └── CompressProgress.tsx# 压缩阶段进度遮罩
 │   ├── workers/
 │   │   └── compress.worker.ts  # processFiles / processText

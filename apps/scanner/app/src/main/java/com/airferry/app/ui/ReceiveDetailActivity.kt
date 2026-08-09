@@ -6,7 +6,6 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -25,7 +24,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
+import com.airferry.app.scan.CreateNamedDocument
+import com.airferry.app.scan.FileTransfer
 import java.io.File
 
 private val BgDark = Color(0xFF0F172A)
@@ -48,7 +48,7 @@ class ReceiveDetailActivity : ComponentActivity() {
     private var crcUnknown: Boolean = true
 
     private val createDocument = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("application/octet-stream")
+        CreateNamedDocument()
     ) { uri: Uri? ->
         if (uri != null) saveToUri(uri)
     }
@@ -224,14 +224,14 @@ class ReceiveDetailActivity : ComponentActivity() {
                 Toast.makeText(this, "没有可分享的文件", Toast.LENGTH_SHORT).show()
                 return
             }
-            // Share the canonical store blob directly (no cache/share copy).
-            val authority = "${packageName}.fileprovider"
-            val uri = FileProvider.getUriForFile(this, authority, src)
+            // Share the canonical blob without copying, but expose the logical
+            // filename: the physical ContentStore path is only a SHA-256 digest.
+            val uri = FileTransfer.shareUri(this, src, fileName)
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "application/octet-stream"
+                type = FileTransfer.mimeType(fileName)
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_TITLE, fileName)
-                putExtra(Intent.EXTRA_TEXT, fileName)
+                putExtra(Intent.EXTRA_TITLE, FileTransfer.displayName(fileName))
+                putExtra(Intent.EXTRA_TEXT, FileTransfer.displayName(fileName))
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(shareIntent, "分享文件"))

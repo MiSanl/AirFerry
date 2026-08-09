@@ -4,8 +4,9 @@
 
 .DESCRIPTION
   对标 scripts/build-all.sh 的 scanner 子命令，但面向 Windows + .NET 8 SDK。
-  流程：① 编译 Rust C ABI (transfer_engine.dll, --features cffi) → 拷 runtime/
-       ② dotnet restore + publish → 打包 zip 到 dist/。
+  流程：① 编译 Rust C ABI (transfer_engine.dll, --features cffi)
+       ② 编译共享 ZXing-C++ 解码器 (airferry_zxing.dll)
+       ③ dotnet restore + publish → 打包 zip 到 dist/。
 
   这是 Windows 端的权威构建路径；build-all.sh 的 windows 子命令是 Git
   Bash/WSL 下的回退入口，逻辑等价。
@@ -56,7 +57,27 @@ New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 Copy-Item $DllSrc "$RuntimeDir/transfer_engine.dll" -Force
 Info "Rust DLL -> apps/windows/AirFerry.Windows/runtime/transfer_engine.dll"
 
-# ── ② C# WPF 构建 ───────────────────────────────────────────────────────
+# ── ② shared ZXing-C++ DLL ──────────────────────────────────────────────
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    Fail "未找到 CMake；Windows 原生二维码解码器需要 CMake 3.22+"
+}
+$NativeSource = "$Root/apps/windows/native"
+$NativeBuild = "$NativeSource/build"
+Info "编译共享 ZXing-C++ 解码器 (airferry_zxing.dll) ..."
+cmake -S $NativeSource -B $NativeBuild -G "Visual Studio 17 2022" -A x64
+if ($LASTEXITCODE -ne 0) { Fail "ZXing-C++ CMake 配置失败" }
+cmake --build $NativeBuild --config Release --parallel
+if ($LASTEXITCODE -ne 0) { Fail "ZXing-C++ 编译失败" }
+ctest --test-dir $NativeBuild -C Release --output-on-failure
+if ($LASTEXITCODE -ne 0) { Fail "ZXing-C++ 单元测试失败" }
+$ZxingDll = Get-ChildItem -Path $NativeBuild -Recurse -File -Filter "airferry_zxing.dll" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+if ($null -eq $ZxingDll) { Fail "未找到 airferry_zxing.dll" }
+Copy-Item $ZxingDll.FullName "$RuntimeDir/airferry_zxing.dll" -Force
+Info "ZXing-C++ DLL -> apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll"
+
+# ── ③ C# WPF 构建 ───────────────────────────────────────────────────────
 Info "还原 NuGet 包 ..."
 Push-Location "$Root/apps/windows"
 dotnet restore
@@ -64,13 +85,19 @@ if ($LASTEXITCODE -ne 0) { Fail "dotnet restore 失败" }
 
 if ($Pack) {
     Info "发布 (self-contained=false, single-file) ..."
+    $PublishDir = "$Root/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/publish"
     dotnet publish AirFerry.Windows/AirFerry.Windows.csproj `
         -c Release -r win-x64 `
-        -p:PublishSingleFile=true --self-contained false
+        -p:PublishSingleFile=true --self-contained false `
+        -o $PublishDir
     if ($LASTEXITCODE -ne 0) { Fail "dotnet publish 失败" }
 
-    $PublishDir = "$Root/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/publish"
     if (-not (Test-Path $PublishDir)) { Fail "未找到发布产物: $PublishDir" }
+    foreach ($RequiredDll in @("transfer_engine.dll", "airferry_zxing.dll")) {
+        if (-not (Test-Path "$PublishDir/$RequiredDll")) {
+            Fail "发布目录缺少 native 依赖: $RequiredDll"
+        }
+    }
 
     $DistDir = "$Root/dist"
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null

@@ -23,8 +23,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCrea
     _total_symbols: jint,
     _symbol_size: jint,
 ) -> jlong {
-    let sid: SessionIdRaw =
-        ((session_id_hi as u64 as u128) << 64) | (session_id_lo as u64 as u128);
+    let sid: SessionIdRaw = ((session_id_hi as u64 as u128) << 64) | (session_id_lo as u64 as u128);
     // Cache-only bootstrap: do NOT build a decoder from these caller-supplied
     // totals (a guessed early layout, and `derive_meta_from_totals`'s OTI build
     // can itself assert on large values). Data frames are buffered until the
@@ -66,7 +65,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverDest
 /// as an error sentinel (a real transfer never reaches that).
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverIngest(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     frame_bytes: JByteArray,
@@ -82,7 +81,11 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
     let frame = match qr_protocol::Frame::from_bytes(&frame_vec) {
         Ok(f) => f,
         Err(e) => {
-            android_log(&format!("frame rejected (len={}): {:?}", frame_vec.len(), e));
+            android_log(&format!(
+                "frame rejected (len={}): {:?}",
+                frame_vec.len(),
+                e
+            ));
             return INGEST_ERROR;
         }
     };
@@ -103,8 +106,13 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
     if p.frames_seen <= 3 || is_descriptor || (p.frames_seen % 50 == 0 && !session.is_complete()) {
         android_log(&format!(
             "f={} desc={} meta={} recv={} dec={} {}/{} mismatch={}",
-            p.frames_seen, is_descriptor, p.meta_confirmed,
-            p.received_symbols, p.decoded_blocks, p.decoded_symbols, p.total_symbols,
+            p.frames_seen,
+            is_descriptor,
+            p.meta_confirmed,
+            p.received_symbols,
+            p.decoded_blocks,
+            p.decoded_symbols,
+            p.total_symbols,
             p.session_mismatch_streak
         ));
     }
@@ -112,7 +120,11 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
     // A frame "contributed" if received_symbols advanced, OR it was a descriptor
     // that confirmed meta (so re-init state on the Kotlin side updates even when
     // no new symbol arrived on that descriptor tick).
-    let accepted = if p.received_symbols > prev_received { 1 } else { 0 };
+    let accepted = if p.received_symbols > prev_received {
+        1
+    } else {
+        0
+    };
     pack_ingest_status(
         complete == 1,
         accepted == 1,
@@ -179,8 +191,7 @@ fn fill_array(env: &mut JNIEnv, buf: &[u8]) -> jni::sys::jbyteArray {
     };
     // SAFETY: u8 and i8 have the same layout; the slice is a valid
     // reinterpretation for the JNI SetByteArrayRegion call.
-    let i8_buf: &[i8] =
-        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len()) };
+    let i8_buf: &[i8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len()) };
     if env.set_byte_array_region(&arr, 0, i8_buf).is_ok() {
         arr.into_raw()
     } else {

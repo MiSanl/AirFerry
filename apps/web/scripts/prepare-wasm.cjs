@@ -3,11 +3,10 @@
  *
  * Two things must be in place:
  *
- *  1. `apps/sender/wasm-pkg/` — the Rust `transfer_engine` WASM produced by
- *     `wasm-pack`. The web app imports it (via loader.ts's relative path
- *     `../../wasm-pkg/transfer_engine.js`), so it MUST exist. It is a build
- *     artifact of the sender project (run `npm run wasm` there). We only check
- *     here — we never rebuild Rust from this project.
+ *  1. `apps/sender/wasm-pkg-simd/` — the modern Rust WASM produced by
+ *     `wasm-pack`. We validate both glue and binary, then atomically copy it
+ *     into web's private `wasm-pkg/` import path. This prevents extension builds
+ *     from switching the package while Vite is reading it.
  *
  *  2. `public/wasm-zstd.wasm` — the zstd compressor WASM, fetched at runtime by
  *     the compress worker's fallback path (`new URL("wasm-zstd.wasm",
@@ -19,22 +18,37 @@
  */
 const fs = require("fs")
 const path = require("path")
+const { acquireWasmLock } = require("../../sender/scripts/wasm-lock.cjs")
 
 const webRoot = path.resolve(__dirname, "..")
 const senderRoot = path.resolve(webRoot, "..", "sender")
-const wasmPkgDir = path.join(senderRoot, "wasm-pkg")
-const wasmPkgGlue = path.join(wasmPkgDir, "transfer_engine.js")
+const wasmPkgDir = path.join(webRoot, "wasm-pkg")
+const modernPkgDir = path.join(senderRoot, "wasm-pkg-simd")
+const wasmPkgGlue = path.join(modernPkgDir, "transfer_engine.js")
+const wasmPkgBinary = path.join(modernPkgDir, "transfer_engine_bg.wasm")
 
-// (1) Verify the sender's wasm-pkg exists.
-if (!fs.existsSync(wasmPkgGlue)) {
-  console.error(
-    "\n✖ apps/sender/wasm-pkg/transfer_engine.js not found.\n" +
-      "  The web app reuses the sender's Rust WASM. Build it first:\n" +
-      "    cd apps/sender && npm install && npm run wasm\n" +
-      "  (this runs wasm-pack for the transfer-engine crate)\n"
-  )
-  process.exit(1)
+// Web owns its selected package directory. Copy it while holding the sender's
+// WASM lock, then release: extension MV2/MV3 builds may freely switch their own
+// shared package without changing files Vite is currently bundling.
+const releaseLock = acquireWasmLock(senderRoot)
+try {
+  // Verify only after acquiring the publisher lock; otherwise we could inspect
+  // the tiny remove/rename window of an in-progress publish and fail spuriously.
+  if (!fs.existsSync(wasmPkgGlue) || !fs.existsSync(wasmPkgBinary)) {
+    throw new Error(
+      "apps/sender/wasm-pkg-simd/ is incomplete. Build it first with: " +
+        "cd apps/sender && npm install && npm run wasm"
+    )
+  }
+  const stagedPkg = path.join(webRoot, `.wasm-pkg.web-staged-${process.pid}`)
+  fs.rmSync(stagedPkg, { recursive: true, force: true })
+  fs.cpSync(modernPkgDir, stagedPkg, { recursive: true })
+  fs.rmSync(wasmPkgDir, { recursive: true, force: true })
+  fs.renameSync(stagedPkg, wasmPkgDir)
+} finally {
+  releaseLock()
 }
+console.log("[prepare-wasm] copied wasm-pkg-simd into web-owned wasm-pkg")
 
 // (2) Copy wasm-zstd.wasm into public/ for the worker's runtime fetch.
 const zstdSrc = path.join(webRoot, "node_modules", "@foxglove", "wasm-zstd", "dist", "wasm-zstd.wasm")

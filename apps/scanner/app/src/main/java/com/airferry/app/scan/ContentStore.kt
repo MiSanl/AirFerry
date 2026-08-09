@@ -1,6 +1,7 @@
 package com.airferry.app.scan
 
 import android.content.Context
+import android.util.AtomicFile
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -55,6 +56,9 @@ object ContentStore {
 
     fun blobPath(ctx: Context, hash: String): File {
         val h = hash.lowercase()
+        require(h.length == 64 && h.all { it in '0'..'9' || it in 'a'..'f' }) {
+            "invalid SHA-256 hash"
+        }
         val dir = File(root(ctx), "$BLOBS/${h.take(2)}")
         if (!dir.exists()) dir.mkdirs()
         return File(dir, h)
@@ -90,12 +94,17 @@ object ContentStore {
         bundleId: String? = null,
         bundleTitle: String? = null,
     ): PutResult {
+        // Read and validate the index before touching blob storage. A corrupt
+        // index must never be interpreted as an empty history and overwritten
+        // by the next received file.
+        val all = loadIndex(ctx).toMutableList()
         val hash = sha256Hex(bytes)
         val blob = blobPath(ctx, hash)
-        val deduped = blob.exists() && blob.length() == bytes.size.toLong()
+        val deduped = blob.exists() && blob.length() == bytes.size.toLong() &&
+            try { sha256Hex(blob) == hash } catch (_: Exception) { false }
         if (!deduped) {
             blob.parentFile?.mkdirs()
-            blob.writeBytes(bytes)
+            writeBytesAtomic(blob, bytes)
         }
         val entry = Entry(
             id = UUID.randomUUID().toString(),
@@ -109,7 +118,8 @@ object ContentStore {
             bundleId = bundleId,
             bundleTitle = bundleTitle,
         )
-        appendEntry(ctx, entry)
+        all.add(entry)
+        saveIndex(ctx, all)
         return PutResult(entry, blob, deduped)
     }
 
@@ -229,8 +239,7 @@ object ContentStore {
             buildList {
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    add(
-                        Entry(
+                    val entry = Entry(
                             id = o.getString("id"),
                             name = o.getString("name"),
                             hash = o.getString("hash"),
@@ -242,12 +251,28 @@ object ContentStore {
                             bundleId = o.optString("bundleId", "").ifEmpty { null },
                             bundleTitle = o.optString("bundleTitle", "").ifEmpty { null },
                         )
-                    )
+                    if (entry.size < 0 || entry.hash.length != 64 ||
+                        !entry.hash.all { it in '0'..'9' || it.lowercaseChar() in 'a'..'f' }
+                    ) {
+                        throw IllegalArgumentException("invalid ContentStore entry at index $i")
+                    }
+                    add(entry)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "loadIndex failed", e)
-            emptyList()
+            // Keep a byte-for-byte forensic copy, but leave index.json in place
+            // and fail closed so no later mutation can silently replace it.
+            val backup = File(f.parentFile, "index.corrupt.${f.lastModified()}.json")
+            try {
+                if (!backup.exists()) f.copyTo(backup)
+            } catch (backupError: Exception) {
+                Log.w(TAG, "failed to preserve corrupt index", backupError)
+            }
+            throw IllegalStateException(
+                "接收历史索引已损坏，已停止写入以保护现有数据: ${backup.absolutePath}",
+                e,
+            )
         }
     }
 
@@ -271,12 +296,20 @@ object ContentStore {
         }
         val f = indexFile(ctx)
         f.parentFile?.mkdirs()
-        f.writeText(arr.toString())
+        writeBytesAtomic(f, arr.toString().toByteArray(Charsets.UTF_8))
     }
 
-    private fun appendEntry(ctx: Context, entry: Entry) {
-        val all = loadIndex(ctx).toMutableList()
-        all.add(entry)
-        saveIndex(ctx, all)
+    private fun writeBytesAtomic(target: File, bytes: ByteArray) {
+        val atomic = AtomicFile(target)
+        var out: java.io.FileOutputStream? = null
+        try {
+            out = atomic.startWrite()
+            out.write(bytes)
+            out.fd.sync()
+            atomic.finishWrite(out)
+            out = null
+        } finally {
+            if (out != null) atomic.failWrite(out)
+        }
     }
 }

@@ -153,21 +153,37 @@ public partial class ReceiveBundleView : Page
             await Task.Run(() => File.WriteAllBytes(target, f.Data));
             saved++;
         }
-        // Also archive into received/ as a grouped bundle.
-        ScanViewModel.ArchiveBundle(_result.Bundle);
+        // Members were already indexed atomically when recovery completed.
+        // Saving is an export operation and must not create duplicate history
+        // groups each time the button is clicked.
         MessageBox.Show($"已保存 {saved} 个文件到:\n{dir}", "AirFerry",
             MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     private void ShareAll_Click(object sender, RoutedEventArgs e)
     {
-        // Archive the bundle into a fresh subdir then open Explorer there.
         if (_result.Bundle is null)
         {
             return;
         }
-        string dir = ScanViewModel.ArchiveBundle(_result.Bundle);
-        Process.Start("explorer.exe", dir);
+        try
+        {
+            // ContentStore members are extensionless SHA-256 blobs. Export a
+            // temporary, logically named directory before handing it to Explorer.
+            string dir = ShareExport.ExportFiles(
+                _result.Bundle.Select(f => (f.Name, f.Data)));
+            var startInfo = new ProcessStartInfo("explorer.exe")
+            {
+                UseShellExecute = true,
+            };
+            startInfo.ArgumentList.Add(dir);
+            Process.Start(startInfo);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"分享失败: {ex.Message}", "AirFerry",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void Rescan_Click(object sender, RoutedEventArgs e) => NavigationService?.GoBack();

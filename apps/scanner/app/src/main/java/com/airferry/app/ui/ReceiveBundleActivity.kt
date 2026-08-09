@@ -6,7 +6,6 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -26,7 +25,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
+import com.airferry.app.scan.CreateNamedDocument
+import com.airferry.app.scan.FileTransfer
 import com.airferry.app.scan.TextLike
 import java.io.File
 
@@ -68,7 +68,7 @@ class ReceiveBundleActivity : ComponentActivity() {
     private var pendingSaveIndex = 0
 
     private val saveOne = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("application/octet-stream")
+        CreateNamedDocument()
     ) { uri: Uri? ->
         if (uri != null) {
             saveToUri(uri, files.getOrNull(pendingSaveIndex))
@@ -323,12 +323,12 @@ class ReceiveBundleActivity : ComponentActivity() {
             return
         }
         try {
-            val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", src)
+            val uri = FileTransfer.shareUri(this, src, info.name)
             val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "application/octet-stream"
+                type = FileTransfer.mimeType(info.name)
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_TITLE, info.name)
-                putExtra(Intent.EXTRA_TEXT, info.name)
+                putExtra(Intent.EXTRA_TITLE, FileTransfer.displayName(info.name))
+                putExtra(Intent.EXTRA_TEXT, FileTransfer.displayName(info.name))
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(intent, "分享 ${info.name}"))
@@ -345,7 +345,7 @@ class ReceiveBundleActivity : ComponentActivity() {
             for (f in files) {
                 val src = File(f.filePath)
                 if (!src.exists()) continue
-                uris.add(FileProvider.getUriForFile(this, "${packageName}.fileprovider", src))
+                uris.add(FileTransfer.shareUri(this, src, f.name))
                 names.add(f.name)
             }
             if (uris.isEmpty()) {
@@ -353,9 +353,12 @@ class ReceiveBundleActivity : ComponentActivity() {
                 return
             }
             val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                type = "application/octet-stream"
+                type = FileTransfer.commonMimeType(names)
                 putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                putExtra(Intent.EXTRA_TITLE, if (names.size == 1) names[0] else "${names.size} 个文件")
+                putExtra(
+                    Intent.EXTRA_TITLE,
+                    if (names.size == 1) FileTransfer.displayName(names[0]) else "${names.size} 个文件",
+                )
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(intent, "分享全部文件"))

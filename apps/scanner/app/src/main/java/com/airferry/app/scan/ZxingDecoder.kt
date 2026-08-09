@@ -6,9 +6,10 @@ package com.airferry.app.scan
  * Decodes a single QR code from a CameraX Y (luminance) plane. Returns the raw
  * byte payload, or null if no QR is found. Called on every analysis frame.
  *
- * Both entry points view the Y plane **in place** (the native side honors
+ * Every entry point views the Y plane **in place** (the native side honors
  * `rowStride`), so no compacting copy of the padded plane is made on either
- * side of the JNI boundary.
+ * side of the JNI boundary. The JNI wrapper delegates the actual full-frame
+ * and ROI algorithms to `core/zxing-decoder`, shared with Windows.
  */
 object ZxingDecoder {
     init {

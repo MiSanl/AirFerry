@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
 using AirFerry.Windows.ViewModels;
 using Microsoft.Win32;
@@ -28,7 +29,9 @@ public partial class ReceiveDetailView : Page
     private void Populate()
     {
         string filePath = _result.SingleFilePath ?? "";
-        string displayName = Path.GetFileNameWithoutExtension(filePath);
+        string displayName = !string.IsNullOrWhiteSpace(_result.DisplayName)
+            ? _result.DisplayName
+            : Path.GetFileName(filePath);
         if (string.IsNullOrEmpty(displayName))
         {
             displayName = "received_file";
@@ -65,7 +68,9 @@ public partial class ReceiveDetailView : Page
         {
             return;
         }
-        string displayName = Path.GetFileName(src);
+        string displayName = !string.IsNullOrWhiteSpace(_result.DisplayName)
+            ? _result.DisplayName
+            : Path.GetFileName(src);
         var dlg = new SaveFileDialog
         {
             FileName = displayName,
@@ -78,7 +83,7 @@ public partial class ReceiveDetailView : Page
         try
         {
             File.Copy(src, dlg.FileName, overwrite: true);
-            // Also archive a copy into the received directory.
+            // ContentStore is idempotent when src is already a canonical blob.
             ScanViewModel.ArchiveSingleFile(src, displayName);
             MessageBox.Show("已保存", "AirFerry", MessageBoxButton.OK, MessageBoxImage.Information);
         }
@@ -95,9 +100,26 @@ public partial class ReceiveDetailView : Page
         {
             return;
         }
-        // Open Explorer with the file selected — Windows' closest analogue to
-        // Android's share Intent for a single file.
-        Process.Start("explorer.exe", $"/select,\"{src}\"");
+        try
+        {
+            string displayName = !string.IsNullOrWhiteSpace(_result.DisplayName)
+                ? _result.DisplayName
+                : "received_file";
+            // Never expose the extensionless SHA-256 ContentStore blob. Explorer
+            // receives a temporary copy carrying the logical filename instead.
+            string exported = ShareExport.ExportFile(src, displayName);
+            var startInfo = new ProcessStartInfo("explorer.exe")
+            {
+                UseShellExecute = true,
+            };
+            startInfo.ArgumentList.Add($"/select,{exported}");
+            Process.Start(startInfo);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"分享失败: {ex.Message}", "AirFerry",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void Rescan_Click(object sender, RoutedEventArgs e)

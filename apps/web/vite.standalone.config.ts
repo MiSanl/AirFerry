@@ -59,6 +59,7 @@ export default defineConfig({
     alias: [
       // Same as the main web config: point @/ at the real sender source.
       { find: "@/", replacement: path.resolve(__dirname, "../sender/src/") + "/" },
+      { find: "@airferry-wasm/", replacement: path.resolve(__dirname, "wasm-pkg/") + "/" },
     ],
   },
   worker: {

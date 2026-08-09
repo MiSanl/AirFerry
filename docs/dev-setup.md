@@ -2,7 +2,7 @@
 
 ## 概述
 
-AirFerry 的开发需要以下工具链：Rust（核心库）、Node.js（浏览器扩展）、JDK + Android SDK/NDK（Android App）。
+AirFerry 的开发需要以下工具链：Rust（核心库）、Node.js（浏览器扩展）、JDK + Android SDK/NDK（Android App）；完整 Windows 桌面构建还需 Windows + .NET 8 + CMake/MSVC。
 
 ## 1. Rust 工具链
 
@@ -78,6 +78,17 @@ brew install --cask temurin@17
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 ```
 
+## 6. Windows 桌面工具链
+
+仅在 Windows 10/11 上安装 .NET 8 SDK、CMake 3.22+，并在 Visual Studio 2022 Installer 勾选 **Desktop development with C++**。权威构建入口会依次生成 Rust 引擎 DLL、共享 ZXing-C++ DLL 和 WPF 应用：
+
+```powershell
+.\scripts\build-windows.ps1       # 构建
+.\scripts\build-windows.ps1 -Pack # 构建并打包
+```
+
+详见 [build-windows.md](build-windows.md)。
+
 ## 快速验证
 
 ```bash
@@ -143,4 +154,4 @@ CMake 首次会从 GitHub 克隆 zxing-cpp 并编译（约 1–2 分钟）。后
 
 ### Release APK 签名：找不到 keystore / 签名配置
 
-`assembleRelease` 的签名由 `apps/scanner/keystore.properties`（git-ignored）驱动。无此文件时自动回退 debug 签名（可装，但不是 release 证书）。要发正式签名包，按 [build-android.md](build-android.md#关于-release-签名) 创建 `keystore.properties` 并指向 release keystore。
+`assembleRelease` 的签名由 `apps/scanner/keystore.properties`（git-ignored）驱动。缺少文件、字段或 keystore 时 release 任务会失败，不会生成 debug 签名伪装的发布包。按 [build-android.md](build-android.md#关于-release-签名) 创建配置并指向 release keystore。

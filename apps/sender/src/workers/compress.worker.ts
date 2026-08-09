@@ -21,29 +21,33 @@
  * ## Message protocol
  *
  * In (from main):
- *   { files: File[] }                 — chosen files (File is structurally
- *                                       cloneable, so name/mtime/size travel
- *                                       with the buffer automatically)
- *   { text: string }                  — chosen text (text Tab). Wrapped in the
- *                                       ETTEXTv1 magic and processed exactly
- *                                       like a single file's bytes.
+ *   { type: "wasm-init", zstd?: ArrayBuffer | null }
+ *       — optional zstd bytes. Always marks the worker ready; missing/null zstd
+ *         still allows compress (preparePayload falls back to raw).
+ *   { jobId: number, files: File[] }
+ *       — chosen files (File is structurally cloneable).
+ *   { jobId: number, text: string, name?: string }
+ *       — pure text item. Wrapped in ETTEXTv1; optional `name` becomes the
+ *         descriptor filename (default "文字消息.txt", normalized to *.txt).
+ *
+ * `jobId` is the main-thread compress epoch. Stale jobs are ignored so list
+ * edits / "back to select" do not apply late results (CPU may still finish the
+ * in-flight WASM compress; only the post is suppressed).
  *
  * Out — progress (stage-based; the compressors are synchronous WASM so no
  * mid-stage percentage is possible, only phase boundaries):
- *   { phase: "reading" | "bundling" | "zstd" | "xz" }
+ *   { phase: "reading" | "bundling" | "zstd" | "xz" | "finalizing", jobId? }
  *
  * Out — final result:
- *   { phase: "done",
+ *   { phase: "done", jobId,
  *     compressed: ArrayBuffer,          — transferable (zero-copy back to main)
  *     algorithm, originalSize, compressedSize,
- *     preCrc32,                         — CRC32 of the pre-compression bytes
- *     sessionId: { lo: string, hi: string },  — 128-bit session id (as decimal
- *                                        strings; bigint survives structured
- *                                        clone but plain strings are simplest)
+ *     preCrc32,
+ *     sessionId: { lo: string, hi: string },
  *     displayName }
  *
  * Out — error:
- *   { phase: "error", message: string }
+ *   { phase: "error", message: string, jobId? }
  */
 
 /// <reference lib="webworker" />
@@ -51,8 +55,9 @@
 import { preparePayload, initZstdFromBytes } from "@/wasm/compress"
 import { crc32 } from "@/wasm/crc32"
 import { contentFingerprint, deriveSessionId } from "@/wasm/session"
-import { buildBundle } from "@/wasm/bundle"
+import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
+import { normalizeDraftFilename } from "@/storage/textDrafts"
 
 /** Decimal-string form of the 128-bit session id, clone-safe across threads. */
 export interface SessionIdDto {
@@ -63,6 +68,8 @@ export interface SessionIdDto {
 /** Result message payload (phase = "done"). */
 export interface CompressResult {
   phase: "done"
+  /** Main-thread compress epoch that issued this job. */
+  jobId: number
   /** Compressed payload, transferred back (detached from this thread). */
   compressed: ArrayBuffer
   algorithm: number
@@ -77,77 +84,150 @@ export type CompressPhase = "reading" | "bundling" | "zstd" | "xz" | "finalizing
 
 /** All messages the worker posts back to the main thread. */
 export type WorkerMessage =
-  | { phase: CompressPhase }
+  | { phase: CompressPhase; jobId?: number }
   | CompressResult
-  | { phase: "error"; message: string }
+  | { phase: "error"; message: string; jobId?: number }
 
-/** Queue of pending compression requests, processed after WASM init. */
-let pendingFiles: File[] | null = null
-let pendingText: string | null = null
-/** Whether the WASM module has been initialized. */
-let wasmReady = false
+type PendingJob =
+  | { kind: "files"; jobId: number; files: File[] }
+  | { kind: "text"; jobId: number; text: string; name?: string }
 
-self.onmessage = async (e: MessageEvent<{ files: File[] } | { text: string } | { type: "wasm-init"; zstd: ArrayBuffer }>) => {
+/** Latest pending request while the worker is still waiting for first init. */
+let pendingJob: PendingJob | null = null
+/**
+ * Ready to accept compress jobs. Set true by `wasm-init` even when zstd bytes
+ * are missing — preparePayload already falls back to raw without zstd.
+ * Also set true on the first job if the main thread never sent wasm-init
+ * (defensive: never hang the UI forever).
+ */
+let ready = false
+/** Latest accepted job id; posts for older ids are suppressed. */
+let activeJobId = -1
+/** True while processFiles/processText is running (single-flight). */
+let busy = false
+
+self.onmessage = async (
+  e: MessageEvent<
+    | { jobId?: number; files: File[] }
+    | { jobId?: number; text: string; name?: string }
+    | { type: "wasm-init"; zstd?: ArrayBuffer | null }
+  >
+) => {
   const data = e.data
 
   // Handle WASM pre-load message (sent from main thread before compression).
   if ("type" in data && data.type === "wasm-init") {
-    initZstdFromBytes((data as { type: "wasm-init"; zstd: ArrayBuffer }).zstd)
-    wasmReady = true
-    // Process whatever request arrived first while WASM was loading.
-    if (pendingFiles) {
-      const req = pendingFiles
-      pendingFiles = null
-      processFiles(req)
-    } else if (pendingText !== null) {
-      const req = pendingText
-      pendingText = null
-      processText(req)
+    const zstd = (data as { type: "wasm-init"; zstd?: ArrayBuffer | null }).zstd
+    if (zstd && zstd.byteLength > 0) {
+      try {
+        initZstdFromBytes(zstd)
+      } catch (err) {
+        console.warn("initZstdFromBytes failed; compress will fall back to raw:", err)
+      }
+    } else {
+      // Explicit null/empty: still ready — raw-only path is fine.
+      console.warn("wasm-init without zstd bytes; compress will fall back to raw when zstd unavailable")
     }
+    ready = true
+    drainPending()
     return
   }
 
-  if ("text" in data) {
-    // Text Tab input.
-    if (data.text.length === 0) {
-      post({ phase: "error", message: "empty text" })
+  const jobId =
+    typeof (data as { jobId?: number }).jobId === "number"
+      ? (data as { jobId: number }).jobId
+      : 0
+
+  if ("text" in data && typeof (data as { text?: unknown }).text === "string") {
+    const text = (data as { text: string; name?: string }).text
+    const name = (data as { text: string; name?: string }).name
+    if (text.length === 0) {
+      post({ phase: "error", message: "empty text", jobId })
       return
     }
-    if (!wasmReady) {
-      pendingText = data.text
-      return
-    }
-    processText(data.text)
+    enqueueOrRun({ kind: "text", jobId, text, name })
     return
   }
 
-  const { files } = data as { files: File[] }
+  const files = (data as { files?: File[] }).files
   if (!files || files.length === 0) {
-    post({ phase: "error", message: "no files" })
+    post({ phase: "error", message: "no files", jobId })
     return
   }
-
-  // If WASM hasn't been initialized yet, queue this request
-  if (!wasmReady) {
-    pendingFiles = files
-    return
-  }
-
-  processFiles(files)
+  enqueueOrRun({ kind: "files", jobId, files })
 }
 
-async function processFiles(files: File[]) {
+function enqueueOrRun(job: PendingJob): void {
+  // Newer job always supersedes any queued request.
+  activeJobId = job.jobId
+  if (!ready) {
+    // Main always posts wasm-init, including an explicit null when preloading
+    // failed. Queueing here preserves the preloaded-byte fast path when the
+    // user clicks Send before that asynchronous fetch completes.
+    pendingJob = job
+    return
+  }
+  if (busy) {
+    // Replace pending; the in-flight job will finish but its posts are
+    // suppressed via activeJobId checks.
+    pendingJob = job
+    return
+  }
+  void runJob(job)
+}
 
+function drainPending(): void {
+  if (!ready || busy || pendingJob === null) return
+  const job = pendingJob
+  pendingJob = null
+  void runJob(job)
+}
+
+async function runJob(job: PendingJob): Promise<void> {
+  busy = true
+  activeJobId = job.jobId
   try {
-    // --- Stage 1: read files ---
-    post({ phase: "reading" })
+    if (job.kind === "files") {
+      await processFiles(job.files, job.jobId)
+    } else {
+      await processText(job.text, job.name, job.jobId)
+    }
+  } finally {
+    busy = false
+    // If a newer job was queued while we were busy, run it now
+    // (enqueueOrRun already set activeJobId to that pending job).
+    if (pendingJob !== null) {
+      const next = pendingJob
+      pendingJob = null
+      void runJob(next)
+    }
+  }
+}
+
+function isCurrent(jobId: number): boolean {
+  return jobId === activeJobId
+}
+
+async function processFiles(files: File[], jobId: number) {
+  try {
+    const selectedBytes = files.reduce((sum, file) => sum + file.size, 0)
+    if (!Number.isSafeInteger(selectedBytes) || selectedBytes > MAX_TRANSFER_BYTES) {
+      throw new Error(`所选内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
+    }
+    if (files.length === 1 && files[0].size === 0) {
+      throw new Error("暂不支持发送空文件（0 B）")
+    }
+    if (!isCurrent(jobId)) return
+    post({ phase: "reading", jobId })
     const isBundle = files.length > 1
     let raw: Uint8Array
     let displayName: string
     let sessionId: { lo: bigint; hi: bigint }
     if (isBundle) {
-      post({ phase: "bundling" })
+      if (!isCurrent(jobId)) return
+      post({ phase: "bundling", jobId })
       const built = await buildBundle(files)
+      if (!isCurrent(jobId)) return
       raw = built.bytes
       displayName = `${files.length}个文件打包`
       console.log(`Bundle: ${files.length} files, ${raw.length} bytes pre-compress`)
@@ -160,43 +240,51 @@ async function processFiles(files: File[]) {
       sessionId = deriveSessionId(namesJoined, BigInt(raw.length), BigInt(mtimeMax), fp)
     } else {
       raw = new Uint8Array(await files[0].arrayBuffer())
+      if (!isCurrent(jobId)) return
       displayName = files[0].name
       const fp = computeFingerprint(raw)
       const f = files[0]
       sessionId = deriveSessionId(f.name, BigInt(f.size), BigInt(f.lastModified), fp)
     }
 
-    await finalizeAndPost(raw, displayName, sessionId)
+    await finalizeAndPost(raw, displayName, sessionId, jobId)
   } catch (err) {
-    post({ phase: "error", message: (err as Error)?.message || String(err) })
+    if (!isCurrent(jobId)) return
+    post({ phase: "error", message: (err as Error)?.message || String(err), jobId })
   }
 }
 
 /**
  * Process a text transfer: wrap the text in the ETTEXTv1 magic, then feed the
- * bytes through the SAME compress → CRC → finalize path as a file. The session
- * id is derived from a fixed name ("文字消息.txt"), the payload size, the
- * current timestamp (standing in for a file's mtime), and the content
- * fingerprint — so the same text sent twice in quick succession still gets a
- * distinct id (the timestamp differs), but resuming a broken transfer of the
- * same text seconds later re-derives the same id deterministically.
+ * bytes through the SAME compress → CRC → finalize path as a file.
+ *
+ * `name` (optional) is the user-chosen filename from the select page; empty /
+ * missing falls back to {@link TEXT_DISPLAY_NAME}. Normalized to a safe `*.txt`
+ * so the descriptor never carries path separators.
  */
-async function processText(text: string) {
+async function processText(text: string, name: string | undefined, jobId: number) {
   try {
-    post({ phase: "reading" })
+    if (!isCurrent(jobId)) return
+    post({ phase: "reading", jobId })
     const raw = buildTextPayload(text)
+    if (raw.length > MAX_TRANSFER_BYTES) {
+      throw new Error(`文字内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
+    }
     const fp = computeFingerprint(raw)
+    const displayName =
+      normalizeDraftFilename(typeof name === "string" ? name : "") || TEXT_DISPLAY_NAME
     // mtime substitute: Date.now() at send time. Deterministic enough for
     // resume within the same moment; differs across distinct sends.
     const sessionId = deriveSessionId(
-      TEXT_DISPLAY_NAME,
+      displayName,
       BigInt(raw.length),
       BigInt(Date.now()),
       fp
     )
-    await finalizeAndPost(raw, TEXT_DISPLAY_NAME, sessionId)
+    await finalizeAndPost(raw, displayName, sessionId, jobId)
   } catch (err) {
-    post({ phase: "error", message: (err as Error)?.message || String(err) })
+    if (!isCurrent(jobId)) return
+    post({ phase: "error", message: (err as Error)?.message || String(err), jobId })
   }
 }
 
@@ -209,16 +297,21 @@ async function processText(text: string) {
 async function finalizeAndPost(
   raw: Uint8Array,
   displayName: string,
-  sessionId: { lo: bigint; hi: bigint }
+  sessionId: { lo: bigint; hi: bigint },
+  jobId: number
 ) {
+  if (!isCurrent(jobId)) return
   // --- Compress (zstd always; xz if compressible) ---
   // preparePayload drives the stage callback so we can post zstd/xz phase
   // boundaries up to the UI. The compress itself is synchronous WASM but
   // runs here in the worker, so the main thread keeps painting meanwhile.
   const { payload: compressed, algorithm, compressedSize } = await preparePayload(
     raw,
-    (phase) => post({ phase })
+    (phase) => {
+      if (isCurrent(jobId)) post({ phase, jobId })
+    }
   )
+  if (!isCurrent(jobId)) return
   console.log(
     `Compression: ${raw.length} → ${compressedSize} bytes ` +
       `(${raw.length > 0 ? ((compressedSize / raw.length) * 100).toFixed(1) : "0"}%)`
@@ -228,8 +321,9 @@ async function finalizeAndPost(
   // 这一段（CRC32 over the whole payload）没有任何阶段回调，是 done 前的"盲区"。
   // 大文件 CRC 可达数百毫秒，补一个 finalizing 阶段让 UI 步骤清单能显示它，
   // 而非从"压缩"直接跳到"完成"。
-  post({ phase: "finalizing" })
+  post({ phase: "finalizing", jobId })
   const crc = crc32(raw)
+  if (!isCurrent(jobId)) return
 
   // Transfer the compressed buffer back (zero-copy). Ensure it owns a
   // dedicated ArrayBuffer at offset 0 so the transfer detaches cleanly. The
@@ -242,6 +336,7 @@ async function finalizeAndPost(
 
   const result: CompressResult = {
     phase: "done",
+    jobId,
     compressed: outBuf,
     algorithm,
     originalSize: raw.length,

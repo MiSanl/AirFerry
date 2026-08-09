@@ -9,10 +9,9 @@
 //! ## Algorithm selection
 //!
 //! The wire protocol tags every transfer with a [`COMPRESSION_*`] byte so the
-//! receiver knows which decoder to run. Zstd is the default and works
-//! end-to-end today; XZ (LZMA2) gives a better ratio for text-heavy payloads
-//! but is currently only wired into the Rust decompressor (the browser has no
-//! stable XZ compressor), so it is reserved for future use.
+//! receiver knows which decoder to run. Zstd is the default; XZ (LZMA2) gives
+//! a better ratio for text-heavy payloads. Native Rust implements both directions,
+//! while the browser supplies interoperable zstd/XZ streams from its worker.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
@@ -32,10 +31,7 @@ pub const COMPRESSION_XZ: u8 = 2;
 /// True for on-wire algorithm tags the stack implements end-to-end.
 #[inline]
 pub fn is_known_compression_tag(tag: u8) -> bool {
-    matches!(
-        tag,
-        COMPRESSION_NONE | COMPRESSION_ZSTD | COMPRESSION_XZ
-    )
+    matches!(tag, COMPRESSION_NONE | COMPRESSION_ZSTD | COMPRESSION_XZ)
 }
 
 /// XZ/LZMA2 preset. The low 5 bits are the compression level (0..=9); bit 31
@@ -55,6 +51,9 @@ pub fn is_known_compression_tag(tag: u8) -> bool {
 const LZMA_PRESET_EXTREME: u32 = 0x8000_0000;
 #[cfg(not(target_arch = "wasm32"))]
 const XZ_PRESET: u32 = 6 | LZMA_PRESET_EXTREME;
+/// Decoder dictionary/memory ceiling independent of the output byte cap.
+#[cfg(not(target_arch = "wasm32"))]
+const XZ_DECODER_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 
 /// Compress `data` with zstd at the given level.
 /// For small files, uses maximum compression (level 22) by default.
@@ -112,7 +111,11 @@ pub fn decompress_with_limit(data: &[u8], compression: u8, max_output: usize) ->
                 .map_err(|e| Error::Compress(e.to_string()))?;
             read_capped(dec, max_output)
         }
-        COMPRESSION_XZ => read_capped(xz2::read::XzDecoder::new(data), max_output),
+        COMPRESSION_XZ => {
+            let stream = xz2::stream::Stream::new_stream_decoder(XZ_DECODER_MEMORY_LIMIT, 0)
+                .map_err(|e| Error::Compress(e.to_string()))?;
+            read_capped(xz2::read::XzDecoder::new_stream(data, stream), max_output)
+        }
         _ => {
             if !is_known_compression_tag(compression) && !data.is_empty() {
                 return Err(Error::Compress(format!(
@@ -133,11 +136,16 @@ fn read_capped<R: std::io::Read>(r: R, max_output: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
     // Read one byte past the cap so an over-limit stream can be detected.
-    r.take(max_output as u64 + 1)
+    let read_limit = u64::try_from(max_output)
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1);
+    r.take(read_limit)
         .read_to_end(&mut out)
         .map_err(|e| Error::Compress(e.to_string()))?;
     if out.len() > max_output {
-        return Err(Error::Compress("decompressed output exceeds expected size".into()));
+        return Err(Error::Compress(
+            "decompressed output exceeds expected size".into(),
+        ));
     }
     Ok(out)
 }
@@ -246,7 +254,10 @@ mod tests {
     fn unknown_compression_tag_rejected_on_limited_decompress() {
         let data = vec![1u8, 2, 3, 4];
         assert!(decompress_with_limit(&data, 99, 1024).is_err());
-        assert_eq!(decompress_with_limit(&[], 99, 1024).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            decompress_with_limit(&[], 99, 1024).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -258,11 +269,17 @@ mod tests {
         // Cap below the true output → rejected (bomb defense).
         assert!(decompress_with_limit(&z, COMPRESSION_ZSTD, 1000).is_err());
         // Cap at the true output → ok.
-        assert_eq!(decompress_with_limit(&z, COMPRESSION_ZSTD, data.len()).unwrap(), data);
+        assert_eq!(
+            decompress_with_limit(&z, COMPRESSION_ZSTD, data.len()).unwrap(),
+            data
+        );
 
         // XZ path behaves the same.
         let x = xz_compress(&data).unwrap();
         assert!(decompress_with_limit(&x, COMPRESSION_XZ, 1000).is_err());
-        assert_eq!(decompress_with_limit(&x, COMPRESSION_XZ, data.len()).unwrap(), data);
+        assert_eq!(
+            decompress_with_limit(&x, COMPRESSION_XZ, data.len()).unwrap(),
+            data
+        );
     }
 }

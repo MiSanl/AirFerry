@@ -19,8 +19,8 @@
  * alongside the existing bundle logic, keeps the descriptor unchanged, and is
  * automatically backward compatible: an old receiver that doesn't know the
  * magic falls through to single-file handling and saves the bytes as a `.txt`
- * (the sender declares `filename = "文字消息.txt"` in the descriptor), which a
- * user can still open.
+ * under the descriptor filename (user-chosen on the select page, defaulting
+ * to {@link TEXT_DISPLAY_NAME} = "文字消息.txt"), which a user can still open.
  *
  * ## Wire format
  *
@@ -42,7 +42,10 @@
 
 export const TEXT_MAGIC = "ETTEXTv1"
 
-/** Display name written into the descriptor for a text transfer. */
+/**
+ * Default display name written into the descriptor for a text transfer when
+ * the select page did not supply a user-chosen filename.
+ */
 export const TEXT_DISPLAY_NAME = "文字消息.txt"
 
 /** True if `bytes` begins with the text magic (8 bytes). */

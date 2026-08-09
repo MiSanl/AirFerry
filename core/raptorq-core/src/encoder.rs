@@ -23,11 +23,11 @@ impl Encoder {
         if data.is_empty() {
             return Err(Error::EmptyData);
         }
-        if config.symbol_size == 0 {
-            return Err(Error::InvalidSymbolSize);
-        }
+        // Revalidate here too: serde can deserialize a private field without
+        // going through Config::new when that feature is enabled.
+        let config = Config::new(config.symbol_size())?;
 
-        let rq_encoder = RqEncoder::with_defaults(data, config.mtu());
+        let rq_encoder = RqEncoder::with_defaults(data, config.mtu()?);
         let oti = rq_encoder.get_config();
         let rq_blocks = rq_encoder.get_block_encoders();
 
@@ -77,6 +77,17 @@ impl Encoder {
     pub fn repair_symbols(&self, sbn: u32, start: u32, count: u32) -> Result<Vec<Symbol>> {
         let block = self.block(sbn)?;
         let k = self.meta.blocks[sbn as usize].num_source_symbols;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let last_esi = k
+            .checked_add(start)
+            .and_then(|v| v.checked_add(count - 1))
+            .ok_or(Error::UnknownSymbol { sbn, esi: u32::MAX })?;
+        if last_esi >= (1 << 24) {
+            return Err(Error::UnknownSymbol { sbn, esi: last_esi });
+        }
+        // Validate before entering raptorq: PayloadId::new asserts this bound.
         let pkts: Vec<EncodingPacket> = block.encoder.repair_packets(start, count);
         pkts.into_iter()
             .enumerate()
@@ -150,6 +161,14 @@ mod tests {
         for (i, s) in repairs.iter().enumerate() {
             assert_eq!(s.id.esi, k + i as u32);
         }
+    }
+
+    #[test]
+    fn rejects_repair_range_past_24_bit_esi_before_upstream_call() {
+        let data = random_data(8192);
+        let enc = Encoder::new(&data, Config::default()).unwrap();
+        let k = enc.meta().blocks[0].num_source_symbols;
+        assert!(enc.repair_symbols(0, (1 << 24) - k, 1).is_err());
     }
 
     /// Performance baseline: emitting all K source symbols of one block should
