@@ -153,6 +153,66 @@ function isFileDrag(dataTransfer: DataTransfer | null): boolean {
   return Array.from(dataTransfer.types).includes("Files")
 }
 
+/* Inline SVG icons (stroke style, inherit currentColor). */
+const svgProps = {
+  width: 20,
+  height: 20,
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.8,
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+  "aria-hidden": true,
+} as const
+
+function FolderIcon() {
+  return (
+    <svg {...svgProps}>
+      <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    </svg>
+  )
+}
+
+function PenIcon() {
+  return (
+    <svg {...svgProps}>
+      <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
+      <path d="m15 5 4 4" />
+    </svg>
+  )
+}
+
+function FileIcon() {
+  return (
+    <svg {...svgProps}>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+    </svg>
+  )
+}
+
+function TextDocIcon() {
+  return (
+    <svg {...svgProps}>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M8 13h8" />
+      <path d="M8 17h5" />
+    </svg>
+  )
+}
+
+function UploadIcon({ size = 24 }: { size?: number }) {
+  return (
+    <svg {...svgProps} width={size} height={size}>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="17 8 12 3 7 8" />
+      <line x1="12" x2="12" y1="3" y2="15" />
+    </svg>
+  )
+}
+
 export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepthRef = useRef(0)
@@ -164,6 +224,7 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   const [isReadingDrop, setIsReadingDrop] = useState(false)
   const [dropError, setDropError] = useState<string | null>(null)
   const [textOpen, setTextOpen] = useState(false)
+  const [listCollapsed, setListCollapsed] = useState(true)
 
   useEffect(() => {
     mountedRef.current = true
@@ -368,23 +429,25 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
       {dragging && (
         <div className="page-drop-overlay" role="status" aria-live="polite">
           <div className="page-drop-overlay-card">
-            <span className="page-drop-overlay-icon" aria-hidden="true">📥</span>
+            <span className="page-drop-overlay-icon">
+              <UploadIcon size={28} />
+            </span>
             <strong>松开即可添加</strong>
             <span>文件或文件夹可拖到网页任意位置</span>
           </div>
         </div>
       )}
       <h2>选择要发送的内容</h2>
-      <p className="hint" style={{ marginTop: 0, marginBottom: 16 }}>
+      <p className="page-desc">
         添加文件或文字到列表，确认后发送（多项会打包为一次传输）
       </p>
 
       <div className="select-actions">
         <button type="button" className="btn secondary select-action-btn" onClick={handleBrowseClick}>
-          📁 添加文件
+          <FolderIcon /> 添加文件
         </button>
         <button type="button" className="btn secondary select-action-btn" onClick={() => setTextOpen(true)}>
-          ✍ 添加文字
+          <PenIcon /> 添加文字
         </button>
       </div>
 
@@ -402,20 +465,22 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
             e.target.value = ""
           }}
         />
-        <div className="dropzone-icon">{items.length > 0 ? "📦" : "📁"}</div>
-        <p className="dropzone-hint">
-          {items.length > 0 ? (
-            <>
-              <strong>{items.length} 项已加入列表</strong>
-              <br />
-              共 {formatBytes(totalSize(items))}
-              <br />
-              <span className="muted">点击或拖拽可继续追加</span>
-            </>
-          ) : (
-            "拖拽文件或文件夹到网页任意位置，或点击「添加文件」"
-          )}
-        </p>
+        <div className="dropzone-icon">
+          {items.length > 0 ? <FolderIcon /> : <UploadIcon />}
+        </div>
+        {items.length > 0 ? (
+          <>
+            <p className="dropzone-title">{items.length} 项已加入列表</p>
+            <p className="dropzone-hint">
+              共 {formatBytes(totalSize(items))} · 点击或拖拽可继续追加
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="dropzone-title">拖拽文件或文件夹到网页任意位置</p>
+            <p className="dropzone-hint">或点击此处 / 「添加文件」浏览选择</p>
+          </>
+        )}
       </div>
 
       {isReadingDrop && (
@@ -427,64 +492,63 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
 
       {items.length > 0 && (
         <>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginTop: 16,
-              marginBottom: 8,
-            }}
-          >
-            <p className="hint" style={{ margin: 0 }}>
-              {items.length > 1
-                ? `${items.length} 项将打包为一次传输`
-                : "已就绪，点下方「发送」继续"}
-            </p>
+          <div className="file-list-summary-row">
             <button
               type="button"
-              className="btn secondary"
-              style={{ fontSize: 12, padding: "4px 12px" }}
+              className="file-list-summary"
+              onClick={() => setListCollapsed((v) => !v)}
+              aria-expanded={!listCollapsed}
+            >
+              <span className="file-list-summary-count">
+                {items.length} 项 · {formatBytes(totalSize(items))}
+              </span>
+              <span className="file-list-summary-caret">{listCollapsed ? "▸ 展开" : "▾ 折叠"}</span>
+            </button>
+            <button
+              type="button"
+              className="btn secondary btn-sm"
               onClick={clearAll}
             >
               清空
             </button>
           </div>
-          <ul className="file-list">
-            {items.map((it) => (
-              <li key={it.id} className="file-list-item">
-                <span className="file-list-name">
-                  <span className="file-list-ico">{it.kind === "text" ? "📝" : "📄"}</span>
-                  <span className="file-list-text">
-                    <strong>{itemName(it)}</strong>
-                    <span className="muted">
-                      {" "}
-                      {formatBytes(itemSize(it))}
-                      {it.kind === "text" ? ` · ${previewText(it.content)}` : ""}
+          {!listCollapsed && (
+            <ul className="file-list">
+              {items.map((it) => (
+                <li key={it.id} className="file-list-item">
+                  <span className="file-list-name">
+                    <span className={`file-list-ico${it.kind === "text" ? " text-ico" : ""}`}>
+                      {it.kind === "text" ? <TextDocIcon /> : <FileIcon />}
+                    </span>
+                    <span className="file-list-text">
+                      <strong>{itemName(it)}</strong>
+                      <span className="muted">
+                        {formatBytes(itemSize(it))}
+                        {it.kind === "text" ? ` · ${previewText(it.content)}` : ""}
+                      </span>
                     </span>
                   </span>
-                </span>
-                <button
-                  type="button"
-                  className="file-list-remove"
-                  title="移除"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    removeItem(it.id)
-                  }}
-                >
-                  ✕
-                </button>
-              </li>
-            ))}
-          </ul>
+                  <button
+                    type="button"
+                    className="file-list-remove"
+                    title="移除"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      removeItem(it.id)
+                    }}
+                  >
+                    ✕
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </>
       )}
 
       <button
         type="button"
-        className="btn primary"
-        style={{ marginTop: 20, width: "100%" }}
+        className="btn primary page-cta"
         disabled={!canSend}
         onClick={onSend}
       >

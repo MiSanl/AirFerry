@@ -193,9 +193,11 @@ export function QrStream({
           </button>
         )}
       </div>
-      <button onClick={toggleFullscreen} className="btn">
-        {fullscreen ? "退出全屏" : "全屏播放"}
-      </button>
+      <div className="qr-actions">
+        <button onClick={toggleFullscreen} className="btn secondary">
+          {fullscreen ? "退出全屏" : "全屏播放"}
+        </button>
+      </div>
     </div>
   )
 }

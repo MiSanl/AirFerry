@@ -478,28 +478,31 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <div className="app-logo"><img src={iconUrl} alt="AirFerry" /></div>
-        <h1>AirFerry · 无网文件传输</h1>
+        <div className="app-title">
+          <h1>AirFerry</h1>
+          <p className="app-subtitle">无网文件传输 · 屏幕二维码流</p>
+        </div>
       </header>
       <div className="steps">
         <div className={`step ${state.page === "select" ? "active" : state.prepared ? "done" : ""}`} onClick={() => go("select")}>
-          <span className="step-dot">1</span> 选择文件
+          <span className="step-dot">1</span><span className="step-label">选择文件</span>
         </div>
         <div className="step-line" />
         <div className={`step ${state.page === "params" ? "active" : state.session ? "done" : ""}`} onClick={() => state.prepared && go("params")}>
-          <span className="step-dot">2</span> 传输参数
+          <span className="step-dot">2</span><span className="step-label">传输参数</span>
         </div>
         <div className="step-line" />
         <div className={`step ${state.page === "play" ? "active" : ""}`} onClick={() => state.session && go("play")}>
-          <span className="step-dot">3</span> 播放传输
+          <span className="step-dot">3</span><span className="step-label">播放传输</span>
         </div>
         <div className="step-line" />
         <div className={`step ${state.page === "stats" ? "active" : ""}`} onClick={() => state.session && go("stats")}>
-          <span className="step-dot">4</span> 统计
+          <span className="step-dot">4</span><span className="step-label">统计</span>
         </div>
       </div>
       <main className="app-main">
         {state.error && (
-          <div className="error-banner" style={{ padding: "12px 16px", marginBottom: 16, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, color: "#991b1b", fontSize: 14 }}>
+          <div className="error-banner" role="alert">
             {state.error}
           </div>
         )}
@@ -546,7 +549,7 @@ export default function App() {
           target="_blank"
           rel="noopener noreferrer"
         >
-          下载扫码端
+          下载 Releases
         </a>
         <span className="app-footer-sep">·</span>
         <a
@@ -555,7 +558,7 @@ export default function App() {
           target="_blank"
           rel="noopener noreferrer"
         >
-          项目地址
+          项目仓库
         </a>
       </footer>
       {/* Compress progress overlay — shown while the worker prepares the file.

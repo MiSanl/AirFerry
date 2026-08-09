@@ -78,6 +78,7 @@ export function ParamsPage({
   return (
     <div className="page">
       <h2>传输参数</h2>
+      <p className="page-desc">确认内容与大小，按需调整冗余与速度后开始传输</p>
       <table className="kv">
         <tbody>
           <tr>
@@ -125,10 +126,10 @@ export function ParamsPage({
       </table>
 
       <div className="field">
-        <label>
-          冗余率: <strong>{config.redundancyPct}%</strong>{" "}
-          <span className="muted">(5%–50%)</span>
-        </label>
+        <div className="field-label">
+          <span>冗余率 <span className="muted">(5%–50%)</span></span>
+          <span className="field-value">{config.redundancyPct}%</span>
+        </div>
         <input
           type="range"
           min={5}
@@ -185,9 +186,10 @@ export function ParamsPage({
       </div>
 
       <div className="field">
-        <label>
-          亮度: <strong>{config.brightness.toFixed(2)}x</strong>
-        </label>
+        <div className="field-label">
+          <span>亮度</span>
+          <span className="field-value">{config.brightness.toFixed(2)}x</span>
+        </div>
         <input
           type="range"
           min={1}
@@ -199,12 +201,12 @@ export function ParamsPage({
       </div>
 
       <div className="field">
-        <label>
+        <label className="field-check">
           <input
             type="checkbox"
             checked={config.autoOptimize}
             onChange={(e) => onChange({ autoOptimize: e.target.checked })}
-          />{" "}
+          />
           自动优化亮度 / 对比度 / 边距
         </label>
       </div>
@@ -221,18 +223,18 @@ export function ParamsPage({
       </div>
 
       <div className="field">
-        <label>
+        <label className="field-check">
           <input
             type="checkbox"
             checked={config.ditherJitter}
             onChange={(e) => onChange({ ditherJitter: e.target.checked })}
-          />{" "}
+          />
           亚像素抖动（防摩尔纹）
         </label>
       </div>
 
       <button
-        className="btn primary"
+        className="btn primary page-cta"
         onClick={onStart}
         disabled={initializing}
       >

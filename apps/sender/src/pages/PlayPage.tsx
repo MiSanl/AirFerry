@@ -52,6 +52,7 @@ export function PlayPage({ session, config, sessionId, totalBytes }: Props) {
   return (
     <div className="page">
       <h2>正在播放</h2>
+      <p className="page-desc">将接收端摄像头对准屏幕，保持画面完整可见</p>
       {error && <p className="error">{error}</p>}
       <QrStream
         session={session}
