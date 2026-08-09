@@ -69,7 +69,7 @@ cargo build -p transfer-engine --features cffi --release
 # 产物: target/release/transfer_engine.dll
 ```
 
-> **必须先于 C# 构建**：csproj 会把 `runtime/transfer_engine.dll` 复制到应用目录。若 DLL 缺失，运行时第一个引擎 P/Invoke 会抛 `DllNotFoundException`。
+> **必须先于 C# 构建**：csproj 会把两个 `runtime/*.dll` 复制到 build/publish 应用目录，并明确排除单文件内嵌。若 DLL 缺失，运行时第一个 P/Invoke 会抛 `DllNotFoundException`。
 
 ### 4.2 编译共享 ZXing-C++ DLL
 

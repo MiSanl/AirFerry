@@ -229,8 +229,8 @@ npm run preview        # 本地预览构建产物
 | `apps/scanner/app/build/` | Gradle/APK 构建产物：`outputs/apk/{debug,release}/app-*.apk` + native-debug-symbols + baselineProfiles | `./gradlew` | ✅ |
 | `apps/scanner/app/src/main/jniLibs/arm64-v8a/` | Rust 编译的 `libtransfer_engine.so` + 遗留的 `libet_code.so`（**当前代码无任何 `System.loadLibrary("et_code")` 引用，未使用，建议清理**）。ZXing 的 `libairferry_zxing.so` 不在此处——由 CMake 在 APK 构建时直接编译进 APK | `cargo ndk ... build` | ✅ |
 | `apps/windows/AirFerry.Windows/bin/` `obj/` | C# WPF 构建产物：`bin/x64/Release/net8.0-windows/win-x64/` + OpenCV/native DLLs | `dotnet build` / `dotnet publish` | ✅ |
-| `apps/windows/AirFerry.Windows/runtime/transfer_engine.dll` | Rust 编译的 C ABI DLL（`--features cffi`），csproj 标 `CopyToOutputDirectory=PreserveNewest` 打进 exe 同目录 | `cargo build`（由 build-windows.ps1 拷入） | ✅ |
-| `apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll` | Android/Windows 共用解码核心的 Windows C ABI DLL；csproj 复制进 exe 同目录 | `cmake --build apps/windows/native/build`（由 build-windows.ps1 拷入） | ✅ |
+| `apps/windows/AirFerry.Windows/runtime/transfer_engine.dll` | Rust 编译的 C ABI DLL（`--features cffi`），csproj 标记复制到 build/publish 输出并排除单文件内嵌 | `cargo build`（由 build-windows.ps1 拷入） | ✅ |
+| `apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll` | Android/Windows 共用解码核心的 Windows C ABI DLL；csproj 复制到 build/publish 输出并保留为独立 native DLL | `cmake --build apps/windows/native/build`（由 build-windows.ps1 拷入） | ✅ |
 | `apps/windows/native/build/` | Windows ZXing-C++ 配置、依赖与 CTest 产物 | CMake（首次配置按固定 commit 获取 zxing-cpp） | ✅ |
 | `dist/` | 发布归档 + 签名材料（`*.pem` Chrome 私钥、`airferry-release.keystore`） | `pack_dist` | ✅ |
 | `target/` | Rust 编译缓存（workspace 共享） | `cargo` | ✅ |
