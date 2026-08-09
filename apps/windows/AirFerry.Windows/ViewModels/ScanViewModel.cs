@@ -56,7 +56,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int PreviewFps = 15;
     private const int RateWindowSeconds = 3;
     private const int RateMinMilliseconds = 500;
-    private const int CodeActiveSeconds = 5;
+    private const int CodeActiveSeconds = 2;
     private const int CenterCodeSlot = -1;
 
     private sealed record AssembledPayload(
@@ -448,14 +448,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             return false;
         }
-        IngestStatus? status = session.Ingest(payload);
-        if (status is null)
+        // Presence means that a syntactically valid AirFerry QR is physically
+        // visible. Before the first descriptor, valid data frames are
+        // intentionally not accepted by ReceiverSession, so waiting for Ingest
+        // would falsely label those decoded tiles as absent.
+        if (FrameHeader.Parse(payload) is null)
         {
             return false;
         }
-        IngestStatus s = status.Value;
-        int epoch = Volatile.Read(ref _sessionEpoch);
-
         if (bbox is not null && bbox.Length >= 4)
         {
             int slot = GridSlotOf(bbox, pool);
@@ -464,6 +464,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 _codeActivity[slot] = Stopwatch.GetTimestamp();
             }
         }
+
+        IngestStatus? status = session.Ingest(payload);
+        if (status is null)
+        {
+            return false;
+        }
+        IngestStatus s = status.Value;
+        int epoch = Volatile.Read(ref _sessionEpoch);
 
         if (s.Complete)
         {
@@ -882,6 +890,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
 
         int count = pool.SnapshotMultiCount();
+        int quadrantCount = activity.Keys.Count(slot => slot is >= 0 and <= 3);
+        if (quadrantCount > 0)
+        {
+            count = Math.Clamp(Math.Max(count, quadrantCount), 2, 4);
+        }
         if (count <= 1)
         {
             string dot = Dot(CenterCodeSlot);

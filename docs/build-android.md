@@ -103,7 +103,7 @@ APK 包含三个原生库：
 
 ## ZXing-C++ 构建
 
-ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。实际识别逻辑位于仓库级 `core/zxing-decoder/`，Android 的 `scan_jni.cpp` 仅做 JNI 桥接；Windows C ABI 复用同一核心。
+ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。实际识别逻辑位于仓库级 `core/zxing-decoder/`，Android 的 `scan_jni.cpp` 仅做 JNI 桥接；Windows C ABI 复用同一核心。全帧发现保留 TryHarder/TryInvert；高频 ROI 热路径针对 AirFerry 固定的正常极性二维码关闭反色重试，缺码时不再每帧付双重识别成本。
 
 ```cmake
 # app/src/main/cpp/CMakeLists.txt

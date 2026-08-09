@@ -11,7 +11,7 @@
 | UI | WPF (.NET 8, C#) | 对标 Android Compose UI |
 | 相机/采集卡 | OpenCvSharp4 (DirectShow 后端) | 单句柄读取；Gray 送解码、池化 BGR24 快照送预览 |
 | 设备枚举 | DirectShowLib (DsDevice) | `FilterCategory.VideoInputDevice` 同时覆盖摄像头+采集卡 |
-| QR 解码 | 共享 ZXing-C++（TryHarder/TryInvert，全帧 + 多 ROI） | `core/zxing-decoder/` 与 Android 共用；Windows 仅加薄 C ABI |
+| QR 解码 | 共享 ZXing-C++（全帧 TryHarder/TryInvert + 正常极性多 ROI） | `core/zxing-decoder/` 与 Android 共用；Windows 仅加薄 C ABI |
 | 核心引擎 | Rust `transfer-engine` (C ABI, `--features cffi`) | 编解码逻辑与 Android/WASM 共享，编译为 `transfer_engine.dll` |
 | MVVM | CommunityToolkit.Mvvm | ObservableObject / RelayCommand 源生成器 |
 
@@ -54,7 +54,7 @@ cmake --version           # ≥ 3.22
 2. 拷贝 DLL 到 `apps/windows/AirFerry.Windows/runtime/transfer_engine.dll`
 3. CMake 配置/编译共享 ZXing-C++ → CTest → 拷贝 `airferry_zxing.dll` 到同一 `runtime/`
 4. `dotnet restore` + `dotnet build -c Release`（或 `-Pack` 时 `dotnet publish`）
-5. （`-Pack` 时）压缩发布目录到 `dist/airferry-windows-x64-v{VER}.zip`
+5. （`-Pack` 时）压缩发布目录到 `dist/airferry-receiver-windows-x64-v{VER}.zip`
 
 > 也可以用 bash 入口（Git Bash/WSL 下）：`./scripts/build-all.sh windows`。逻辑等价，但 PowerShell 是 Windows 上的首选。
 
@@ -127,7 +127,7 @@ workflow_dispatch（手动）且上述三 job 成功
        CMake/MSVC 构建共享 ZXing-C++ + CTest
        拷贝 airferry_zxing.dll → apps/windows/AirFerry.Windows/runtime/
        dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
-       Compress-Archive → airferry-windows-x64-v${VER}.zip
+       Compress-Archive → airferry-receiver-windows-x64-v${VER}.zip
        gh release upload v${VER} … --clobber
        （若 tag/release 不存在则 gh release create --draft）
 ```
@@ -150,7 +150,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 ### 7.1 单采集源与停止生命周期
 
 - 解码和预览共用一个 DirectShow 句柄；生产线程每次读取只向池化 Gray 缓冲复制一次，并按最高 15fps 发布 BGR24 预览快照，避免独占型驱动因双开设备导致黑屏。
-- 2–6 个 worker 调用与 Android 相同的 ZXing-C++ 核心。冷启动走全帧多码识别；锁定 bbox 后走多 ROI 热路径，连续 3 次 ROI miss 才回退全帧重锁。首次只锁到部分 tile 时每 30 次 ROI 成功低频补一次全帧发现，直到 4 个码位锁齐；部分重锁不会缩掉已有槽位。
+- 2–6 个 worker 调用与 Android 相同的 ZXing-C++ 核心。冷启动走全帧多码识别；锁定 bbox 后走多 ROI 热路径，连续 3 次 ROI miss 才回退全帧重锁。首次只锁到部分 tile 时每 30 次 ROI 成功安排下一帧做一次全帧发现（该帧不再先跑 ROI），直到 4 个码位锁齐；连续 60 次 ROI 未命中的槽位会退休，二维码重现后由低频全帧发现重新加入。
 - 预览快照使用 `ArrayPool<byte>`，UI 只把托管像素写入 `WriteableBitmap`，不在 Dispatcher 上调用阻塞式 `VideoCapture.Read()`。
 - 扫描页只保留最新预览帧；UI 忙时自动覆盖旧帧，不堆积 Dispatcher 任务或大图像缓冲。
 - 停止会先作废旧会话的排队 UI 回调，并启动唯一的有序清理任务：等待生产者、完成后的组装/落盘任务及全部解码 worker 真正结束后，才释放 native handle/camera。前台最多等待 2 秒；慢摄像头超时后资源由后台任务继续持有并安全释放，期间禁止重启扫描，因此既不冻结 WPF Dispatcher，也不会并发 free/Dispose。
@@ -169,7 +169,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 | 产物 | 路径 | 说明 |
 |------|------|------|
 | 可执行文件 | `apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/AirFerry.exe` | 依赖同目录下的 `transfer_engine.dll`、`airferry_zxing.dll` + OpenCV native DLLs |
-| 发布 zip（本地） | `dist/airferry-windows-x64-v{VER}.zip` | `build-windows.ps1 -Pack` |
+| Windows 接收端 zip（本地） | `dist/airferry-receiver-windows-x64-v{VER}.zip` | `build-windows.ps1 -Pack` |
 | 发布 zip（CI） | GitHub Release asset 同名 | `windows.yml` → `windows-pack` job |
 
 > 所有本地产物均 git-ignored。分发走 GitHub Release；**默认 Windows 发版路径是 workflow**（§6）。

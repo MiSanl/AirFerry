@@ -146,13 +146,13 @@ jobs:
   # ① cargo build --features cffi → transfer_engine.dll → runtime/
   # ② CMake → airferry_zxing.dll → runtime/
   # ③ dotnet publish -r win-x64 single-file self-contained=false → publish/
-  # ④ Compress publish/ → airferry-windows-x64-v${VER}.zip
+  # ④ Compress publish/ → airferry-receiver-windows-x64-v${VER}.zip
   # ⑤ gh release upload 到 v${VER}（tag 已存在，--clobber 覆盖同名 asset）
   # 只在 workflow_dispatch + 打包后手动触发上传（避免每次 push 都发 release）。
   # 版本号与 apps/sender/package.json、build.gradle.kts、Cargo.toml、csproj 四处
   # 手动保持同步（AGENTS.md §2.7 关键依赖顺序第 5 条）。发版时改这一处即可。
   windows-pack:
-    name: Windows publish + upload to release
+    name: Windows receiver publish + upload to release
     needs: [rust-cffi, csharp-tests, windows-build]
     runs-on: windows-2022
     # 仅在手动触发时跑（不污染 push/PR）；确保质量门（前三个 job）通过。
@@ -262,17 +262,17 @@ jobs:
           # airferry_zxing.dll + OpenCV native DLLs）
           Write-Host "=== publish 内容 ==="
           Get-ChildItem $PublishDir | Select-Object Name, Length | Format-Table -AutoSize
-          $ZipName = "airferry-windows-x64-v${env:VER}.zip"
+          $ZipName = "airferry-receiver-windows-x64-v${env:VER}.zip"
           if (Test-Path $ZipName) { Remove-Item $ZipName -Force }
           Compress-Archive -Path "$PublishDir/*" -DestinationPath $ZipName
-          Write-Host "Windows 端 -> $ZipName ($((Get-Item $ZipName).Length) bytes)"
+          Write-Host "Windows 接收端 -> $ZipName ($((Get-Item $ZipName).Length) bytes)"
 
       - name: Upload to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $ZipName = "airferry-windows-x64-v${env:VER}.zip"
+          $ZipName = "airferry-receiver-windows-x64-v${env:VER}.zip"
           $Tag = "v${env:VER}"
           # Prefer an existing release tag (created when packaging sender/APK).
           # If missing, create a draft release so upload still works when Windows
@@ -283,5 +283,5 @@ jobs:
             gh release create $Tag --draft --title $Tag --notes "Windows build from CI (workflow_dispatch)"
           }
           # --clobber：覆盖同名 asset（覆盖式发布）。
-          gh release upload $Tag $ZipName --clobber
+          gh release upload $Tag "$ZipName#Windows 接收端（x64，需安装 .NET 8 Desktop Runtime）" --clobber
           Write-Host "已上传 $ZipName 到 release $Tag"

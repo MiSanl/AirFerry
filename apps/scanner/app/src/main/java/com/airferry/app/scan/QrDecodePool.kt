@@ -84,20 +84,22 @@ class QrDecodePool(
     private var multiTrackedBboxes: IntArray? = null
     private val multiTrackingLock = Any()
     /**
-     * Number of positions in the latest full-frame lock. The low-frequency
-     * discovery pass may grow it from a partial initial lock up to four. Between
-     * full-frame passes the tracker ALWAYS maintains this many slots: a code that
-     * fails to decode in one frame keeps its last-known bbox (the native side
-     * expands the window by TRACK_MARGIN next frame, tolerating motion), instead
-     * of being dropped from the tracking list and permanently lost until a full
-     * re-lock. This fixes the partial-decode shrinking bug.
+     * Number of live tracked positions. A transient miss keeps the last bbox;
+     * only [MULTI_SLOT_RETIRE_AFTER] consecutive misses retire a vanished slot.
+     * Low-frequency full-frame discovery can grow the lock back to four.
      */
     @Volatile
     private var multiLockedCount: Int = 0
+    /** Largest layout seen in this transfer; unlike live ROI count it never shrinks. */
+    private var multiDetectedCount: Int = 0
+    /** Consecutive region misses per tracked slot; used to retire vanished codes. */
+    private var multiSlotMisses = IntArray(0)
     /** Consecutive tracked-region misses in multi mode → trigger re-lock. */
     private val multiMiss = AtomicLong(0)
     /** Successful ROI scans since the last low-frequency full-frame discovery pass. */
     private val multiHotScans = AtomicLong(0)
+    /** Schedules a full-frame discovery on a later frame, never after ROI work on the same frame. */
+    private val multiDiscoveryPending = AtomicBoolean(false)
 
     /**
      * Analysis-stream sensor rotation in degrees (0/90/180/270), published by
@@ -282,10 +284,26 @@ class QrDecodePool(
         val (tracked, lockedCount) = synchronized(multiTrackingLock) {
             multiTrackedBboxes to multiLockedCount
         }
-        // Hot path whenever a lock exists. We track `lockedCount` slots (fixed
-        // since the first lock), NOT results.size — a partial decode must keep
-        // hinting all original positions next frame.
+        // Hot path whenever a lock exists. A partial decode keeps unmatched
+        // positions until their consecutive-miss retirement threshold.
         if (tracked != null && lockedCount > 0) {
+            // A discovery frame REPLACES the region pass. 1.1.4 decoded every
+            // tracked ROI first and then decoded the entire 1080p frame again;
+            // single-code and temporarily missing-code streams paid that double
+            // cost forever. Claim the pending scan atomically so only one worker
+            // performs it, and let the other frames stay on the cheap ROI path.
+            if (lockedCount < MAX_MULTI_CODES &&
+                multiDiscoveryPending.compareAndSet(true, false)
+            ) {
+                val discovered = decodeMultiFull(frame)
+                if (discovered.isNotEmpty()) {
+                    seedTrackedSlots(discovered)
+                    multiMiss.set(0)
+                } else {
+                    multiMiss.incrementAndGet()
+                }
+                return discovered
+            }
             val buf = try {
                 ZxingDecoder.decodeMultiYTracked(
                     frame.y, frame.width, frame.height, frame.rowStride,
@@ -308,13 +326,10 @@ class QrDecodePool(
                 // never runs and throughput stays at 1/4 forever. Until all four
                 // slots are known, pay for one discovery scan every few hot-path
                 // frames; once locked at four this branch disappears entirely.
-                val discoveryDue = lockedCount < MAX_MULTI_CODES &&
+                if (lockedCount < MAX_MULTI_CODES &&
                     multiHotScans.incrementAndGet() % MULTI_DISCOVERY_EVERY == 0L
-                if (!discoveryDue) return results
-                val discovered = decodeMultiFull(frame)
-                if (discovered.size > lockedCount) {
-                    seedTrackedSlots(discovered)
-                    return discovered
+                ) {
+                    multiDiscoveryPending.set(true)
                 }
                 return results
             }
@@ -326,8 +341,8 @@ class QrDecodePool(
         // Cold path: full-frame scan, seeds/re-seeds the tracker.
         val results = decodeMultiFull(frame)
         if (results.isNotEmpty()) {
-            // Seed the fixed slot count from a full-frame lock. Subsequent frames
-            // maintain exactly this many slots regardless of partial decodes.
+            // Seed the slot count from a full-frame lock. Transient partial
+            // region decodes retain slots; long-lived absences retire them.
             seedTrackedSlots(results)
             multiMiss.set(0)
         } else {
@@ -351,8 +366,8 @@ class QrDecodePool(
 
     /**
      * Seed the tracker from a full-frame decode. A later discovery pass may grow
-     * the slot count, while partial ROI decodes only update positions and never
-     * shrink it.
+     * the slot count. One partial full-frame read never shrinks the current lock;
+     * sustained per-slot ROI misses handle retirement instead.
      */
     private fun seedTrackedSlots(results: List<ZxingDecoder.MultiResult>) {
         if (results.isEmpty()) return
@@ -371,7 +386,10 @@ class QrDecodePool(
             if (results.size < multiLockedCount) return
             multiTrackedBboxes = packed
             multiLockedCount = results.size
+            multiDetectedCount = maxOf(multiDetectedCount, results.size).coerceAtMost(MAX_MULTI_CODES)
+            multiSlotMisses = IntArray(results.size)
             multiHotScans.set(0)
+            multiDiscoveryPending.set(false)
         }
     }
 
@@ -379,11 +397,9 @@ class QrDecodePool(
      * Update the tracked slots from a region decode. Each freshly decoded bbox
      * is matched to its nearest current slot (by center distance — the codes are
      * on a fixed screen grid, so the nearest slot is the same physical code) and
-     * that slot's position is refreshed. Slots with no match (codes that missed
-     * this frame) KEEP their last bbox, so they're hinted again next frame with
-     * only the native TRACK_MARGIN expansion compensating for motion. This is the
-     * fix for the partial-decode shrinking bug: a transient miss no longer drops
-     * a code from the tracking list.
+     * that slot's position is refreshed. Slots with no match keep their last bbox
+     * for transient blur/motion, then retire after a sustained miss run so an
+     * absent tile no longer consumes one failed native decode on every frame.
      */
     private fun updateTrackedSlots(results: List<ZxingDecoder.MultiResult>) {
         synchronized(multiTrackingLock) {
@@ -394,6 +410,11 @@ class QrDecodePool(
                 return
             }
             val updated = old.copyOf()  // preserve stale slots for unmatched codes
+            val misses = if (multiSlotMisses.size == n) {
+                multiSlotMisses.copyOf()
+            } else {
+                IntArray(n)
+            }
             // Track which slots have been claimed to avoid double-updating one slot.
             val claimed = BooleanArray(n)
             for (r in results) {
@@ -413,13 +434,38 @@ class QrDecodePool(
                 }
                 if (bestSlot >= 0) {
                     claimed[bestSlot] = true
+                    misses[bestSlot] = 0
                     updated[bestSlot * 4] = b[0]
                     updated[bestSlot * 4 + 1] = b[1]
                     updated[bestSlot * 4 + 2] = b[2]
                     updated[bestSlot * 4 + 3] = b[3]
                 }
             }
-            multiTrackedBboxes = updated
+            for (slot in 0 until n) {
+                if (!claimed[slot]) misses[slot]++
+            }
+
+            // A vanished tile otherwise remains an expensive failed ROI forever.
+            // Retire it only after a long consecutive miss run; low-frequency
+            // full-frame discovery can add it back when it reappears.
+            val kept = (0 until n).filter { misses[it] < MULTI_SLOT_RETIRE_AFTER }
+            if (kept.isNotEmpty() && kept.size < n) {
+                val compact = IntArray(kept.size * 4)
+                val compactMisses = IntArray(kept.size)
+                for ((dst, src) in kept.withIndex()) {
+                    for (coordinate in 0 until 4) {
+                        compact[dst * 4 + coordinate] = updated[src * 4 + coordinate]
+                    }
+                    compactMisses[dst] = misses[src]
+                }
+                multiTrackedBboxes = compact
+                multiLockedCount = kept.size
+                multiSlotMisses = compactMisses
+                multiHotScans.set(0)
+            } else {
+                multiTrackedBboxes = updated
+                multiSlotMisses = misses
+            }
         }
     }
 
@@ -601,7 +647,25 @@ class QrDecodePool(
     fun snapshotMultiBboxes(): IntArray? = synchronized(multiTrackingLock) {
         multiTrackedBboxes?.copyOf()
     }
-    fun snapshotMultiCount(): Int = synchronized(multiTrackingLock) { multiLockedCount }
+    /** Layout count for UI mapping; preserves multi mode after vanished ROIs retire. */
+    fun snapshotMultiCount(): Int = synchronized(multiTrackingLock) {
+        maxOf(multiLockedCount, multiDetectedCount)
+    }
+
+    /** Forget ROI locks between transfers so the next sender starts from a clean full-frame scan. */
+    fun resetTracking() {
+        lastQrBbox = null
+        roiMiss.set(0)
+        synchronized(multiTrackingLock) {
+            multiTrackedBboxes = null
+            multiLockedCount = 0
+            multiDetectedCount = 0
+            multiSlotMisses = IntArray(0)
+            multiMiss.set(0)
+            multiHotScans.set(0)
+            multiDiscoveryPending.set(false)
+        }
+    }
 
     /**
      * Run [action] while holding the ingest lock, so it cannot overlap any
@@ -640,6 +704,8 @@ class QrDecodePool(
         private const val MULTI_FULL_DECODE_EVERY = 3L
         /** While fewer than four positions are known, periodically discover missing tiles. */
         private const val MULTI_DISCOVERY_EVERY = 30L
+        /** Retire a tracked tile after this many consecutive region misses. */
+        private const val MULTI_SLOT_RETIRE_AFTER = 60
         private const val MAX_MULTI_CODES = 4
         /**
          * Max decoded symbols a worker accumulates before flushing them to the

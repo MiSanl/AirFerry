@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.WindowManager
 import android.widget.Toast
 import android.util.Log
@@ -44,11 +45,13 @@ import androidx.core.content.ContextCompat
 import com.airferry.app.nativelib.NativeBridge
 import com.airferry.app.scan.BundleParser
 import com.airferry.app.scan.QrDecodePool
+import com.airferry.app.scan.QrPresence
 import com.airferry.app.scan.QrStreamAnalyzer
 import com.airferry.app.scan.ReceiverSessionManager
 import com.airferry.app.scan.TextParser
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.delay
 
 // Design tokens
 private val BgDark = Color(0xFF0F172A)
@@ -105,9 +108,9 @@ class ScanActivity : ComponentActivity() {
         val fileSize: Long = 0,
         val complete: Boolean = false,
         val jniReady: Boolean = false,
-        /**         Snapshot of per-code activity timestamps for the code-status row. */
+        /** Snapshot of per-code activity timestamps for the code-status row. */
         val codeActivitySnapshot: Map<Int, Long> = emptyMap(),
-        /** How many QR codes the decoder is tracking (0/1/4). */
+        /** Largest QR layout detected for this transfer (0/1/2–4). */
         val multiCodeCount: Int = 0,
         /** Elapsed transfer time in ms (0 = not started yet). */
         val transferElapsedMs: Long = 0,
@@ -124,21 +127,19 @@ class ScanActivity : ComponentActivity() {
     //
     // For a multi-QR sender we show, in the bottom info card, whether each
     // on-screen code is actively delivering symbols. A code is mapped to a fixed
-    // grid slot by [gridSlotOf] (single-code → center slot, multi-code → one of
-    // four 2×2 slots). We record the last wall-clock ms each slot ACCEPTED a new
-    // RaptorQ symbol; the UI compares that against now to label the code
+    // grid slot by [QrPresence.slotOf] (single-code → center slot, multi-code → one of
+    // four 2×2 slots). We record the last wall-clock ms each slot decoded a valid
+    // AirFerry frame; the UI compares that against now to label the code
     // "receiving" (within [CODE_ACTIVE_MS]) / "paused" (seen before but stale) /
     // "unseen" (multi-code slots that never fired). This replaces the old
     // positional spark overlay, which was hard to land accurately.
 
     /**
-     * Map of grid slot → last-accepted-symbol wall-clock ms. Written on the
+     * Map of grid slot → last-decoded-frame wall-clock ms. Written on the
      * ingest worker under [codeActivityLock]; read + snapshot on the UI tick.
      */
     private val codeActivityLock = Any()
     private val codeActivity = HashMap<Int, Long>()
-    /** Reactive snapshot of [codeActivity] consumed by Compose. */
-    private val codeActivityState = mutableStateOf<Map<Int, Long>>(emptyMap())
 
     private val recoveryStage = mutableStateOf<String?>(null)
     /** Wall-clock ms when the transfer first started (totalSymbols > 0). */
@@ -192,6 +193,16 @@ class ScanActivity : ComponentActivity() {
     private fun ScanScreen() {
         val state by uiState
         val recovery by recoveryStage
+        var presenceNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+        // Presence must expire even when decoding stops completely. Calling
+        // currentTimeMillis() only from codeStatusString is not reactive, so the
+        // old UI could leave a vanished QR marked active forever.
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(CODE_STATUS_TICK_MS)
+                presenceNowMs = SystemClock.elapsedRealtime()
+            }
+        }
 
         BoxWithConstraints(modifier = Modifier.fillMaxSize().background(BgDark)) {
 
@@ -256,8 +267,15 @@ class ScanActivity : ComponentActivity() {
                             }
                             InfoRow("已识别符号", "${state.receivedSymbols} / ${state.totalSymbols}")
                             InfoRow("解码速率", "${state.decodePerSec} 符号/秒")
-                            InfoRow("二维码", codeStatusString(
-                                state.codeActivitySnapshot, state.multiCodeCount))
+                            InfoRow(
+                                "二维码",
+                                QrPresence.statusString(
+                                    state.codeActivitySnapshot,
+                                    state.multiCodeCount,
+                                    presenceNowMs,
+                                    CODE_ACTIVE_MS,
+                                ),
+                            )
                             // 传输用时 + 近几秒滑动窗口速度（非全程平均）
                             if (state.transferElapsedMs > 0) {
                                 val elapsedStr = formatDuration(state.transferElapsedMs)
@@ -371,58 +389,6 @@ class ScanActivity : ComponentActivity() {
                 modifier = Modifier.weight(1f)
             )
         }
-    }
-
-    /** How long (ms) since the last decoded symbol before a code is considered "paused".
-     *  5s gives a very stable display even on intermittent multi-code decode rates. */
-    private val CODE_ACTIVE_MS = 5000L
-
-    /**
-     * Build a compact per-code status string for the info card.
-     *
-     * Each grid slot's last-activity timestamp is compared against [CODE_ACTIVE_MS]
-     * to determine: "●" (active, within threshold), "○" (paused, seen but stale),
-     * or "·" (unseen, never received a symbol).
-     *
-     * [multiCount] comes from the decode pool's tracker. ≤ 1 = single-code mode;
-     * ≥ 2 = multi-code mode.  An important safety net: if the pool occasionally
-     * reports count=1 while slot 0–3 have already received symbols, the function
-     * forces multi-code mode — so the display never flips back to "单码" mid-transfer.
-     */
-    private fun codeStatusString(activity: Map<Int, Long>, multiCount: Int): String {
-        if (activity.isEmpty()) return "等待扫描…"
-        val now = System.currentTimeMillis()
-
-        val codeActive = { slot: Int ->
-            val last = activity[slot]
-            when {
-                last == null -> "·"           // unseen
-                now - last < CODE_ACTIVE_MS -> "●"  // active
-                else -> "○"                  // paused
-            }
-        }
-
-        // Safety net: if any real grid slot (0–3) has activity, the decoder IS
-        // tracking multiple codes. Never revert to single-code mode even if the
-        // pool's snapshotMultiCount() temporarily dips to 1.
-        val hasRealSlot = activity.keys.any { it >= 0 }
-        val effectiveCount = if (hasRealSlot) {
-            maxOf(multiCount, activity.keys.count { it >= 0 }).coerceIn(2, 4)
-        } else {
-            multiCount
-        }
-
-        // Single-code mode: only the center slot.
-        if (effectiveCount <= 1) {
-            val dot = codeActive(SLOT_CENTER)
-            return if (dot == "·") "等待扫描…" else "$dot ${if (dot == "●") "活跃" else "暂停"}"
-        }
-
-        // Multi-code mode: always show all 4 slots (①②③④) so the display
-        // length never changes regardless of how many codes the tracker sees.
-        val labels = arrayOf("①", "②", "③", "④")
-        val parts = List(4) { i -> "${labels[i]}${codeActive(i)}" }
-        return parts.joinToString(" ")
     }
 
     @Composable
@@ -571,33 +537,39 @@ class ScanActivity : ComponentActivity() {
     /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot.
      *
      *  [bbox] is the decoded code's {minX,minY,maxX,maxY} in analysis-stream
-     *  pixel coords (null on the legacy single-code path). When the receiver
-     *  *accepts* the symbol as new (RaptorQ dedup passed), the code's activity
-     *  timestamp is recorded for the per-code status indicator. */
+     *  pixel coords (null on the legacy single-code path). A syntactically valid
+     *  AirFerry frame refreshes the code's presence before descriptor gating or
+     *  RaptorQ duplicate handling. */
     private fun handleFrameAsync(payload: ByteArray, bbox: IntArray?) {
         // After completion, drop further frames: the main thread is (or will be)
         // calling assemble() on the receiver, which must not run concurrently
         // with another ingest. This runs under the pool's ingest lock, so the
         // check+ingest+stop sequence is atomic w.r.t. other workers.
         if (ingestStopped.get()) return
-        // ingest() returns a lightweight status (no JSON) so the per-frame path
-        // stays cheap; the full progress is fetched only on the throttled UI tick.
-        val status = session.ingest(payload) ?: return
-
-        // Record this code's last-decoded timestamp (keyed by grid slot) so the
-        // info card can show per-code status (active / paused / unseen).  We
-        // track EVERY decoded frame, not just accepted symbols — once a block
-        // is fully decoded, subsequent symbols are RaptorQ-duplicate-rejected
-        // (not "accepted") but the code is still being actively scanned.
+        // Presence describes a physically decoded AirFerry QR, not whether the
+        // receiver happened to accept it. Before the first descriptor, valid
+        // data frames intentionally make ingest() return null; recording only
+        // after ingest therefore falsely marked those visible tiles as absent.
+        if (session.parseHeader(payload) == null) return
         if (bbox != null) {
             val pool = decodePool
             if (pool != null) {
-                val slot = gridSlotOf(bbox, pool)
+                val (width, height) = pool.snapshotAnalysisSize()
+                val slot = QrPresence.slotOf(
+                    bbox,
+                    width,
+                    height,
+                    pool.snapshotAnalysisRotation(),
+                    pool.snapshotMultiCount(),
+                )
                 synchronized(codeActivityLock) {
-                    codeActivity[slot] = System.currentTimeMillis()
+                    codeActivity[slot] = SystemClock.elapsedRealtime()
                 }
             }
         }
+        // ingest() returns a lightweight status (no JSON) so the per-frame path
+        // stays cheap; the full progress is fetched only on the throttled UI tick.
+        val status = session.ingest(payload) ?: return
 
         // UI refresh throttle: ~7 Hz is plenty for a progress bar, and keeps the
         // main thread free. Always let the final "complete" frame through.
@@ -738,9 +710,6 @@ class ScanActivity : ComponentActivity() {
                 recentWireBps = recentWireBps,
             )
         }
-
-        // Update codeActivityState for any Compose bindings that read it directly.
-        codeActivityState.value = snapshotMap
 
         if (handleCompletion && progress.complete && !completedHandled) {
             completedHandled = true
@@ -953,6 +922,7 @@ class ScanActivity : ComponentActivity() {
             ingestStopped.set(false)
         }
         decodePool?.runExclusive(swap) ?: swap()
+        decodePool?.resetTracking()
         completedHandled = false
         lastUiUpdate = 0
         rateSamples.clear()
@@ -960,7 +930,6 @@ class ScanActivity : ComponentActivity() {
         recentWireBps = 0L
         // Clear per-code activity state.
         synchronized(codeActivityLock) { codeActivity.clear() }
-        codeActivityState.value = emptyMap()
         transferStartMs = 0L
         recoveryStage.value = null
         updateUi {
@@ -985,41 +954,6 @@ class ScanActivity : ComponentActivity() {
         runOnUiThread { recoveryStage.value = null }
     }
 
-    /**
-     * Snap a decoded code's bbox to a grid slot for per-code status tracking.
-     *
-     * Returns:
-     *  - [SLOT_CENTER] (-1) for a single on-screen code.
-     *  - 0..3 for a multi-code grid (2×2): the code's bbox center decides which
-     *    quadrant of the analysis frame it sits in.
-     *
-     * Quadrant → slot index (in normalized upright-image space):
-     *   left/right = bbox center X vs frame mid; top/bottom = center Y vs mid.
-     *   0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right.
-     */
-    private fun gridSlotOf(bbox: IntArray, pool: QrDecodePool): Int {
-        val count = pool.snapshotMultiCount()
-        // Single code (or tracker not yet locked) → center slot.
-        if (count <= 1) return SLOT_CENTER
-        val (aw, ah) = pool.snapshotAnalysisSize()
-        if (aw <= 0 || ah <= 0) return SLOT_CENTER
-        // Use the bbox CENTER (robust to perspective corner overshoot) relative
-        // to the analysis-frame midpoint to pick a quadrant. We compare against
-        // raw analysis coords (not the rotated mapping) because a 90° rotation
-        // only swaps axes — the left/right + top/bottom partition of the frame
-        // is preserved, which is all we need to pick a grid slot.
-        val cxRaw = (bbox[0].toFloat() + bbox[2].toFloat()) * 0.5f
-        val cyRaw = (bbox[1].toFloat() + bbox[3].toFloat()) * 0.5f
-        val right = cxRaw > aw * 0.5f
-        val bottom = cyRaw > ah * 0.5f
-        return when {
-            !right && !bottom -> 0   // top-left
-            right && !bottom -> 1    // top-right
-            !right && bottom -> 2    // bottom-left
-            else -> 3                // bottom-right
-        }
-    }
-
     // slotScreenPos 已移除（火花动画已删除）。
 
     // refreshOverlay / dedupeSparksBySlot 已移除（火花动画已删除）。
@@ -1033,13 +967,13 @@ class ScanActivity : ComponentActivity() {
                 ingestStopped.set(false)
             }
             decodePool?.runExclusive(swap) ?: swap()
+            decodePool?.resetTracking()
             completedHandled = false
             lastUiUpdate = 0
             rateSamples.clear()
             decodePerSec = 0
             recentWireBps = 0L
             synchronized(codeActivityLock) { codeActivity.clear() }
-            codeActivityState.value = emptyMap()
             transferStartMs = 0L
             recoveryStage.value = null
             updateUi { UiState(jniReady = true, statusText = "就绪 — 对准二维码…") }
@@ -1075,8 +1009,10 @@ class ScanActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ScanActivity"
-        /** Slot index for a single on-screen code (used by gridSlotOf). */
-        private const val SLOT_CENTER = -1
+        /** A tile becomes paused shortly after its last successful decode. */
+        private const val CODE_ACTIVE_MS = 2_000L
+        /** Recompose the presence row even when the camera yields no QR at all. */
+        private const val CODE_STATUS_TICK_MS = 250L
         /**
          * Sliding window for decode rate + wire throughput shown in the info card.
          * ~3s is responsive enough to feel "live" without jittering every tick.
