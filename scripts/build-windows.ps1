@@ -108,7 +108,7 @@ if ($Pack) {
 
     $DistDir = "$Root/dist"
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-    $ZipName = "airferry-receiver-windows-x64-v$Ver.zip"
+    $ZipName = "airferry-windows-x64-v$Ver.zip"
     $ZipPath = "$DistDir/$ZipName"
     if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
     Compress-Archive -Path "$PublishDir/*" -DestinationPath $ZipPath

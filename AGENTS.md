@@ -239,18 +239,18 @@ npm run preview        # 本地预览构建产物
 
 ### 2.8 产物格式与命名规范
 
-发布归档（`dist/`）的命名格式 = `airferry-{端}-{平台}-v{版本}.{扩展}`：
+发布归档沿用历史稳定格式 `airferry-{组件及变体}-v{版本}.{扩展}`。角色（发送端/接收端）、系统要求和架构写在 Release 资产标签与说明中，不额外插入文件名，以免破坏既有下载链接和自动化约定：
 
 | 产物 | 命名格式 | 格式说明 |
 |------|---------|---------|
-| Android 接收端 APK | `airferry-receiver-android-arm64-v{VER}.apk` | 文件名明确标识为接收端和 arm64 架构；arm64-v8a 单 ABI；Android 10+（minSdk 29）；必须用 `apps/scanner/keystore.properties` 指向的 release keystore 签名；缺失时 release 构建失败，打包还会用 `apksigner` 拒绝 debug/无效签名 |
-| Windows 接收端 zip | `airferry-receiver-windows-x64-v{VER}.zip` | 明确标识为接收端，避免与浏览器/网页发送端混淆；x64 单架构；Windows 10+；`dotnet publish` 单文件 + 框架依赖（目标机须装 .NET 8 Desktop Runtime）；内含 `AirFerry.exe` + `transfer_engine.dll` + `airferry_zxing.dll` + OpenCV native DLLs。**只能在 Windows 上构建**（WPF TFM） |
+| Android 接收端 APK | `airferry-android-v{VER}.apk` | arm64-v8a 单 ABI；Android 10+（minSdk 29）；必须用 `apps/scanner/keystore.properties` 指向的 release keystore 签名；缺失时 release 构建失败，打包还会用 `apksigner` 拒绝 debug/无效签名 |
+| Windows 接收端 zip | `airferry-windows-x64-v{VER}.zip` | x64 单架构；Windows 10+；`dotnet publish` 单文件 + 框架依赖（目标机须装 .NET 8 Desktop Runtime）；内含 `AirFerry.exe` + `transfer_engine.dll` + `airferry_zxing.dll` + OpenCV native DLLs。**只能在 Windows 上构建**（WPF TFM） |
 | Chrome MV3 | `airferry-sender-chrome-mv3-v{VER}.crx` + `.zip` | `.crx` = Cr24 签名格式（Chrome 96+/Edge 96+，现代 WASM externref）；`.zip` = 解压目录打包回退 |
 | Chrome MV2 | `airferry-sender-chrome-mv2-v{VER}.crx` + `.zip` | 同上，旧版兼容 |
 | Firefox MV3 | `airferry-sender-firefox-mv3-v{VER}.xpi` | Firefox 116+；`.xpi` 本质是 zip 改名 |
 | Firefox MV2 | `airferry-sender-firefox-mv2-v{VER}.xpi` | Firefox 91+ |
-| 网页发送端 | `airferry-sender-web-v{VER}.zip` | 文件名明确标识为发送端；纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。`pack_dist` 自动打包（须先跑 `build-all.sh web` 产出 `apps/web/dist/`，缺失时 warn 跳过） |
-| 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | 文件名明确标识为发送端；**单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `cd apps/web && npm run build:standalone` 产出（`dist-standalone/index.html` → 改名）。不进 `pack_dist`（与静态站点 zip 不同，单文件是 `.html` 无需 zip），手动上传 Release |
+| 网页发送端 | `airferry-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。`pack_dist` 自动打包（须先跑 `build-all.sh web` 产出 `apps/web/dist/`，缺失时 warn 跳过） |
+| 网页发送端单文件 | `airferry-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `cd apps/web && npm run build:standalone` 产出（`dist-standalone/index.html` → 改名）。不进 `pack_dist`（与静态站点 zip 不同，单文件是 `.html` 无需 zip），手动上传 Release |
 
 **扩展产物内部结构**（每个 `*-prod/` 目录）：
 - `manifest.json`——由 `scripts/fix-manifest.cjs` 后处理：复制真实 RGBA 图标覆盖 Plasmo 占位图、MV2 删 `action` 留 `browser_action` 并把 CSP 改为 `wasm-eval`、Firefox 补 `browser_specific_settings.gecko.id = airferry@airferry.app`、修补 HTML `<title>`
@@ -289,7 +289,7 @@ npm run preview        # 本地预览构建产物
 1. 把上表版本（含 `windows.yml` 的 `VER`）改到目标版本（如 `1.1.1`），提交并推 `main`。
 2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`（若尚无 tag，workflow 会 **draft** 创建，之后可补 notes/其它 asset）。
 3. GitHub → Actions → **windows** → **Run workflow**（`workflow_dispatch`）。
-4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset，资产标签明确写“Windows 接收端”）。
+4. 跑完后 Release 上应有 `airferry-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset，资产标签明确写“Windows 接收端”）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
 

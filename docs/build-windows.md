@@ -54,7 +54,7 @@ cmake --version           # ≥ 3.22
 2. 拷贝 DLL 到 `apps/windows/AirFerry.Windows/runtime/transfer_engine.dll`
 3. CMake 配置/编译共享 ZXing-C++ → CTest → 拷贝 `airferry_zxing.dll` 到同一 `runtime/`
 4. `dotnet restore` + `dotnet build -c Release`（或 `-Pack` 时 `dotnet publish`）
-5. （`-Pack` 时）压缩发布目录到 `dist/airferry-receiver-windows-x64-v{VER}.zip`
+5. （`-Pack` 时）压缩发布目录到 `dist/airferry-windows-x64-v{VER}.zip`
 
 > 也可以用 bash 入口（Git Bash/WSL 下）：`./scripts/build-all.sh windows`。逻辑等价，但 PowerShell 是 Windows 上的首选。
 
@@ -127,7 +127,7 @@ workflow_dispatch（手动）且上述三 job 成功
        CMake/MSVC 构建共享 ZXing-C++ + CTest
        拷贝 airferry_zxing.dll → apps/windows/AirFerry.Windows/runtime/
        dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
-       Compress-Archive → airferry-receiver-windows-x64-v${VER}.zip
+       Compress-Archive → airferry-windows-x64-v${VER}.zip
        gh release upload v${VER} … --clobber
        （若 tag/release 不存在则 gh release create --draft）
 ```
@@ -169,7 +169,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 | 产物 | 路径 | 说明 |
 |------|------|------|
 | 可执行文件 | `apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/AirFerry.exe` | 依赖同目录下的 `transfer_engine.dll`、`airferry_zxing.dll` + OpenCV native DLLs |
-| Windows 接收端 zip（本地） | `dist/airferry-receiver-windows-x64-v{VER}.zip` | `build-windows.ps1 -Pack` |
+| Windows 接收端 zip（本地） | `dist/airferry-windows-x64-v{VER}.zip` | `build-windows.ps1 -Pack` |
 | 发布 zip（CI） | GitHub Release asset 同名 | `windows.yml` → `windows-pack` job |
 
 > 所有本地产物均 git-ignored。分发走 GitHub Release；**默认 Windows 发版路径是 workflow**（§6）。
