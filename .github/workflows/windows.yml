@@ -78,7 +78,9 @@ jobs:
   # 不在此 job 跑 dotnet test（协议层测试已在 csharp-tests job 跑过，避免重复）。
   windows-build:
     name: Windows build (WPF + native DLLs)
-    runs-on: windows-latest
+    # CMake explicitly targets the VS 2022 generator; pin the matching runner
+    # instead of following windows-latest to images that may omit VS 2022.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -152,7 +154,7 @@ jobs:
   windows-pack:
     name: Windows publish + upload to release
     needs: [rust-cffi, csharp-tests, windows-build]
-    runs-on: windows-latest
+    runs-on: windows-2022
     # 仅在手动触发时跑（不污染 push/PR）；确保质量门（前三个 job）通过。
     if: github.event_name == 'workflow_dispatch'
     permissions:

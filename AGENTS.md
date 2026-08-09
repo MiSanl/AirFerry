@@ -281,8 +281,8 @@ npm run preview        # 本地预览构建产物
 |-----|--------|------|------|
 | `rust-cffi` | ubuntu | push/PR（core/windows 路径）+ `workflow_dispatch` | `cargo test/build --features cffi` |
 | `csharp-tests` | ubuntu | 同上 | `dotnet test` 协议层及 packed QR 结果解析（不加载 native DLL） |
-| `windows-build` | windows-latest | 同上 | cargo + CMake/CTest 生成两个 native DLL → `dotnet build` WPF |
-| `windows-pack` | windows-latest | **仅** `workflow_dispatch`（且前三 job 通过） | 重建两个 native DLL → `dotnet publish` 单文件 → zip → Release |
+| `windows-build` | windows-2022 | 同上 | cargo + CMake/CTest 生成两个 native DLL → `dotnet build` WPF；固定 runner 以匹配 VS 2022 CMake generator |
+| `windows-pack` | windows-2022 | **仅** `workflow_dispatch`（且前三 job 通过） | 重建两个 native DLL → `dotnet publish` 单文件 → zip → Release |
 
 **发版步骤（Windows 端）**：
 

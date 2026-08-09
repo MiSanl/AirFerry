@@ -118,7 +118,7 @@ macOS/Linux 无法编 WPF。正式 Windows 产物用 [`.github/workflows/windows
 
 ```text
 push/PR（core/** 或 apps/windows/**）
-  → rust-cffi (ubuntu) + csharp-tests (ubuntu) + windows-build (windows-latest)
+  → rust-cffi (ubuntu) + csharp-tests (ubuntu) + windows-build (windows-2022)
 
 workflow_dispatch（手动）且上述三 job 成功
   → windows-pack：
