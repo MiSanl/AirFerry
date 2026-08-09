@@ -50,16 +50,16 @@
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-android-v1.1.4.apk` | 接收端-Android-arm64-v8a |
-| `airferry-windows-x64-v1.1.4.zip` | 接收端-Windows-x64 |
-| `airferry-sender-chrome-mv3-v1.1.4.crx` | 发送端-Chrome/Edge-MV3已签名 |
-| `airferry-sender-chrome-mv3-v1.1.4.zip` | 发送端-Chrome/Edge-MV3解压加载 |
-| `airferry-sender-chrome-mv2-v1.1.4.crx` | 发送端-Chrome/Edge-MV2已签名 |
-| `airferry-sender-chrome-mv2-v1.1.4.zip` | 发送端-Chrome/Edge-MV2解压加载 |
-| `airferry-sender-firefox-mv3-v1.1.4.xpi` | 发送端-Firefox-MV3扩展 |
-| `airferry-sender-firefox-mv2-v1.1.4.xpi` | 发送端-Firefox-MV2扩展 |
-| `airferry-web-v1.1.4.zip` | 发送端-网页-静态站点 |
-| `airferry-web-standalone-v1.1.4.html` | 发送端-网页-单文件 |
+| `airferry-sender-chrome-mv3-v1.1.4.crx` | 发送端-Chrome/Edge-MV3.crx |
+| `airferry-sender-chrome-mv3-v1.1.4.zip` | 发送端-Chrome/Edge-MV3.zip |
+| `airferry-sender-chrome-mv2-v1.1.4.crx` | 发送端-Chrome/Edge-MV2.crx |
+| `airferry-sender-chrome-mv2-v1.1.4.zip` | 发送端-Chrome/Edge-MV2.zip |
+| `airferry-sender-firefox-mv3-v1.1.4.xpi` | 发送端-Firefox-MV3.xpi |
+| `airferry-sender-firefox-mv2-v1.1.4.xpi` | 发送端-Firefox-MV2.xpi |
+| `airferry-web-v1.1.4.zip` | 发送端-web-静态站点.zip |
+| `airferry-web-standalone-v1.1.4.html` | 发送端-web-单文件.html |
+| `airferry-android-v1.1.4.apk` | 接收端-Android-arm64-v8a.apk |
+| `airferry-windows-x64-v1.1.4.zip` | 接收端-Windows-x64.zip |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 

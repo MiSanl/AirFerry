@@ -433,7 +433,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// Per-frame ingest callback (runs under <see cref="QrDecodePool.IngestLock"/>).
     /// Returns true when this symbol completes recovery.
     /// </summary>
-    private bool OnDecoded(byte[] payload, int[]? _)
+    private bool OnDecoded(byte[] payload, int[]? unusedBbox)
     {
         QrDecodePool? pool = _pool;
         ReceiverSession? session = _session;
