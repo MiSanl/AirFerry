@@ -94,6 +94,13 @@ if ($Pack) {
 
     if (-not (Test-Path $PublishDir)) { Fail "未找到发布产物: $PublishDir" }
     foreach ($RequiredDll in @("transfer_engine.dll", "airferry_zxing.dll")) {
+        $RuntimeDll = "$RuntimeDir/$RequiredDll"
+        if (-not (Test-Path $RuntimeDll)) {
+            Fail "runtime 目录缺少 native 依赖: $RequiredDll"
+        }
+        # 显式放到单文件 exe 同目录，避免 SDK 默认 item glob / publish 规则变化
+        # 造成 P/Invoke DLL 静默漏包。
+        Copy-Item $RuntimeDll "$PublishDir/$RequiredDll" -Force
         if (-not (Test-Path "$PublishDir/$RequiredDll")) {
             Fail "发布目录缺少 native 依赖: $RequiredDll"
         }

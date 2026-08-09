@@ -37,16 +37,22 @@
          decoder. scripts/build-windows.ps1 (or build-all.sh windows) places
          both in runtime/. Loading is deferred to their managed bridges so a
          missing DLL produces a user-facing startup error. -->
-    <None Update="runtime\transfer_engine.dll">
+    <!-- Generated DLLs are excluded from the SDK's default None glob. Add
+         them explicitly and flatten them next to AirFerry.exe. -->
+    <None Remove="runtime\transfer_engine.dll" />
+    <None Remove="runtime\airferry_zxing.dll" />
+    <Content Include="runtime\transfer_engine.dll" Condition="Exists('runtime\transfer_engine.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
-    </None>
-    <None Update="runtime\airferry_zxing.dll">
+      <TargetPath>transfer_engine.dll</TargetPath>
+    </Content>
+    <Content Include="runtime\airferry_zxing.dll" Condition="Exists('runtime\airferry_zxing.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
-    </None>
+      <TargetPath>airferry_zxing.dll</TargetPath>
+    </Content>
   </ItemGroup>
 
 </Project>

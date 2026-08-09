@@ -247,6 +247,13 @@ jobs:
           $PublishDir = $publishDirs[-1].FullName
           Write-Host "=== publish 目录: $PublishDir ==="
           foreach ($required in @("transfer_engine.dll", "airferry_zxing.dll")) {
+            $runtimeDll = Join-Path "apps/windows/AirFerry.Windows/runtime" $required
+            if (-not (Test-Path $runtimeDll)) {
+              throw "runtime native dependency missing before packaging: $required"
+            }
+            # Keep packaging independent of SDK item-glob details and ensure
+            # P/Invoke dependencies sit beside the single-file executable.
+            Copy-Item $runtimeDll (Join-Path $PublishDir $required) -Force
             if (-not (Test-Path (Join-Path $PublishDir $required))) {
               throw "publish output missing native dependency: $required"
             }
