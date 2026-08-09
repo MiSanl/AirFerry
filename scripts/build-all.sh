@@ -13,15 +13,15 @@ set -euo pipefail
 #   ./scripts/build-all.sh release      # 构建 + 打包到 dist/（发送 crx/xpi/zip + APK）
 #
 # 产物（dist/，均 git-ignored，通过 GitHub Release 分发）:
-#   airferry-android-v<VER>.apk                  Android 接收端 APK
-#   airferry-windows-x64-v<VER>.zip              Windows 接收端（WPF + Rust/ZXing-C++ DLL + OpenCV）
+#   airferry-receiver-android-arm64-v<VER>.apk  Android 接收端 APK
+#   airferry-receiver-windows-x64-v<VER>.zip    Windows 接收端（WPF + Rust/ZXing-C++ DLL + OpenCV）
 #   airferry-sender-chrome-mv3-v<VER>.crx       Chrome/Edge MV3（已签名 Cr24）
 #   airferry-sender-chrome-mv3-v<VER>.zip       Chrome/Edge MV3（解压加载回退）
 #   airferry-sender-chrome-mv2-v<VER>.crx       Chrome/Edge MV2（已签名 Cr24）
 #   airferry-sender-chrome-mv2-v<VER>.zip
 #   airferry-sender-firefox-mv3-v<VER>.xpi      Firefox MV3（zip→xpi）
 #   airferry-sender-firefox-mv2-v<VER>.xpi
-#   airferry-web-v<VER>.zip                       网页发送端静态站点
+#   airferry-sender-web-v<VER>.zip              网页发送端静态站点
 #   airferry-extension.pem                      Chrome 签名私钥（首次自动生成）
 #
 # 版本号取自 apps/sender/package.json，与扩展 manifest 一致。
@@ -272,8 +272,8 @@ pack_dist() {
   local apk_src="$ROOT/apps/scanner/app/build/outputs/apk/release/app-release.apk"
   [[ -f "$apk_src" ]] || error "找不到 APK：${apk_src}（先运行 build-all.sh scanner）"
   verify_apk_signature "$apk_src"
-  cp "$apk_src" "$ROOT/dist/airferry-android-v${VER}.apk"
-  info "Android 接收端 → dist/airferry-android-v${VER}.apk"
+  cp "$apk_src" "$ROOT/dist/airferry-receiver-android-arm64-v${VER}.apk"
+  info "Android 接收端 → dist/airferry-receiver-android-arm64-v${VER}.apk"
 
   # Windows 端 zip（仅当已构建时打包——Windows 端须在 Windows 上构建）
   local win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/publish"
@@ -281,8 +281,8 @@ pack_dist() {
     win_publish="$ROOT/apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/publish"
   fi
   if [[ -d "$win_publish" ]]; then
-    ( cd "$win_publish" && zip -r -q -X "$ROOT/dist/airferry-windows-x64-v${VER}.zip" . )
-    info "Windows 接收端 → dist/airferry-windows-x64-v${VER}.zip"
+    ( cd "$win_publish" && zip -r -q -X "$ROOT/dist/airferry-receiver-windows-x64-v${VER}.zip" . )
+    info "Windows 接收端 → dist/airferry-receiver-windows-x64-v${VER}.zip"
   else
     warn "未找到 Windows 端 publish 产物。如需打包 Windows 端，请在 Windows 上运行: ./scripts/build-windows.ps1 -Pack"
   fi
@@ -291,8 +291,8 @@ pack_dist() {
   # warn 而非 error：用户可能只想发扩展+APK 而不发网页端（web 是可选的发送入口）。
   local web_dist="$ROOT/apps/web/dist"
   if [[ -d "$web_dist" ]]; then
-    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-web-v${VER}.zip" . )
-    info "网页发送端 → dist/airferry-web-v${VER}.zip"
+    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . )
+    info "网页发送端 → dist/airferry-sender-web-v${VER}.zip"
   else
     warn "未找到网页端构建产物（${web_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
   fi

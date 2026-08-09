@@ -56,10 +56,10 @@
 | `airferry-sender-chrome-mv2-v1.1.4.zip` | 发送端-Chrome/Edge-MV2.zip |
 | `airferry-sender-firefox-mv3-v1.1.4.xpi` | 发送端-Firefox-MV3.xpi |
 | `airferry-sender-firefox-mv2-v1.1.4.xpi` | 发送端-Firefox-MV2.xpi |
-| `airferry-web-v1.1.4.zip` | 发送端-web-静态站点.zip |
-| `airferry-web-standalone-v1.1.4.html` | 发送端-web-单文件.html |
-| `airferry-android-v1.1.4.apk` | 接收端-Android-arm64-v8a.apk |
-| `airferry-windows-x64-v1.1.4.zip` | 接收端-Windows-x64.zip |
+| `airferry-sender-web-v1.1.4.zip` | 发送端-web-静态站点.zip |
+| `airferry-sender-web-standalone-v1.1.4.html` | 发送端-web-单文件.html |
+| `airferry-receiver-android-arm64-v1.1.4.apk` | 接收端-Android-arm64-v8a.apk |
+| `airferry-receiver-windows-x64-v1.1.4.zip` | 接收端-Windows-x64.zip |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 
@@ -69,7 +69,7 @@
 
 ### Windows 接收端
 
-解压 `airferry-windows-x64-v1.1.4.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
+解压 `airferry-receiver-windows-x64-v1.1.4.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 
