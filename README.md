@@ -50,16 +50,16 @@
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-android-v1.1.4.apk` | Android 接收端（Android 10+，arm64-v8a） |
-| `airferry-windows-x64-v1.1.4.zip` | Windows 接收端（Windows 10+，x64；需 .NET 8 Desktop Runtime；由 CI `windows.yml` 打包） |
-| `airferry-sender-chrome-mv3-v1.1.4.crx` | Chrome / Edge MV3 扩展（已签名 Cr24） |
-| `airferry-sender-chrome-mv3-v1.1.4.zip` | Chrome / Edge MV3（解压加载，crx 被拦截时用） |
-| `airferry-sender-chrome-mv2-v1.1.4.crx` | Chrome / Edge MV2 扩展（旧版兼容，已签名 Cr24） |
-| `airferry-sender-chrome-mv2-v1.1.4.zip` | Chrome / Edge MV2（解压加载） |
-| `airferry-sender-firefox-mv3-v1.1.4.xpi` | Firefox MV3 扩展（Firefox 116+） |
-| `airferry-sender-firefox-mv2-v1.1.4.xpi` | Firefox MV2 扩展（Firefox 91+） |
-| `airferry-web-v1.1.4.zip` | 网页发送端静态站点 |
-| `airferry-web-standalone-v1.1.4.html` | 网页发送端单文件版（双击即可运行） |
+| `airferry-android-v1.1.4.apk` | Android 接收端（arm64-v8a，Android 10+） |
+| `airferry-windows-x64-v1.1.4.zip` | Windows 接收端（x64，需 .NET 8 Desktop Runtime；由 CI `windows.yml` 打包） |
+| `airferry-sender-chrome-mv3-v1.1.4.crx` | Chrome / Edge 发送端扩展（MV3，已签名） |
+| `airferry-sender-chrome-mv3-v1.1.4.zip` | Chrome / Edge 发送端扩展（MV3，解压加载） |
+| `airferry-sender-chrome-mv2-v1.1.4.crx` | Chrome / Edge 发送端扩展（MV2，已签名） |
+| `airferry-sender-chrome-mv2-v1.1.4.zip` | Chrome / Edge 发送端扩展（MV2，解压加载） |
+| `airferry-sender-firefox-mv3-v1.1.4.xpi` | Firefox 发送端扩展（MV3，Firefox 116+） |
+| `airferry-sender-firefox-mv2-v1.1.4.xpi` | Firefox 发送端扩展（MV2，Firefox 91+） |
+| `airferry-web-v1.1.4.zip` | 网页发送端（静态站点） |
+| `airferry-web-standalone-v1.1.4.html` | 网页发送端（单文件，双击即用） |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 
@@ -94,15 +94,15 @@
 
 ```
 AirFerry/
-├── core/                  # 跨端 Rust 协议核心 + 共享 ZXing-C++ 相机解码核心
+├── core/                  # 跨端 Rust 协议核心 + Windows ZXing-C++ 相机解码核心
 │   ├── raptorq-core/      # RFC 6330 RaptorQ 编解码封装
 │   ├── qr-protocol/       # 帧格式 / 分块 / 压缩 / CRC / QR 矩阵
 │   ├── transfer-engine/   # 编排 / 状态机 / 进度 / 断点 + WASM/JNI/C ABI
-│   └── zxing-decoder/     # Android/Windows 共用全帧/多 ROI ZXing-C++ 逻辑
+│   └── zxing-decoder/     # Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
 ├── apps/
 │   ├── sender/            # Plasmo + React + TS + WASM 发送端（浏览器扩展）
 │   ├── scanner/           # Kotlin + CameraX + ZXing-C++ 接收端（Android App）
-│   └── windows/           # C# WPF + OpenCvSharp + 共享 ZXing-C++（Windows App）
+│   └── windows/           # C# WPF + OpenCvSharp + ZXing-C++（Windows App）
 ├── scripts/
 │   ├── build-all.sh       # 一键构建 + 打包（含 crx/xpi 签名，windows 子命令）
 │   └── build-windows.ps1  # Windows 端原生 PowerShell 构建脚本（首选）
@@ -129,7 +129,7 @@ AirFerry/
 - **压缩层**：三算法选优（Raw / Zstd Lv1 / Xz Lv9），70% Zstd early-exit 启发式跳过慢速 Xz
 - **传输层**：60 字节帧头 + symbol_size 负载（浏览器默认 1400）+ 4 字节 CRC，编码为**最小版本** EC-L 二维码（**1464B 帧 → V27 125×125**）；4 码模式同帧 tile 4 个符号、吞吐 ~4×
 - **协议层**：Descriptor 帧（每 16 帧，首帧即描述符）携带 OTI + 文件元数据（文件名、大小、CRC32、压缩标签）
-- **接收层**：Android 用 CameraX、Windows 用 OpenCvSharp DirectShow；两端均为 2–6 worker + 共享 ZXing-C++ 全帧/多 bbox ROI 热路径 + 串行 Rust 摄入。Windows Gray 帧仅池化复制一次，UI 以约 7Hz 展示 3 秒窗口速率、有效吞吐和多码状态
+- **接收层**：Android 用 CameraX，并固定采用 v1.1.3 的 Kotlin 调度器与 JNI ZXing-C++ 解码路径；Windows 用 OpenCvSharp DirectShow，并通过 `core/zxing-decoder/` 镜像同一套 v1.1.3 全帧/ROI 模式。两端均为 2–6 worker、4 符号批摄入和串行 Rust 摄入。Windows Gray 帧仅池化复制一次，UI 以约 7Hz 展示 3 秒窗口速率、有效吞吐和多码状态
 
 ## 文档
 

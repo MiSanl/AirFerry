@@ -922,7 +922,6 @@ class ScanActivity : ComponentActivity() {
             ingestStopped.set(false)
         }
         decodePool?.runExclusive(swap) ?: swap()
-        decodePool?.resetTracking()
         completedHandled = false
         lastUiUpdate = 0
         rateSamples.clear()
@@ -967,7 +966,6 @@ class ScanActivity : ComponentActivity() {
                 ingestStopped.set(false)
             }
             decodePool?.runExclusive(swap) ?: swap()
-            decodePool?.resetTracking()
             completedHandled = false
             lastUiUpdate = 0
             rateSamples.clear()

@@ -17,9 +17,6 @@ public sealed class QrDecodePool : IDisposable
 
     private const int IngestBatch = 4;
     private const int MultiFullDecodeEvery = 3;
-    private const int MultiDiscoveryEvery = 30;
-    private const int MultiSlotRetireAfter = 60;
-    private const int MaxMultiCodes = 4;
     private const float TrackMargin = 0.35F;
 
     private readonly BlockingCollection<GrayFrame> _queue;
@@ -34,14 +31,10 @@ public sealed class QrDecodePool : IDisposable
     private long _droppedFrames;
     private long _decodedSymbols;
     private long _multiMisses;
-    private long _multiHotScans;
-    private int _multiDiscoveryPending;
     private int _frameWidth;
     private int _frameHeight;
     private int[]? _multiTrackedBboxes;
     private int _multiLockedCount;
-    private int _multiDetectedCount;
-    private int[] _multiSlotMisses = [];
 
     internal volatile bool IngestStopped;
     internal readonly object IngestLock = new();
@@ -256,25 +249,13 @@ public sealed class QrDecodePool : IDisposable
             lockedCount = _multiLockedCount;
         }
 
-        if (tracked is not null && lockedCount > 0)
+        // Match Android v1.1.3 exactly: a zero miss counter is due for a
+        // full-frame lock; otherwise try the tracked regions first. A complete
+        // region miss falls through to full-frame recovery on the same frame.
+        bool dueFullLock = tracked is null || lockedCount == 0 ||
+            Interlocked.Read(ref _multiMisses) % MultiFullDecodeEvery == 0;
+        if (!dueFullLock && tracked is not null && lockedCount > 0)
         {
-            // Discovery replaces one ROI pass. Doing both on the same 1080p
-            // frame doubled work whenever fewer than four codes were visible.
-            if (lockedCount < MaxMultiCodes &&
-                Interlocked.Exchange(ref _multiDiscoveryPending, 0) != 0)
-            {
-                List<ZxingDecoder.MultiResult> discovered = DecodeMultiFull(frame);
-                if (discovered.Count > 0)
-                {
-                    SeedTrackedSlots(discovered);
-                    Interlocked.Exchange(ref _multiMisses, 0);
-                }
-                else
-                {
-                    Interlocked.Increment(ref _multiMisses);
-                }
-                return discovered;
-            }
             List<ZxingDecoder.MultiResult> regionResults = ZxingDecoder.DecodeMulti(
                 frame.Pixels, frame.Length, frame.Width, frame.Height, frame.RowStride,
                 tracked, lockedCount, TrackMargin);
@@ -282,22 +263,9 @@ public sealed class QrDecodePool : IDisposable
             {
                 UpdateTrackedSlots(regionResults);
                 Interlocked.Exchange(ref _multiMisses, 0);
-                // The first full-frame pass can lock only one tile of a 4-code
-                // display. A permanently successful ROI would otherwise prevent
-                // miss-based re-lock and cap throughput at one code per frame.
-                if (lockedCount < MaxMultiCodes &&
-                    Interlocked.Increment(ref _multiHotScans) % MultiDiscoveryEvery == 0)
-                {
-                    Interlocked.Exchange(ref _multiDiscoveryPending, 1);
-                }
                 return regionResults;
             }
-
-            long misses = Interlocked.Increment(ref _multiMisses);
-            if (misses % MultiFullDecodeEvery != 0)
-            {
-                return [];
-            }
+            Interlocked.Increment(ref _multiMisses);
         }
 
         List<ZxingDecoder.MultiResult> fullResults = DecodeMultiFull(frame);
@@ -305,6 +273,10 @@ public sealed class QrDecodePool : IDisposable
         {
             SeedTrackedSlots(fullResults);
             Interlocked.Exchange(ref _multiMisses, 0);
+        }
+        else
+        {
+            Interlocked.Increment(ref _multiMisses);
         }
         return fullResults;
     }
@@ -327,20 +299,8 @@ public sealed class QrDecodePool : IDisposable
         }
         lock (_trackingGate)
         {
-            // Never shrink a multi-code lock because one full-frame pass was
-            // partially blurred. Stale slots are more useful than losing those
-            // codes until a future complete discovery scan.
-            if (results.Count < _multiLockedCount)
-            {
-                return;
-            }
             _multiTrackedBboxes = packed;
             _multiLockedCount = results.Count;
-            _multiDetectedCount = Math.Min(MaxMultiCodes,
-                Math.Max(_multiDetectedCount, results.Count));
-            _multiSlotMisses = new int[results.Count];
-            Interlocked.Exchange(ref _multiHotScans, 0);
-            Interlocked.Exchange(ref _multiDiscoveryPending, 0);
         }
     }
 
@@ -357,9 +317,6 @@ public sealed class QrDecodePool : IDisposable
             }
 
             int[] updated = (int[])old.Clone();
-            int[] misses = _multiSlotMisses.Length == count
-                ? (int[])_multiSlotMisses.Clone()
-                : new int[count];
             bool[] claimed = new bool[count];
             foreach (ZxingDecoder.MultiResult result in results)
             {
@@ -387,41 +344,10 @@ public sealed class QrDecodePool : IDisposable
                 if (bestSlot >= 0)
                 {
                     claimed[bestSlot] = true;
-                    misses[bestSlot] = 0;
                     Array.Copy(result.Bbox, 0, updated, bestSlot * 4, 4);
                 }
             }
-            for (int slot = 0; slot < count; slot++)
-            {
-                if (!claimed[slot] && misses[slot] < int.MaxValue)
-                {
-                    misses[slot]++;
-                }
-            }
-
-            int[] kept = Enumerable.Range(0, count)
-                .Where(slot => misses[slot] < MultiSlotRetireAfter)
-                .ToArray();
-            if (kept.Length > 0 && kept.Length < count)
-            {
-                int[] compact = new int[kept.Length * 4];
-                int[] compactMisses = new int[kept.Length];
-                for (int destination = 0; destination < kept.Length; destination++)
-                {
-                    int source = kept[destination];
-                    Array.Copy(updated, source * 4, compact, destination * 4, 4);
-                    compactMisses[destination] = misses[source];
-                }
-                _multiTrackedBboxes = compact;
-                _multiLockedCount = kept.Length;
-                _multiSlotMisses = compactMisses;
-                Interlocked.Exchange(ref _multiHotScans, 0);
-            }
-            else
-            {
-                _multiTrackedBboxes = updated;
-                _multiSlotMisses = misses;
-            }
+            _multiTrackedBboxes = updated;
         }
     }
 
@@ -437,7 +363,7 @@ public sealed class QrDecodePool : IDisposable
     {
         lock (_trackingGate)
         {
-            return Math.Max(_multiLockedCount, _multiDetectedCount);
+            return _multiLockedCount;
         }
     }
 

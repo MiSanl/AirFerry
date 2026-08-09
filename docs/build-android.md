@@ -98,12 +98,12 @@ APK 包含三个原生库：
 | 库 | 来源 | 用途 |
 |----|------|------|
 | `libtransfer_engine.so` | Rust → cargo-ndk | RaptorQ 编解码（JNI） |
-| `libairferry_zxing.so` | 共享 ZXing-C++ 核心 → CMake/JNI | QR 全帧/多 ROI 解码；算法与 Windows 相同 |
+| `libairferry_zxing.so` | ZXing-C++ → CMake/JNI | QR 全帧/多 ROI 解码；实现锁定为 v1.1.3 路径 |
 | `libimage_processing_util_jni.so` | CameraX | 图像处理工具 |
 
 ## ZXing-C++ 构建
 
-ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。实际识别逻辑位于仓库级 `core/zxing-decoder/`，Android 的 `scan_jni.cpp` 仅做 JNI 桥接；Windows C ABI 复用同一核心。全帧发现保留 TryHarder/TryInvert；高频 ROI 热路径针对 AirFerry 固定的正常极性二维码关闭反色重试，缺码时不再每帧付双重识别成本。
+ZXing-C++ 通过 CMake `FetchContent` 从 GitHub 拉取（固定到 v3.0.2 的 commit），首次构建时自动编译。Android 的完整识别逻辑位于 `scan_jni.cpp`，并与 `QrDecodePool.kt`、`ZxingDecoder.kt` 一起锁定为 v1.1.3 的解码实现；Windows 用 C#/C ABI 镜像相同模式，但不直接编译这份 JNI 文件。依赖仍固定到不可变 commit，不回退供应链加固。
 
 ```cmake
 # app/src/main/cpp/CMakeLists.txt
@@ -156,7 +156,7 @@ apps/scanner/
         ├── AndroidManifest.xml
         ├── cpp/
         │   ├── CMakeLists.txt    # ZXing-C++ 构建
-        │   └── scan_jni.cpp      # 共享 ZXing-C++ 核心的 JNI 薄桥
+        │   └── scan_jni.cpp      # v1.1.3 ZXing-C++ JNI 解码实现
         ├── java/com/airferry/app/
         │   ├── nativelib/
         │   │   └── NativeBridge.kt       # Rust JNI 绑定

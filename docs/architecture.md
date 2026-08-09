@@ -50,7 +50,7 @@ core/
 │   ├── wasm.rs        wasm-bindgen（浏览器）
 │   ├── jni.rs         JNI（Android）
 │   └── cffi.rs        C ABI（Windows P/Invoke）
-└── zxing-decoder/     Android/Windows 共用 ZXing-C++ 相机 QR 解码核心
+└── zxing-decoder/     Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
     ├── DecodeMultiFull / DecodeMultiRegions
     └── packed payload + bbox 结果布局
 ```
@@ -63,7 +63,7 @@ core/
 | Android | `aarch64-linux-android` | JNI | `libtransfer_engine.so` |
 | Windows | `x86_64-pc-windows-msvc` | C ABI | `transfer_engine.dll` |
 
-相机识别另有一条共享链：Android 的 `scan_jni.cpp` 与 Windows 的 `native/zxing_capi.cpp` 都调用 `core/zxing-decoder/`；两端分别产出 `libairferry_zxing.so` 和 `airferry_zxing.dll`。
+相机识别使用同一模式、不同平台桥接：Android 的 `QrDecodePool.kt` / `scan_jni.cpp` 锁定为 v1.1.3 解码路径，产出 `libairferry_zxing.so`；Windows 的 `QrDecodePool.cs` 镜像相同 worker、队列、4 符号批摄入及全帧/ROI 状态机，`native/zxing_capi.cpp` 调用 `core/zxing-decoder/` 产出 `airferry_zxing.dll`。两端也共享 Rust 帧协议与 RaptorQ 引擎。
 
 ## 数据流
 
@@ -88,8 +88,8 @@ core/
 ```
 摄像头 / 采集卡视频流 (~60fps)
   │
-  ├─ 生产者将 Gray 池化拷贝一次入队 → 2–6 worker 并行共享 ZXing-C++
-  ├─ 冷启动全帧多码；bbox 后多 ROI；3 次 miss 重锁；补发现替代一帧 ROI、缺码槽位超时退休
+  ├─ 生产者将 Gray 池化拷贝一次入队 → 2–6 worker 并行 ZXing-C++
+  ├─ Android：v1.1.3 调度/JNI；Windows：等价 C#/C ABI 模式
   ├─ Windows 同一采集句柄节流 BGR24 快照 → WPF 预览（UI 不读设备）
   ├─ 串行 ingest（锁）：帧校验 → 去重 → RaptorQ
   └─ assemble + 解压后分流：

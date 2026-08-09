@@ -51,14 +51,10 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zxing)
 
 # --- JNI bridge library ---
-set(AIRFERRY_ZXING_CORE_DIR
-    "${CMAKE_CURRENT_LIST_DIR}/../../../../../../core/zxing-decoder")
+# Android intentionally keeps the proven v1.1.3 JNI decode implementation.
+# Windows mirrors the same behavior through core/zxing-decoder and its C ABI.
 add_library(airferry_zxing SHARED
     scan_jni.cpp
-    "${AIRFERRY_ZXING_CORE_DIR}/airferry_zxing_core.cpp"
-)
-target_include_directories(airferry_zxing PRIVATE
-    "${AIRFERRY_ZXING_CORE_DIR}"
 )
 target_link_libraries(airferry_zxing
     ZXing::ZXing

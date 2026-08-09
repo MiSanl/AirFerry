@@ -126,10 +126,9 @@ std::optional<DecodeResult> DecodeOneRegion(
     }
     const ZXing::ImageView full(pixels, width, height, ZXing::ImageFormat::Lum, row_stride);
     const ZXing::ImageView region = full.cropped(x, y, side, side);
-    // AirFerry always renders black modules on white. Do not pay for ZXing's
-    // inverted-image retry on every hot ROI miss; the periodic full-frame path
-    // remains inversion-capable for robust re-locking.
-    return ToResult(ZXing::ReadBarcode(region, ReaderOptions(false)), x, y);
+    // Keep the v1.1.3 behavior across Android and Windows: region scans retain
+    // TryInvert as well as TryHarder.
+    return ToResult(ZXing::ReadBarcode(region, ReaderOptions()), x, y);
 }
 
 std::vector<DecodeResult> DecodeMultiFull(
@@ -174,11 +173,8 @@ std::vector<DecodeResult> DecodeMultiRegions(
 
     margin_fraction = std::clamp(margin_fraction, 0.0F, 2.0F);
     const ZXing::ImageView full(pixels, width, height, ZXing::ImageFormat::Lum, row_stride);
-    // Tracked regions are the high-frequency hot path and AirFerry's sender is
-    // never inverted. A missing tile used to trigger both normal and inverted
-    // work on every frame until it returned, which materially reduced throughput.
-    // Full-frame discovery still uses TryInvert for recovery/compatibility.
-    const ZXing::ReaderOptions options = ReaderOptions(false);
+    // Match Android's v1.1.3 JNI options for every tracked region.
+    const ZXing::ReaderOptions options = ReaderOptions();
     decoded.reserve(hint_count);
 
     for (size_t i = 0; i < hint_count; ++i) {

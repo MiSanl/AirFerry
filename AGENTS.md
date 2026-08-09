@@ -20,7 +20,7 @@ AirFerry/
 │   ├── raptorq-core/           #   RFC 6330 RaptorQ 编解码封装（纯逻辑）
 │   ├── qr-protocol/            #   帧格式 / 分块 / 压缩 / CRC / QR 矩阵 / 会话 ID
 │   ├── transfer-engine/        #   编排 / 状态机 / 进度 / 断点 + WASM&JNI 绑定
-│   └── zxing-decoder/          #   Android/Windows 共用 ZXing-C++ 解码核心（非 Cargo crate）
+│   └── zxing-decoder/          #   Windows ZXing-C++ 解码核心（非 Cargo crate）
 ├── apps/
 │   ├── sender/                 # 浏览器扩展（Plasmo + React + TS + WASM）
 │   │   ├── src/                #   TS 源码（页面 / WASM 桥 / 压缩 worker / background 图标点击直跳）
@@ -36,7 +36,7 @@ AirFerry/
 │   │       ├── java/com/airferry/app/   # Kotlin
 │   │       ├── cpp/                     # ZXing-C++ JNI 桥（CMake）
 │   │       └── jniLibs/arm64-v8a/       # Rust .so（cargo-ndk 产物, git-ignored）
-│   └── windows/                # Windows App（C# WPF + OpenCvSharp + 共享 ZXing-C++）
+│   └── windows/                # Windows App（C# WPF + OpenCvSharp + ZXing-C++）
 │       ├── native/                     #   Windows ZXing C ABI 包装器 + CMake
 │       ├── AirFerry.Windows/            #   主项目（Views/ViewModels/Scan/Bundle/Native）
 │       │   └── runtime/                 #   transfer_engine.dll + airferry_zxing.dll（git-ignored）
@@ -204,7 +204,7 @@ npm run preview        # 本地预览构建产物
 **脚本行为要点**（权威源 `scripts/build-all.sh`）：
 - **版本号**：从 `apps/sender/package.json` 的 `version` 读取（`read_version()`），与扩展 manifest 同源。改版本改这一处即可被脚本读取，但 APK/扩展本身的版本号仍需手动同步（见 §2.7）。
 - **`build_scanner` 自动跑 cargo-ndk**：在 `./gradlew assembleRelease` **之前**先用 `cargo ndk -t arm64-v8a ... build -p transfer-engine --features jni --release` 编译 `libtransfer_engine.so` 到 `jniLibs/`。这是为了避免打进过期 `.so`（AirFerry 重命名后旧符号 `com.easytransfer.*` 与 Kotlin 新包名对不上会 `UnsatisfiedLinkError` 闪退）。因此 `scanner`/`all`/`release` 子命令都自带这步，无需手动前置。
-- **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android/Windows 的相机侧二维码识别共用 `core/zxing-decoder/`，避免算法和 ROI 行为漂移。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
+- **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android 直接保留 v1.1.3 的 `scan_jni.cpp`，Windows 通过 `core/zxing-decoder/` 镜像同一解码选项与全帧/ROI 调度模式。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
 - **`build_web` 不编译 Rust**：`cd apps/web && npm run build`（Vite 静态站点），`prebuild` 会跑 `prepare-wasm.cjs` 校验 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`，持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` 到 `public/`。web 明确复用现代 WASM，**首次构建前须先 `cd apps/sender && npm run wasm`**。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
 - **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥固定在 `dist/airferry-extension.pem`——**首次运行自动生成并挪到此处，之后 MV2/MV3 复用同一私钥**，保证扩展 ID 稳定。找不到 Chrome 二进制时跳过 crx、仅留 zip。
 - **`pack_dist` 会清旧产物**：删 `dist/airferry-{android-*.apk,windows-*.zip,sender-*.crx,sender-*.zip,sender-*.xpi,web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
@@ -230,7 +230,7 @@ npm run preview        # 本地预览构建产物
 | `apps/scanner/app/src/main/jniLibs/arm64-v8a/` | Rust 编译的 `libtransfer_engine.so` + 遗留的 `libet_code.so`（**当前代码无任何 `System.loadLibrary("et_code")` 引用，未使用，建议清理**）。ZXing 的 `libairferry_zxing.so` 不在此处——由 CMake 在 APK 构建时直接编译进 APK | `cargo ndk ... build` | ✅ |
 | `apps/windows/AirFerry.Windows/bin/` `obj/` | C# WPF 构建产物：`bin/x64/Release/net8.0-windows/win-x64/` + OpenCV/native DLLs | `dotnet build` / `dotnet publish` | ✅ |
 | `apps/windows/AirFerry.Windows/runtime/transfer_engine.dll` | Rust 编译的 C ABI DLL（`--features cffi`）；csproj 显式纳入 build/publish 并扁平复制到 exe 同目录，打包脚本再显式复制+核验 | `cargo build`（由 build-windows.ps1 拷入） | ✅ |
-| `apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll` | Android/Windows 共用解码核心的 Windows C ABI DLL；作为独立 native DLL 放在 exe 同目录，打包时显式复制+核验 | `cmake --build apps/windows/native/build`（由 build-windows.ps1 拷入） | ✅ |
+| `apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll` | Windows 对 Android v1.1.3 模式的 C ABI 等价实现；作为独立 native DLL 放在 exe 同目录，打包时显式复制+核验 | `cmake --build apps/windows/native/build`（由 build-windows.ps1 拷入） | ✅ |
 | `apps/windows/native/build/` | Windows ZXing-C++ 配置、依赖与 CTest 产物 | CMake（首次配置按固定 commit 获取 zxing-cpp） | ✅ |
 | `dist/` | 发布归档 + 签名材料（`*.pem` Chrome 私钥、`airferry-release.keystore`） | `pack_dist` | ✅ |
 | `target/` | Rust 编译缓存（workspace 共享） | `cargo` | ✅ |
@@ -318,7 +318,7 @@ npm run preview        # 本地预览构建产物
 | **JNI 绑定（Android）** | `core/transfer-engine/src/jni.rs:67` | `receiverIngest` 返回**packed jlong**（非 JSON，见 SPEC）；`receiverLastAssembleError` 暴露组装/解压失败原因 |
 | **C ABI 绑定（Windows/.NET P/Invoke）** | `core/transfer-engine/src/cffi.rs:106` | `airferry_receiver_ingest` 返回**packed u64**（位布局与 jni.rs 完全一致）；assemble 用「Rust 分配+free」单次调用 |
 | **WASM 绑定（浏览器）** | `core/transfer-engine/src/wasm.rs` | `next_qr` / `next_qr_multi` 为兼容 API；热路径用 `next_qr_scratch` 写入会话内固定缓冲，再用 `qr_scratch_view` 取得当帧 WASM 视图 |
-| **共享相机 QR 解码核心** | `core/zxing-decoder/` | Android JNI 与 Windows C ABI 共用的 ZXing-C++ 全帧/多 ROI 解码和结果打包；不是 Cargo crate |
+| **Windows 相机 QR 解码核心** | `core/zxing-decoder/` | Windows C ABI 对 Android v1.1.3 ZXing 选项、全帧/多 ROI 与结果打包模式的等价实现；不是 Cargo crate |
 
 ### 3.2 浏览器发送端
 
@@ -349,12 +349,12 @@ npm run preview        # 本地预览构建产物
 | Activity / 管线编排 | `app/.../ui/ScanActivity.kt:64` | owns 管线、相机绑定、摄入线程；`onCreate` 设 `FLAG_KEEP_SCREEN_ON` 防长传息屏 |
 | CameraX 生产者（非阻塞） | `app/.../scan/QrStreamAnalyzer.kt:16` | 拷贝 Y 平面入队后立即 close |
 | **并行解码 + 串行摄入** | `app/.../scan/QrDecodePool.kt:27` | N worker(2-6) + `ingestLock` 串行化 |
-| 多码 ROI 解码追踪 | `app/.../scan/QrDecodePool.kt`（`decodeMultiTracked`） | 3-miss 全帧重锁；部分锁每 30 次 ROI 成功安排下一帧补发现（不与 ROI 同帧重复扫）；连续 60 次未命中的槽位退休、重现后再发现；会话重置会清空旧锁，与 Windows 对齐 |
+| **v1.1.3 解码调度** | `app/.../scan/QrDecodePool.kt`（`decodeMultiTracked`） | 1.1.4 重新发布版按用户实测回退并锁定为 v1.1.3 的 worker/批摄入/全帧与 ROI 状态机；Windows C# 镜像相同模式 |
 | **Rust JNI 桥（Kotlin）** | `app/.../nativelib/NativeBridge.kt` | `receiverIngest` 返回 Long |
 | **接收会话管理器** | `app/.../scan/ReceiverSessionManager.kt:17` | 仅从描述符初始化；`IngestStatus.unpack`(line 68) |
 | 帧头解析（Kotlin 侧） | `app/.../scan/ReceiverSessionManager.kt:99` | `parseHeader`：60B 大端 |
 | ZXing JNI 桥（Kotlin） | `app/.../scan/ZxingDecoder.kt` | 单码/多码/ROI 解码 |
-| **ZXing-C++ JNI（native）** | `app/src/main/cpp/scan_jni.cpp` + `core/zxing-decoder/` | JNI 只做数组/bbox 桥接；共享核心全帧重锁启用 TryHarder/TryInvert，常态 ROI 只需 TryHarder（发送码固定黑色模块/白色背景，不为缺码反复做反色重试） |
+| **ZXing-C++ JNI（native）** | `app/src/main/cpp/scan_jni.cpp` | 完整保留 v1.1.3 解码实现（TryHarder/TryInvert、全帧/ROI/多码打包）；CMake 仍把 ZXing v3.0.2 固定到不可变 commit |
 | 多码显示状态 | `app/.../scan/QrPresence.kt` + `ScanActivity.kt` | bbox 按 CameraX 0/90/180/270° 映射到可见四宫格；有效帧在 ingest 前记录，250ms UI 时钟让消失的码在 2s 后变为暂停，即使完全没有新帧也会刷新 |
 | 多文件包解包 | `app/.../scan/BundleParser.kt` | 恢复后拆包（ETBUNDL1） |
 | **文字载荷解析** | `app/.../scan/TextParser.kt` | `isText`/`parse`（ETTEXTv1 → UTF-8）；字节级镜像 TS `text.ts` 与 C# `TextParser.cs` |
@@ -372,10 +372,10 @@ npm run preview        # 本地预览构建产物
 | **接收会话管理器** | `apps/windows/AirFerry.Windows/Scan/ReceiverSession.cs` | lazy init from descriptor + mismatch re-init（镜像 Kotlin） |
 | 帧头解析 | `apps/windows/AirFerry.Windows/Scan/FrameHeader.cs` | 60B 大端，magic/version/session_id hi+lo |
 | IngestStatus 位域解析 | `apps/windows/AirFerry.Windows/Scan/IngestStatus.cs` | `.Unpack(u64)`，位布局与 Rust/Kotlin 一致 |
-| **并行解码 + 串行摄入** | `apps/windows/AirFerry.Windows/Scan/QrDecodePool.cs` | N worker（2–6）+ `IngestLock` 串行化批摄入；池化 Gray、bbox 多 ROI、3-miss 重锁；部分锁每 30 次成功安排下一帧补发现，连续 60 次未命中的槽位退休 |
+| **v1.1.3 模式 + 串行摄入** | `apps/windows/AirFerry.Windows/Scan/QrDecodePool.cs` | 镜像 Android v1.1.3：N worker（2–6）、容量 `worker+2`、4 符号批摄入、相同全帧/ROI miss 状态机；额外保留池化 Gray 与安全停止 |
 | ★**设备枚举（摄像头+采集卡）** | `apps/windows/AirFerry.Windows/Scan/DeviceEnumerator.cs` | DirectShow `DsDevice`，两类设备统一枚举 |
 | 视频采集 + 预览 | `apps/windows/AirFerry.Windows/Scan/VideoCapture.cs` + `PreviewFrame.cs` | 单个 OpenCvSharp DirectShow 句柄：生产线程一次读取后 BGR→Gray 送解码池，并以 15fps 将池化 BGR24 快照交给 WPF；UI 线程不读设备，快照由消费端 `Dispose` 归还 `ArrayPool` |
-| **共享 ZXing-C++ C ABI** | `apps/windows/native/` + `core/zxing-decoder/` | Windows 薄导出层；与 Android JNI 共用全帧 TryHarder/TryInvert、正常极性 ROI 热路径，固定 ABI 版本和 packed 结果布局 |
+| **Windows ZXing-C++ C ABI** | `apps/windows/native/` + `core/zxing-decoder/` | Windows 薄导出层；全帧与 ROI 都使用 Android v1.1.3 相同的 TryHarder/TryInvert，固定 ABI 版本和 packed 结果布局 |
 | QR 结果解析 | `apps/windows/AirFerry.Windows/Scan/ZxingDecoder.cs` + `Native/NativeZxingBridge.cs` | P/Invoke 调用 `airferry_zxing.dll`，校验长度/上限并在 finally 释放 native buffer |
 | 多文件包解包 | `apps/windows/AirFerry.Windows/Bundle/BundleParser.cs` | ETBUNDL1（字节级镜像 Kotlin BundleParser.kt） |
 | 分享导出 | `apps/windows/AirFerry.Windows/Bundle/ShareExport.cs` | 不暴露无扩展名 hash blob；生成带逻辑名的临时副本、写 MOTW，并在启动/下次分享时清理超过 24 小时的受控 GUID 目录 |

@@ -1,6 +1,6 @@
 # Windows 端构建指南
 
-> Windows 扫码接收端（C# WPF + Rust 引擎 DLL + 共享 ZXing-C++ DLL）。扫描热路径与 Android 对齐，并支持**设备选择**（摄像头或采集卡）。
+> Windows 扫码接收端（C# WPF + Rust 引擎 DLL + ZXing-C++ DLL），支持**设备选择**（摄像头或采集卡）。相机解码镜像 Android v1.1.3 模式。
 
 ---
 
@@ -11,11 +11,11 @@
 | UI | WPF (.NET 8, C#) | 对标 Android Compose UI |
 | 相机/采集卡 | OpenCvSharp4 (DirectShow 后端) | 单句柄读取；Gray 送解码、池化 BGR24 快照送预览 |
 | 设备枚举 | DirectShowLib (DsDevice) | `FilterCategory.VideoInputDevice` 同时覆盖摄像头+采集卡 |
-| QR 解码 | 共享 ZXing-C++（全帧 TryHarder/TryInvert + 正常极性多 ROI） | `core/zxing-decoder/` 与 Android 共用；Windows 仅加薄 C ABI |
+| QR 解码 | ZXing-C++（全帧/ROI 均 TryHarder + TryInvert） | `core/zxing-decoder/` + Windows 薄 C ABI，选项与 Android v1.1.3 相同 |
 | 核心引擎 | Rust `transfer-engine` (C ABI, `--features cffi`) | 编解码逻辑与 Android/WASM 共享，编译为 `transfer_engine.dll` |
 | MVVM | CommunityToolkit.Mvvm | ObservableObject / RelayCommand 源生成器 |
 
-**关键不变量**：RaptorQ/帧协议仍由三端共享 Rust 核心实现；相机侧 QR 识别由 Android/Windows 共享 `core/zxing-decoder/`。两端只分别保留 JNI 与 C ABI 薄包装，减少算法、bbox 和 ROI 行为漂移。
+**关键不变量**：RaptorQ/帧协议仍由三端共享 Rust 核心实现。Android 锁定 v1.1.3 JNI 解码实现；Windows 通过 `core/zxing-decoder/` 和 `QrDecodePool.cs` 镜像相同解码选项与调度状态机。
 
 ---
 
@@ -84,7 +84,7 @@ $dll = Get-ChildItem apps/windows/native/build -Recurse -Filter airferry_zxing.d
 Copy-Item $dll.FullName apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll -Force
 ```
 
-> CMake 固定 zxing-cpp v3.0.2 对应 commit。共享算法位于 `core/zxing-decoder/`，Android JNI 与 Windows C ABI 都只负责传参、异常边界和结果内存所有权。
+> CMake 固定 zxing-cpp v3.0.2 对应 commit。Windows 算法位于 `core/zxing-decoder/`，C ABI 负责传参、异常边界和结果内存所有权；C#/C ABI 行为镜像 Android v1.1.3 JNI 模式。
 
 ### 4.3 构建 C# WPF
 
@@ -150,7 +150,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 ### 7.1 单采集源与停止生命周期
 
 - 解码和预览共用一个 DirectShow 句柄；生产线程每次读取只向池化 Gray 缓冲复制一次，并按最高 15fps 发布 BGR24 预览快照，避免独占型驱动因双开设备导致黑屏。
-- 2–6 个 worker 调用与 Android 相同的 ZXing-C++ 核心。冷启动走全帧多码识别；锁定 bbox 后走多 ROI 热路径，连续 3 次 ROI miss 才回退全帧重锁。首次只锁到部分 tile 时每 30 次 ROI 成功安排下一帧做一次全帧发现（该帧不再先跑 ROI），直到 4 个码位锁齐；连续 60 次 ROI 未命中的槽位会退休，二维码重现后由低频全帧发现重新加入。
+- 2–6 个 worker 调用 Windows 的 ZXing-C++ 核心，队列容量为 `worker+2`，每个 worker 最多累积 4 个符号后进入串行摄入；全帧/ROI 与 miss 计数状态机镜像 Android v1.1.3。
 - 预览快照使用 `ArrayPool<byte>`，UI 只把托管像素写入 `WriteableBitmap`，不在 Dispatcher 上调用阻塞式 `VideoCapture.Read()`。
 - 扫描页只保留最新预览帧；UI 忙时自动覆盖旧帧，不堆积 Dispatcher 任务或大图像缓冲。
 - 停止会先作废旧会话的排队 UI 回调，并启动唯一的有序清理任务：等待生产者、完成后的组装/落盘任务及全部解码 worker 真正结束后，才释放 native handle/camera。前台最多等待 2 秒；慢摄像头超时后资源由后台任务继续持有并安全释放，期间禁止重启扫描，因此既不冻结 WPF Dispatcher，也不会并发 free/Dispose。
@@ -209,9 +209,9 @@ ctest --test-dir apps/windows/native/build -C Release --output-on-failure
 | UI | Compose | WPF XAML |
 | 相机 | CameraX (Y plane) | OpenCvSharp VideoCapture (BGR→Gray) |
 | 设备枚举 | CameraX 自动 | DirectShow DsDevice（★新增设备选择） |
-| QR 解码 | 共享 ZXing-C++ (JNI) | 同一共享 ZXing-C++ (C ABI/P/Invoke) |
+| QR 解码 | ZXing-C++ v1.1.3 路径（JNI） | 等价 ZXing-C++ 模式（C ABI/P/Invoke） |
 | 核心引擎 | Rust `jni.rs` (JNI) | Rust `cffi.rs` (C ABI) |
-| 并行解码 | 2–6 workers + bbox 多 ROI + 3-miss 重锁 + 部分锁低频补发现 | 同参数、同追踪策略 + ingestLock |
+| 并行解码 | 2–6 workers + v1.1.3 调度/4 符号批摄入 | 同 worker/队列/批量/miss 状态机 + ingestLock |
 | 落盘 | ContentStore blob + `index.json` | `%USERPROFILE%\Documents\AirFerry\store\blobs\<hh>\<sha256>` + `index.json` |
 | 多文件包 | BundleParser.kt | BundleParser.cs |
 | 签名 | keystore.properties | （暂无 Authenticode 签名） |
