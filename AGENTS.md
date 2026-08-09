@@ -239,18 +239,42 @@ npm run preview        # 本地预览构建产物
 
 ### 2.8 产物格式与命名规范
 
-发布归档统一格式 `airferry-{角色}-{平台及变体}-v{版本}.{扩展}`，**角色前缀进文件名**（`sender` 发送端 / `receiver` 接收端），系统要求、架构、变体等细节同时写在 Release 资产标签（label，格式 `角色-平台-属性.扩展`）与说明中：
+发布归档统一格式 `airferry-{角色}-{平台及变体}-v{版本}.{扩展}`，**角色前缀进文件名**：
+
+- `sender` = **发送端**（浏览器扩展 / 网页）：把文件编成二维码视频流在屏幕上播放
+- `receiver` = **接收端**（Android / Windows App）：用摄像头 / 采集卡扫码恢复文件
+
+> **asset 不设 label**（Release 资产的「下载说明」字段留空，GitHub 页面直接显示文件名）。各端的用途、系统要求、架构、变体差异等**写在 Release notes 的产物表**（见各版 `docs/releases/v{VER}.md` 与 README 下载表）和文件名本身里，不重复进 label——文件名已含角色+平台+变体+版本，足够区分。
 
 | 产物 | 命名格式 | 格式说明 |
 |------|---------|---------|
-| Android 接收端 APK | `airferry-receiver-android-arm64-v{VER}.apk` | arm64-v8a 单 ABI；Android 10+（minSdk 29）；必须用 `apps/scanner/keystore.properties` 指向的 release keystore 签名；缺失时 release 构建失败，打包还会用 `apksigner` 拒绝 debug/无效签名 |
-| Windows 接收端 zip | `airferry-receiver-windows-x64-v{VER}.zip` | x64 单架构；Windows 10+；`dotnet publish` 单文件 + 框架依赖（目标机须装 .NET 8 Desktop Runtime）；内含 `AirFerry.exe` + `transfer_engine.dll` + `airferry_zxing.dll` + OpenCV native DLLs。**只能在 Windows 上构建**（WPF TFM） |
-| Chrome MV3 | `airferry-sender-chrome-mv3-v{VER}.crx` + `.zip` | `.crx` = Cr24 签名格式（Chrome 96+/Edge 96+，现代 WASM externref）；`.zip` = 解压目录打包回退 |
-| Chrome MV2 | `airferry-sender-chrome-mv2-v{VER}.crx` + `.zip` | 同上，旧版兼容 |
+| Android 接收端 APK | `airferry-receiver-android-arm64-v{VER}.apk` | **Android 扫码端**。arm64-v8a 单 ABI；Android 10+（minSdk 29）；安装后对准屏幕二维码即可接收。必须用 `apps/scanner/keystore.properties` 指向的 release keystore 签名；缺失时 release 构建失败，打包还会用 `apksigner` 拒绝 debug/无效签名 |
+| Windows 接收端 zip | `airferry-receiver-windows-x64-v{VER}.zip` | **Windows 扫码端**。x64 单架构；Windows 10+，需安装 .NET 8 Desktop Runtime；支持摄像头 + USB/HDMI/SDI 采集卡作为视频源。`dotnet publish` 单文件 + 框架依赖；内含 `AirFerry.exe` + `transfer_engine.dll` + `airferry_zxing.dll` + OpenCV native DLLs。**只能在 Windows 上构建**（WPF TFM） |
+| Chrome MV3 | `airferry-sender-chrome-mv3-v{VER}.crx` + `.zip` | `.crx` = Cr24 签名格式（Chrome 96+/Edge 96+，现代 WASM externref）；`.zip` = 解压目录打包回退（`.crx` 被商店外安装拦截时用） |
+| Chrome MV2 | `airferry-sender-chrome-mv2-v{VER}.crx` + `.zip` | 同上，旧版浏览器兼容 |
 | Firefox MV3 | `airferry-sender-firefox-mv3-v{VER}.xpi` | Firefox 116+；`.xpi` 本质是 zip 改名 |
 | Firefox MV2 | `airferry-sender-firefox-mv2-v{VER}.xpi` | Firefox 91+ |
 | 网页发送端 | `airferry-sender-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。`pack_dist` 自动打包（须先跑 `build-all.sh web` 产出 `apps/web/dist/`，缺失时 warn 跳过） |
 | 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `cd apps/web && npm run build:standalone` 产出（`dist-standalone/index.html` → 改名）。不进 `pack_dist`（与静态站点 zip 不同，单文件是 `.html` 无需 zip），手动上传 Release |
+
+#### 发布流程（GitHub Release 怎么来）
+
+1. **本地构建打包**：`./scripts/build-all.sh release`（macOS/Linux）→ 产出 `dist/` 下除 Windows 外的全部产物（扩展 4 目标 crx/zip/xpi + Android APK + web zip）。Windows zip 单独在 Windows 上用 `.\scripts\build-windows.ps1 -Pack` 或走 `.github/workflows/windows.yml` 的 `windows-pack` job（见 §2.9）。
+2. **创建/更新 Release**：`build-all.sh release` 内部 `pack_dist` 只把产物放进 `dist/`，**不自动上传 GitHub**。发版时手动：
+   ```bash
+   gh release create v{VER} -R UR-SillyB/AirFerry \
+     --target <commit-sha> --title v{VER} \
+     --notes-file docs/releases/v{VER}.md        # 创建（首次）
+   gh release upload v{VER} -R UR-SillyB/AirFerry dist/* --clobber   # 上传/覆盖 asset
+   ```
+   Windows asset 由 `windows.yml` 的 `windows-pack` job 自动 `gh release upload --clobber`。
+3. **重新发布同一 tag（需改 notes / 重排 asset / 清 label 时）**：保留 tag 以维持下载链接稳定，只重建 release 记录：
+   ```bash
+   gh release delete v{VER} -R UR-SillyB/AirFerry --yes --cleanup-tag=false   # 删 release，保留 tag
+   gh release create v{VER} -R UR-SillyB/AirFerry --target <tag-commit> --title v{VER} --notes-file docs/releases/v{VER}.md
+   gh release upload  v{VER} -R UR-SillyB/AirFerry dist/* --clobber            # 重新上传
+   ```
+   `gh release upload` **不写 label**（label 留空，按本节规范）。历史版本（v1.0.0–v1.1.3）文件名不含角色前缀，属历史命名，不回改。
 
 **扩展产物内部结构**（每个 `*-prod/` 目录）：
 - `manifest.json`——由 `scripts/fix-manifest.cjs` 后处理：复制真实 RGBA 图标覆盖 Plasmo 占位图、MV2 删 `action` 留 `browser_action` 并把 CSP 改为 `wasm-eval`、Firefox 补 `browser_specific_settings.gecko.id = airferry@airferry.app`、修补 HTML `<title>`
@@ -289,7 +313,7 @@ npm run preview        # 本地预览构建产物
 1. 把上表版本（含 `windows.yml` 的 `VER`）改到目标版本（如 `1.1.1`），提交并推 `main`。
 2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`（若尚无 tag，workflow 会 **draft** 创建，之后可补 notes/其它 asset）。
 3. GitHub → Actions → **windows** → **Run workflow**（`workflow_dispatch`）。
-4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset，资产标签固定为 `接收端-Windows-x64.zip`）。
+4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset；asset 不设 label，见 §2.8）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
 

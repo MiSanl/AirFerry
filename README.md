@@ -50,16 +50,16 @@
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-sender-chrome-mv3-v1.1.4.crx` | 发送端-Chrome/Edge-MV3.crx |
-| `airferry-sender-chrome-mv3-v1.1.4.zip` | 发送端-Chrome/Edge-MV3.zip |
-| `airferry-sender-chrome-mv2-v1.1.4.crx` | 发送端-Chrome/Edge-MV2.crx |
-| `airferry-sender-chrome-mv2-v1.1.4.zip` | 发送端-Chrome/Edge-MV2.zip |
-| `airferry-sender-firefox-mv3-v1.1.4.xpi` | 发送端-Firefox-MV3.xpi |
-| `airferry-sender-firefox-mv2-v1.1.4.xpi` | 发送端-Firefox-MV2.xpi |
-| `airferry-sender-web-v1.1.4.zip` | 发送端-web-静态站点.zip |
-| `airferry-sender-web-standalone-v1.1.4.html` | 发送端-web-单文件.html |
-| `airferry-receiver-android-arm64-v1.1.4.apk` | 接收端-Android-arm64-v8a.apk |
-| `airferry-receiver-windows-x64-v1.1.4.zip` | 接收端-Windows-x64.zip |
+| `airferry-sender-chrome-mv3-v1.1.4.crx` | Chrome / Edge 浏览器扩展，MV3（现代版），已签名，拖入即可安装 |
+| `airferry-sender-chrome-mv3-v1.1.4.zip` | 同上解压加载版（`.crx` 被拦截时用「加载已解压的扩展程序」） |
+| `airferry-sender-chrome-mv2-v1.1.4.crx` | Chrome / Edge MV2，旧版浏览器兼容 |
+| `airferry-sender-chrome-mv2-v1.1.4.zip` | 同上解压加载版 |
+| `airferry-sender-firefox-mv3-v1.1.4.xpi` | Firefox 扩展，MV3（Firefox 116+） |
+| `airferry-sender-firefox-mv2-v1.1.4.xpi` | Firefox 扩展，MV2（Firefox 91+） |
+| `airferry-sender-web-v1.1.4.zip` | 网页发送端静态站点，部署到任意静态托管 |
+| `airferry-sender-web-standalone-v1.1.4.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
+| `airferry-receiver-android-arm64-v1.1.4.apk` | **Android 扫码端**：arm64-v8a，Android 10+，对准屏幕二维码即可接收 |
+| `airferry-receiver-windows-x64-v1.1.4.zip` | **Windows 扫码端**：x64，Windows 10+，支持摄像头 + USB/HDMI/SDI 采集卡 |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 

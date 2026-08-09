@@ -282,6 +282,6 @@ jobs:
             Write-Host "Release $Tag not found — creating draft"
             gh release create $Tag --draft --title $Tag --notes "Windows build from CI (workflow_dispatch)"
           }
-          # --clobber：覆盖同名 asset（覆盖式发布）。
-          gh release upload $Tag "$ZipName#接收端-Windows-x64" --clobber
+          # --clobber：覆盖同名 asset（覆盖式发布）。asset 不设 label（见 AGENTS.md §2.8）。
+          gh release upload $Tag "$ZipName" --clobber
           Write-Host "已上传 $ZipName 到 release $Tag"
