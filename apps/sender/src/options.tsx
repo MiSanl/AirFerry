@@ -540,7 +540,6 @@ export default function App() {
         )}
       </main>
       <footer className="app-footer">
-        <span className="app-footer-hint">需要接收文件？下载手机 / 电脑扫码端：</span>
         <a
           className="app-footer-link"
           href="https://github.com/UR-SillyB/AirFerry/releases/latest"
