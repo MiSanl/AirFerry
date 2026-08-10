@@ -663,6 +663,17 @@ class ScanActivity : ComponentActivity() {
                             Toast.LENGTH_LONG,
                         ).show()
                     }
+                } catch (e: OutOfMemoryError) {
+                    // A large recovered payload (e.g. multi-MB text decoded to a
+                    // ~2x String) can transiently exceed the default heap. Do not
+                    // crash the whole scanner — drop to a graceful message. The
+                    // bytes are typically already persisted by this point, so the
+                    // user can reopen the file from the list.
+                    android.util.Log.e("ScanActivity", "recoverAndStage OOM", e)
+                    clearRecoveryStage()
+                    runOnUiThread {
+                        Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
@@ -716,7 +727,17 @@ class ScanActivity : ComponentActivity() {
         // Text payload → ETTEXTv1. Detected BEFORE the bundle check.
         // Prefer the descriptor filename (sender select-page name); fall back
         // to the default only when the descriptor never supplied one.
-        if (TextParser.isText(truncBytes)) {
+        //
+        // Size guard: only decode into the in-memory text UI when it fits within
+        // the text cap. Otherwise fall through to single-file handling below,
+        // which saves the raw bytes as a `.txt` file — decoding a multi-MB text
+        // message into a ~2x UTF-16 String plus a re-encode here balloons the
+        // JVM heap past the budget on low-end devices (the sibling text paths in
+        // FileListActivity / ReceiveTextActivity / ReceiveBundleActivity all
+        // guard with fitsTextUi; this branch is the only one that did not).
+        if (TextParser.isText(truncBytes) &&
+            com.airferry.app.scan.TextLike.fitsTextUi(truncBytes.size)
+        ) {
             val text = TextParser.parse(truncBytes)
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")

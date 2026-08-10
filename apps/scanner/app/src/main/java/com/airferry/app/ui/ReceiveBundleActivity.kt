@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -167,7 +168,12 @@ class ReceiveBundleActivity : ComponentActivity() {
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(files, key = { it.filePath }) { f ->
+                // Bundle members are content-addressed: files with identical
+                // content share one blob path (ContentStore dedup), so filePath
+                // is NOT unique within a bundle and using it as a LazyColumn key
+                // crashes with "Key ... already used" once two dedup'd members
+                // appear on screen. Key by stable position instead.
+                itemsIndexed(files, key = { index, _ -> index }) { _, f ->
                     val looksText = TextLike.isTextLikeName(f.name)
                     FileRow(
                         f = f,

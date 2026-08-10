@@ -455,7 +455,6 @@ class FileListActivity : ComponentActivity() {
                 return
             }
         }
-        Toast.makeText(this, "正在校验…", Toast.LENGTH_SHORT).show()
         Thread {
             val receivedCrc = try {
                 ScanActivity.crc32OfBytes(file.readBytes())
