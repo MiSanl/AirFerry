@@ -175,10 +175,15 @@ class ReceiveBundleActivity : ComponentActivity() {
                 // appear on screen. Key by stable position instead.
                 itemsIndexed(files, key = { index, _ -> index }) { _, f ->
                     val looksText = TextLike.isTextLikeName(f.name)
+                    // Only readable in the in-memory text UI when it fits; larger
+                    // text-like members degrade to the file detail screen.
+                    val canOpenText = looksText && TextLike.fitsTextUi(f.size)
                     FileRow(
                         f = f,
                         looksText = looksText,
+                        canOpenText = canOpenText,
                         onOpenText = { openAsText(f) },
+                        onOpenAsFile = { openAsFile(f) },
                         onSave = {
                             pendingSaveIndex = files.indexOf(f)
                             saveOne.launch(f.name)
@@ -235,14 +240,24 @@ class ReceiveBundleActivity : ComponentActivity() {
     private fun FileRow(
         f: FileInfo,
         looksText: Boolean,
+        canOpenText: Boolean,
         onOpenText: () -> Unit,
+        onOpenAsFile: () -> Unit,
         onSave: () -> Unit,
         onShare: () -> Unit,
     ) {
+        // Text-like members are tappable: open the text UI if it fits, otherwise
+        // degrade to the file detail screen (so a >2MB .txt/.html still shows its
+        // name and can be saved/shared instead of a bare "文件过大" toast).
+        val onClick = if (looksText) {
+            if (canOpenText) onOpenText else onOpenAsFile
+        } else {
+            null
+        }
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .then(if (looksText) Modifier.clickable(onClick = onOpenText) else Modifier),
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(containerColor = CardBg)
         ) {
@@ -252,20 +267,17 @@ class ReceiveBundleActivity : ComponentActivity() {
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        if (looksText) "📝 ${f.name}" else f.name,
+                        f.name,
                         color = TextPrimary,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
                         maxLines = 1,
                     )
                     Text(
-                        if (looksText) "${formatSize(f.size)} · 点开可复制" else formatSize(f.size),
+                        formatSize(f.size),
                         color = TextSecondary,
                         fontSize = 12.sp,
                     )
-                }
-                if (looksText) {
-                    TextButton(onClick = onOpenText) { Text("复制", color = Success, fontSize = 13.sp) }
                 }
                 TextButton(onClick = onSave) { Text("保存", color = Accent, fontSize = 13.sp) }
                 TextButton(onClick = onShare) { Text("分享", color = Success, fontSize = 13.sp) }
@@ -286,7 +298,11 @@ class ReceiveBundleActivity : ComponentActivity() {
         }
         try {
             if (!TextLike.fitsTextUi(src.length())) {
-                Toast.makeText(this, "文件过大，请用「保存」后用其他应用打开", Toast.LENGTH_SHORT).show()
+                // A text-like member larger than the in-memory text UI cap is not
+                // readable as a String here — fall back to the file detail screen
+                // (name / size / save / share) instead of just toasting "文件过大",
+                // so the user can still see the file name and act on it.
+                openAsFile(info)
                 return
             }
             val bytes = src.readBytes()
@@ -306,6 +322,30 @@ class ReceiveBundleActivity : ComponentActivity() {
         } catch (e: Exception) {
             Toast.makeText(this, "无法作为文字打开: ${e.message}", Toast.LENGTH_LONG).show()
         }
+    }
+
+    /**
+     * Open a bundle member in the generic file detail screen (name / size /
+     * CRC / save / share). Used when a text-like member exceeds the in-memory
+     * text-UI cap, so the user still sees the file name and can save/share it
+     * instead of hitting a bare "文件过大" toast. RESAVE=true keeps the blob in
+     * ContentStore and skips the legacy copy-to-received-dir duplicate.
+     */
+    private fun openAsFile(info: FileInfo) {
+        val src = File(info.filePath)
+        if (!src.exists()) {
+            Toast.makeText(this, "文件不可用", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startActivity(
+            Intent(this, ReceiveDetailActivity::class.java).apply {
+                putExtra("FILE_PATH", src.absolutePath)
+                putExtra("FILE_NAME", info.name)
+                putExtra("FILE_SIZE", info.size)
+                putExtra("CRC32_UNKNOWN", true)
+                putExtra("RESAVE", true)
+            }
+        )
     }
 
 
