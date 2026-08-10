@@ -10,9 +10,11 @@
     "prepare-wasm": "node scripts/prepare-wasm.cjs",
     "predev": "node scripts/prepare-wasm.cjs",
     "prebuild": "node scripts/prepare-wasm.cjs",
+    "prebuild:receiver": "node scripts/prepare-wasm.cjs",
     "prebuild:standalone": "node scripts/prepare-wasm.cjs",
     "dev": "vite",
     "build": "vite build",
+    "build:receiver": "vite build --config vite.receiver.config.ts",
     "build:standalone": "vite build --config vite.standalone.config.ts && node scripts/build-standalone.cjs",
     "preview": "vite preview"
   },

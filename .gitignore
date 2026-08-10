@@ -19,6 +19,8 @@ build/
 dist/
 # Standalone single-file web build output (apps/web/dist-standalone/).
 dist-standalone/
+# Web receiver build output (apps/web/dist-receiver/ — separate zip from sender).
+dist-receiver/
 
 # Plasmo extension build output + generated typings/cache (both repo-root and
 # per-package). These are regenerable build artifacts, never source.

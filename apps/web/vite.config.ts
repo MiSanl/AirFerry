@@ -83,14 +83,15 @@ export default defineConfig({
     // Emit a static site under dist/ that can be hosted anywhere (GitHub Pages,
     // Netlify, any static server). Relative base so it works under sub-paths
     // (e.g. username.github.io/repo/), not just site root.
+    // Single entry: sender (index.html). The receiver is built separately by
+    // vite.receiver.config.ts into dist-receiver/ so the two ship as independent
+    // self-contained zips (airferry-sender-web / airferry-receiver-web).
     outDir: "dist",
+    emptyOutDir: true,
     target: "esnext",
-    // Multi-page: index.html (sender) + receiver.html (receiver). Each is a
-    // thin entry mounting a shared sender-source component.
     rollupOptions: {
       input: {
         index: path.resolve(__dirname, "index.html"),
-        receiver: path.resolve(__dirname, "receiver.html"),
       },
     },
   },

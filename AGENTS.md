@@ -162,7 +162,8 @@ cd apps/web
 npm install            # 首次（含 postinstall: 提取 lzma-wasm）
 
 npm run dev            # Vite HMR 开发（http://localhost:5180）
-npm run build          # 产出静态站点 dist/（双入口 index 发送 + receiver 接收，可部署任意静态托管）
+npm run build          # 产出**发送端**静态站点 dist/（index.html 单入口，可部署任意静态托管）
+npm run build:receiver # 产出**接收端**静态站点 dist-receiver/（receiver.html 单入口，独立 zip）
 npm run build:standalone  # 产出发送端自包含单文件 dist-standalone/index.html（双击即用，file:// 可运行）
 npm run preview        # 本地预览构建产物
 ```
@@ -177,7 +178,7 @@ npm run preview        # 本地预览构建产物
 >
 > **单文件版（`npm run build:standalone`）**：产出**单个 `dist-standalone/index.html`**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击即可在 `file://` 下运行**，无需服务器。原理：① Vite IIFE bundle（去 ES module 标记，绕过 file:// 的 module 限制）；② worker 源码字符串化后用 Blob URL 加载（绕过 file:// 的 Worker 限制）；③ 三个 WASM base64 内联 + 复用现成 buffer 接口（`init(buffer)` / `initZstdFromBytes` / lzma 自带 base64，绕过 file:// 的 fetch 限制）。`build-standalone.cjs` 后处理脚本完成内联，并处理 `</script>` 转义、`import.meta.url` 替换、`process` polyfill 三个细节。sender 源码（`options.tsx`/`loader.ts`）通过 `globalThis.__AIRFERRY_STANDALONE__` 标志做环境自适应，扩展/web 普通版不受影响。
 >
-> **网页接收端（v1.1.6 新增，`receiver.html`）**：`npm run build` 现产出**双入口**静态站点——`index.html`（发送端）+ `receiver.html`（接收端）。接收端用浏览器 `getUserMedia` 拿摄像头（**三级 fallback**：后置高分辨高帧率 → 后置无约束 → 默认摄像头 `true`，缓解「Starting videoinput failed」——某些摄像头/驱动对严格 constraint 集或 facingMode 不兼容；**`frameRate:{ideal:60,max:60}`** 钉住上限确保 60fps 摄像头真给 60，否则 ideal 软约束常被降 30fps → Web 卡 120 码/s），`requestVideoFrameCallback` 取帧（**1080 全分辨率，不 downscale**），经 **QR decode worker 池**（`zxing-wasm/reader` 兼容路径，**`QR_WORKER_POOL=4` 个 worker 并行解码**跨核分摊帧率，镜像 Android 线程池；**整帧全图解码**，zxing `maxNumberOfSymbols:4` 在多码任意位置都能检出——不用固定 ROI，真实手机拍摄码偏移/倾斜时 ROI 会把码切半导致难扫）→ **receive worker**（单例，`ReceiverSessionWasm` **串行** ingest + `assemble_raw` + JS 侧 zstd/xz 解压 + CRC 校验 + 文字/包/单文件分流）。源码在 `apps/sender/src/{pages/ReceivePage.tsx, receive/{decompress,parse}.ts, workers/{receive,qr-decode}.worker.ts}`，web 入口 `apps/web/src/receiver.tsx` + `apps/web/receiver.html`。Vite 多页面（`rollupOptions.input`）+ `worker.format:"es"`（worker 含 dynamic import 需 ES 格式）。`zxing-wasm` 与 `lzma-wasm` 装在 web 的 node_modules，用 alias 指向其 dist 入口（sender/node_modules 无此包）。`prepare-wasm.cjs` 额外拷 `zxing_reader.wasm` 到 `public/` 供 worker 运行时 fetch。`airferry-sender-web-v{VER}.zip` 现同时含发送+接收两入口，共享 assets。**接收端只有普通多文件版（`receiver.html`），不再保留单文件版**（v1.1.6 曾用 `build:receiver:standalone`，已移除）。
+> **网页接收端（v1.1.6 新增，`receiver.html`）**：v1.1.6 起发送端与接收端**分开构建、独立 zip**——`npm run build` 产出发送端 `dist/`（index.html 单入口），`npm run build:receiver` 产出接收端 `dist-receiver/`（receiver.html 单入口），打包为 `airferry-sender-web-v{VER}.zip` + `airferry-receiver-web-v{VER}.zip` 两个独立可部署产物（发送端 zip 排除 `zxing_reader.wasm`）。接收端用浏览器 `getUserMedia` 拿摄像头（**三级 fallback**：后置高分辨高帧率 → 后置无约束 → 默认摄像头 `true`，缓解「Starting videoinput failed」——某些摄像头/驱动对严格 constraint 集或 facingMode 不兼容；**`frameRate:{ideal:60,max:60}`** 钉住上限确保 60fps 摄像头真给 60，否则 ideal 软约束常被降 30fps → Web 卡 120 码/s），`requestVideoFrameCallback` 取帧（**1080 全分辨率，不 downscale**），经 **QR decode worker 池**（`zxing-wasm/reader` 兼容路径，**`QR_WORKER_POOL=4` 个 worker 并行解码**跨核分摊帧率，镜像 Android 线程池；**整帧全图解码**，zxing `maxNumberOfSymbols:4` 在多码任意位置都能检出——不用固定 ROI，真实手机拍摄码偏移/倾斜时 ROI 会把码切半导致难扫）→ **receive worker**（单例，`ReceiverSessionWasm` **串行** ingest + `assemble_raw` + JS 侧 zstd/xz 解压 + CRC 校验 + 文字/包/单文件分流）。源码在 `apps/sender/src/{pages/ReceivePage.tsx, receive/{decompress,parse}.ts, workers/{receive,qr-decode}.worker.ts}`，web 入口 `apps/web/src/receiver.tsx` + `apps/web/receiver.html`。Vite 多页面（`rollupOptions.input`）+ `worker.format:"es"`（worker 含 dynamic import 需 ES 格式）。`zxing-wasm` 与 `lzma-wasm` 装在 web 的 node_modules，用 alias 指向其 dist 入口（sender/node_modules 无此包）。`prepare-wasm.cjs` 额外拷 `zxing_reader.wasm` 到 `public/` 供 worker 运行时 fetch。发送端与接收端 web **拆为两个独立 zip**（`airferry-sender-web-v{VER}.zip` / `airferry-receiver-web-v{VER}.zip`），各自自包含可独立部署。**接收端只有普通多文件版（`receiver.html`），不再保留单文件版**（v1.1.6 曾用 `build:receiver:standalone`，已移除）。
 >
 > **接收端 UI 复用发送端设计系统**：`ReceivePage.tsx` 样式从 `app.css` 抽离为独立 `apps/sender/src/assets/receive.css`（发送端 `app.css` 不再含 `.receive-*`）。接收端 JSX 复用发送端骨架（`.app` / `.app-header` / `.app-logo` / `.app-main` / `.app-footer`），色值一律走 `app.css` 设计 token（`--color-primary`/`--color-card`/`--color-border`/`--color-success`/`--color-error` 等），无硬编码色；进度条/参数卡/结果卡/按钮与发送端同源观感。接收端专属结构（`.receive-header`/`.camera-area`/`.fps-badge`/`.progress-*`/`.result-area`/`.bundle-*` 等）定义在 `receive.css`。`.receive-page` 复用 `.app` 的 720px 居中布局但设 `justify-content:flex-start`（相机+进度卡可能超一屏，`center` 会裁剪顶部）。图标直接 `import iconUrl from "../../assets/icon128.png"`。
 
@@ -211,7 +212,7 @@ npm run preview        # 本地预览构建产物
 - **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android 直接保留 v1.1.3 的 `scan_jni.cpp`，Windows 通过 `core/zxing-decoder/` 镜像同一解码选项与全帧/ROI 调度模式。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
 - **`build_web` 不编译 Rust**：`cd apps/web && npm run build`（Vite 静态站点），`prebuild` 会跑 `prepare-wasm.cjs` 校验 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`，持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` 到 `public/`。web 明确复用现代 WASM，**首次构建前须先 `cd apps/sender && npm run wasm`**。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
 - **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥固定在 `dist/airferry-extension.pem`——**首次运行自动生成并挪到此处，之后 MV2/MV3 复用同一私钥**，保证扩展 ID 稳定。找不到 Chrome 二进制时跳过 crx、仅留 zip。
-- **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
+- **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,receiver-web-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
 
 ### 2.7 构建目录布局
 
@@ -258,7 +259,8 @@ npm run preview        # 本地预览构建产物
 | Chrome MV2 | `airferry-sender-chrome-mv2-v{VER}.crx` + `.zip` | 同上，旧版浏览器兼容 |
 | Firefox MV3 | `airferry-sender-firefox-mv3-v{VER}.xpi` | Firefox 116+；`.xpi` 本质是 zip 改名 |
 | Firefox MV2 | `airferry-sender-firefox-mv2-v{VER}.xpi` | Firefox 91+ |
-| 网页发送端 | `airferry-sender-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。`pack_dist` 自动打包（须先跑 `build-all.sh web` 产出 `apps/web/dist/`，缺失时 warn 跳过） |
+| 网页发送端 | `airferry-sender-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。v1.1.6 起**仅含发送端**（`build_web` 产 `apps/web/dist/`，打包排除 `zxing_reader.wasm`）。`pack_dist` 自动打包（须先跑 `build-all.sh web`，缺失时 warn 跳过） |
+| 网页接收端 | `airferry-receiver-web-v{VER}.zip` | **接收端独立 zip**（`receiver.html` + assets + `wasm-zstd.wasm` + `zxing_reader.wasm`）。v1.1.6 起与发送端 web 拆分，可独立部署；`build:receiver` 产 `apps/web/dist-receiver/`。`pack_dist` 自动打包（缺失时 warn 跳过） |
 | 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `cd apps/web && npm run build:standalone` 产出（`dist-standalone/index.html` → 改名）。不进 `pack_dist`（与静态站点 zip 不同，单文件是 `.html` 无需 zip），手动上传 Release |
 
 #### 发布流程（GitHub Release 怎么来）

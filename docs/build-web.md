@@ -39,11 +39,23 @@ npm run preview        # 本地预览构建产物（默认 http://localhost:4173
 
 `npm run build:standalone` 也有相同的 `prebuild:standalone` 前置，不会在缺少 `wasm-zstd.wasm` 时先成功打包、再在后处理阶段失败。
 
+## 构建命令（发送端 / 接收端拆分）
+
+v1.1.6 起发送端与接收端**分开构建、独立 zip**：
+
+```bash
+npm run build           # 发送端 → dist/（index.html 单入口）
+npm run build:receiver  # 接收端 → dist-receiver/（receiver.html 单入口）
+npm run build:standalone  # 发送端单文件版 → dist-standalone/index.html
+```
+
+两个产物各自自包含、可独立部署；发送端 zip 打包时排除 `zxing_reader.wasm`（接收端 QR 解码专用）。
+
 ## 产物结构
 
 ```
-apps/web/dist/
-├── index.html                     # SPA 入口（资源用相对路径 ./assets/...）
+apps/web/dist/                     # 发送端（airferry-sender-web-v{VER}.zip）
+├── index.html                     # 发送端入口（资源用相对路径 ./assets/...）
 ├── wasm-zstd.wasm                 # zstd 压缩 WASM（worker 运行时 fetch）
 └── assets/
     ├── index-*.js                 # 主应用（含复用的 sender 页面/组件）
@@ -52,15 +64,28 @@ apps/web/dist/
     ├── transfer_engine_bg-*.wasm  # Rust 核心引擎（来自 web 自有 WASM 快照）
     ├── lzma_wasm_bg-*.wasm        # xz 压缩 WASM
     └── icon128-*.png              # 复用 sender 的图标
+
+apps/web/dist-receiver/            # 接收端（airferry-receiver-web-v{VER}.zip）
+├── receiver.html                  # 接收端入口
+├── wasm-zstd.wasm                 # zstd 解压 WASM
+├── zxing_reader.wasm              # QR 解码 worker 运行时 fetch
+└── assets/
+    ├── receiver-*.js              # 接收端主应用（ReceivePage + worker 编排）
+    ├── receiver-*.css             # 接收端样式
+    ├── qr-decode.worker-*.js      # QR 解码 worker 池
+    ├── receive.worker-*.js        # 串行 ingest worker
+    ├── airferry_zxing-*.js/.wasm  # fastzxing 快路径（Y 平面解码）
+    ├── transfer_engine_bg-*.wasm  # Rust 核心引擎
+    └── lzma_wasm_bg-*.wasm        # xz 解压 WASM
 ```
 
 ## 部署
 
-`dist/` 是纯静态文件，可部署到任意静态托管：
+发送端 `dist/` / 接收端 `dist-receiver/` 都是纯静态文件，可部署到任意静态托管：
 
-- **GitHub Pages**：把 `dist/` 内容推到 `gh-pages` 分支或配置 Actions 构建。`base: "./"` 用相对路径，部署到子路径（如 `user.github.io/repo/`）也正常。
-- **Netlify / Vercel / Cloudflare Pages**：构建命令 `npm run build`，发布目录 `apps/web/dist`。
-- **任意静态服务器**：`nginx`/`caddy`/`python -m http.server` 直接托管 `dist/`。
+- **GitHub Pages**：把 `dist/`（或 `dist-receiver/`）内容推到 `gh-pages` 分支或配置 Actions 构建。`base: "./"` 用相对路径，部署到子路径（如 `user.github.io/repo/`）也正常。
+- **Netlify / Vercel / Cloudflare Pages**：构建命令 `npm run build`（发送端）/ `npm run build:receiver`（接收端），发布目录 `apps/web/dist` 或 `apps/web/dist-receiver`。
+- **任意静态服务器**：`nginx`/`caddy`/`python -m http.server` 直接托管对应目录。
 
 > **不需要 COOP/COEP 头**：核心传输功能不依赖 `SharedArrayBuffer`（压缩在普通 Web Worker 里跑，QR 渲染在主线程 Canvas）。若未来引入多线程并行编码才需配置 `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp`。
 
@@ -70,15 +95,15 @@ apps/web/dist/
 
 ```bash
 cd apps/web
-npm run build   # 构建 dist/（含 index.html + receiver.html 双入口）
+npm run build:receiver   # 构建接收端 dist-receiver/（receiver.html 单入口）
 
 # 用法: node scripts/serve-https.mjs <serveDir> <crt> <key> [port]
-node scripts/serve-https.mjs dist .cert/selfsigned.crt .cert/selfsigned.key 8765
+node scripts/serve-https.mjs dist-receiver .cert/selfsigned.crt .cert/selfsigned.key 8765
 ```
 
 - 自签证书已就位在 `apps/web/.cert/`（`selfsigned.crt` + `selfsigned.key`）；浏览器访问会警告，点「高级」→「继续」即可。
 - 默认端口 **8765**，监听 `0.0.0.0`（本机 `https://localhost:8765/receiver.html`，局域网 `https://<LAN-IP>:8765/receiver.html`）。
-- 根路径 `/` 自动映射到 `receiver.html`（专注接收端测试；发送端走 `index.html`）。
+- 根路径 `/` 自动映射到 `receiver.html`（专注接收端测试）。
 
 ## 与浏览器扩展的关系
 

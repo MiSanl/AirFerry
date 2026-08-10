@@ -201,17 +201,18 @@ build_windows() {
 }
 
 build_web() {
-  info "构建网页端 (apps/web → dist/，含发送端 index.html + 接收端 receiver.html) ..."
+  info "构建网页端 — 发送端 dist/ + 接收端 dist-receiver/（各自独立 zip）..."
   # npm run build 已内嵌 prebuild（prepare-wasm.cjs）：校验 sender 的现代
   # wasm-pkg-simd，持锁复制到 web 自有 wasm-pkg/，再拷 wasm-zstd.wasm +
   # zxing_reader.wasm 到 public/。首次构建前须 cd apps/sender && npm run wasm；
   # 产物缺失时脚本非零退出，npm run build 失败，set -e 中断。
-  # Vite 多页面构建产出 index.html（发送端）+ receiver.html（接收端），共享
-  # 同一份 assets（React + transfer_engine WASM + zstd + lzma）。接收端的
-  # zxing-wasm 解码 worker + receive worker 也作为独立 chunk 产出。
   cd "$ROOT/apps/web"
+  # ① 发送端：vite.config.ts 单入口 index.html → dist/
   npm run build 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done
-  info "网页端构建完成 → apps/web/dist/（index.html 发送 + receiver.html 接收）"
+  info "发送端网页构建完成 → apps/web/dist/（index.html）"
+  # ② 接收端：vite.receiver.config.ts 单入口 receiver.html → dist-receiver/
+  npm run build:receiver 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done
+  info "接收端网页构建完成 → apps/web/dist-receiver/（receiver.html）"
 }
 
 # 打包 Chrome MV2/MV3 为已签名 .crx。
@@ -269,6 +270,7 @@ pack_dist() {
         "$ROOT/dist"/airferry-chrome-*.zip \
         "$ROOT/dist"/airferry-firefox-*.xpi \
         "$ROOT/dist"/airferry-sender-web-*.zip \
+        "$ROOT/dist"/airferry-receiver-web-*.zip \
         "$ROOT/dist"/airferry-web-*.zip
 
   # 扫码端 APK
@@ -290,16 +292,26 @@ pack_dist() {
     warn "未找到 Windows 端 publish 产物。如需打包 Windows 端，请在 Windows 上运行: ./scripts/build-windows.ps1 -Pack"
   fi
 
-  # 网页端 zip（纯静态站点，解压即可托管到任意静态服务器）。单个 zip 同时含
-  # 发送端（index.html）与接收端（receiver.html）入口，共享同一份 assets
-  # （React + transfer_engine/zstd/lzma WASM + zxing_reader.wasm）。与 Windows
-  # 同样用 warn 而非 error：用户可能只想发扩展+APK 而不发网页端。
+  # 网页端 zip（纯静态站点，解压即可托管到任意静态服务器）。发送端与接收端
+  # 拆成两个独立 zip，各自自包含可独立部署：
+  #   • airferry-sender-web-v{VER}.zip    ← dist/        （index.html 发送端）
+  #   • airferry-receiver-web-v{VER}.zip  ← dist-receiver/（receiver.html 接收端）
+  # 发送端 zip 排除 zxing_reader.wasm（接收端 QR 解码专用）；接收端自带
+  # wasm-zstd.wasm（解压 zstd 载荷）+ zxing_reader.wasm。与 Windows 同样用
+  # warn 而非 error：用户可能只想发扩展+APK 而不发网页端。
   local web_dist="$ROOT/apps/web/dist"
   if [[ -d "$web_dist" ]]; then
-    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . )
-    info "网页端（发送 index.html + 接收 receiver.html）→ dist/airferry-sender-web-v${VER}.zip"
+    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . -x 'zxing_reader.wasm' )
+    info "发送端网页 → dist/airferry-sender-web-v${VER}.zip（index.html）"
   else
-    warn "未找到网页端构建产物（${web_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
+    warn "未找到发送端网页构建产物（${web_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
+  fi
+  local web_receiver_dist="$ROOT/apps/web/dist-receiver"
+  if [[ -d "$web_receiver_dist" ]]; then
+    ( cd "$web_receiver_dist" && zip -r -q -X "$ROOT/dist/airferry-receiver-web-v${VER}.zip" . )
+    info "接收端网页 → dist/airferry-receiver-web-v${VER}.zip（receiver.html）"
+  else
+    warn "未找到接收端网页构建产物（${web_receiver_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
   fi
 
   # 发送端：Chrome crx + zip，Firefox xpi（即 zip 改名）
