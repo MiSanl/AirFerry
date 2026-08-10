@@ -91,7 +91,17 @@ apps/web/dist-receiver/            # 接收端（airferry-receiver-web-v{VER}.zi
 
 ### 局域网 HTTPS 接收端测试（`serve-https.mjs`）
 
-**接收端（`receiver.html`）需要摄像头权限，而 `getUserMedia` 只在安全上下文（HTTPS 或 localhost）可用**。局域网真机扫码测试需用 HTTPS 静态服务器。仓库自带最小实现：
+> ⚠️ **网页接收端不能像发送端单文件版那样双击打开**：它是多文件静态站点，必须先部署；且 `getUserMedia`（摄像头）只在**安全上下文**（HTTPS 或 localhost）可用，`file://` 直开或普通 http（非 localhost）无法访问摄像头。局域网真机扫码测试需用 HTTPS 静态服务器。
+
+仓库自带最小实现：
+
+```bash
+cd apps/web
+npm run build:receiver   # 构建接收端 dist-receiver/（receiver.html 单入口）
+
+# 用法: node scripts/serve-https.mjs <serveDir> <crt> <key> [port]
+node scripts/serve-https.mjs dist-receiver .cert/selfsigned.crt .cert/selfsigned.key 8765
+```
 
 ```bash
 cd apps/web
