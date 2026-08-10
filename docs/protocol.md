@@ -53,6 +53,8 @@ session_id = FNV1a_128(
 
 发送端在写入前验证 `file_count` 与每个 UTF-8 文件名均可无损表示为 u16；文件名超过 65535 字节会明确报错，不允许静默截断并造成容器错位。接收端有**两个独立上限**：**压缩对象（wire）上限** `raptorq_core::MAX_OBJECT_BYTES` = **32 MiB**（即 RaptorQ 实际传输的压缩后字节，`ObjectMeta::transfer_length`），以及**原始（解压后）内容上限** `raptorq_core::MAX_ORIGINAL_BYTES` = **256 MiB**（`descriptor::FileMeta::original_size`）。两个上限分别约束"传输量"与"还原内存"，因此高度可压缩的对象（wire 小、原始大）只要原始 ≤ 256 MiB 且压缩后 ≤ 32 MiB 即可完整接收。**发送端不再硬性阻止超限内容**：所选内容原始大小超过 256 MiB 时，会在「发送」前弹出确认提示，告知接收端有该硬性上限、超限传输无法被完整接收；用户确认后仍会正常编码发送（浏览器接收端同样受 `MAX_DECOMPRESSED_BYTES` = 256 MiB 约束）。单个 0 B 文件会在发送前明确拒绝（bundle 内的空条目仍可表示）。
 
+**发送端 wire 上限硬门**：由于接收端对超过 `MAX_OBJECT_BYTES`（32 MiB）的 wire 对象是**硬性拒绝**（无法还原，非警告），发送端在压缩 worker（`apps/sender/src/workers/compress.worker.ts` 的 `finalizeAndPost`）内**压缩完成后**检查实际 `compressed_size`：若超过 32 MiB，直接报错并终止，不再进入播放流程。这覆盖了 256 MiB 原始确认框**漏掉**的关键场景——原始大小介于 32 MiB 与 256 MiB 之间、但压缩后仍超 32 MiB（不可压内容、多文件 bundle 总量大等）：此前会无提示地开始一个接收端必然失败的传输（即「原始 > 32 MiB 时无提示、哪怕单个文件很小也会出问题」）。注意此检查发生在压缩后，无法在「发送」前预判（压缩率未知），故放在 worker 内、用户看到明确报错而非静默失败。
+
 ## 帧格式 (Frame Format)
 
 每帧 = `[Header 60B][Payload T B][Footer 4B]`，其中 **T = symbol_size**（每个 QR 帧的载荷大小）。

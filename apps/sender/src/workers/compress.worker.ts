@@ -55,7 +55,7 @@
 import { preparePayload, initZstdFromBytes } from "@/wasm/compress"
 import { crc32 } from "@/wasm/crc32"
 import { contentFingerprint, deriveSessionId } from "@/wasm/session"
-import { buildBundle } from "@/wasm/bundle"
+import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
 
@@ -309,6 +309,28 @@ async function finalizeAndPost(
     `Compression: ${raw.length} → ${compressedSize} bytes ` +
       `(${raw.length > 0 ? ((compressedSize / raw.length) * 100).toFixed(1) : "0"}%)`
   )
+
+  // --- Wire-ceiling gate (32 MiB, mirrored from raptorq_core::MAX_OBJECT_BYTES) ---
+  // The RaptorQ object actually transmitted over the QR stream is the COMPRESSED
+  // payload. Every receiver (Android / Windows / web) hard-rejects a transfer
+  // whose wire length exceeds 32 MiB — it can never be recovered, no matter how
+  // compressible or how many (or how small) the constituent files are. This is a
+  // hard impossibility, not a "warn and continue" case, so surface a clear error
+  // here (in the worker) rather than silently playing out a transfer the receiver
+  // will always fail. Note this is distinct from the 256 MiB original-size
+  // confirm dialog in FileSelectPage: that one only fires pre-compression for a
+  // selection whose ORIGINAL bytes alone exceed the receiver's post-decompression
+  // budget, and misses exactly this scenario (original between 32 MiB and 256 MiB
+  // that does not compress under the wire ceiling).
+  if (compressedSize > MAX_TRANSFER_BYTES) {
+    const mb = (compressedSize / (1024 * 1024)).toFixed(1)
+    post({
+      phase: "error",
+      message: `压缩后大小 ${mb} MiB 超过 ${MAX_TRANSFER_MIB} MiB 传输上限，接收端（Android/Windows/网页）无法接收，请减少发送内容`,
+      jobId,
+    })
+    return
+  }
 
   // --- CRC32 (on the pre-compress bytes) ---
   // 这一段（CRC32 over the whole payload）没有任何阶段回调，是 done 前的"盲区"。
