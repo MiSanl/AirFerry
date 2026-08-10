@@ -163,7 +163,7 @@ jobs:
       # Keep in sync with apps/sender/package.json, build.gradle.kts,
       # Cargo.toml workspace version, AirFerry.Windows.csproj <Version>
       # (AGENTS.md §2.8 版本号同步 + Windows 发版).
-      VER: '1.1.5'
+      VER: '1.1.6'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 

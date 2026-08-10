@@ -29,8 +29,8 @@ pub use config::{Config, MAX_SYMBOL_SIZE, MIN_SYMBOL_SIZE};
 pub use decoder::Decoder;
 pub use encoder::Encoder;
 pub use meta::{
-    ObjectMeta, SourceBlockMeta, MAX_OBJECT_BYTES, MAX_SOURCE_BLOCKS, MAX_SOURCE_SYMBOLS_PER_BLOCK,
-    MAX_TOTAL_SOURCE_SYMBOLS,
+    ObjectMeta, SourceBlockMeta, MAX_OBJECT_BYTES, MAX_ORIGINAL_BYTES, MAX_SOURCE_BLOCKS,
+    MAX_SOURCE_SYMBOLS_PER_BLOCK, MAX_TOTAL_SOURCE_SYMBOLS,
 };
 pub use symbol::{Symbol, SymbolId};
 

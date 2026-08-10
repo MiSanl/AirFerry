@@ -6,6 +6,7 @@
 
 #![cfg(feature = "jni")]
 
+use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use jni::objects::{JByteArray, JClass};
@@ -75,7 +76,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
     }
     let frame_vec: Vec<u8> = match env.convert_byte_array(&frame_bytes) {
         Ok(v) => v,
-        Err(_) => return INGEST_ERROR,
+        Err(_) => return ingest_status::INGEST_ERROR as jlong,
     };
     let session = unsafe { &mut *(handle as *mut ReceiverSession) };
     let frame = match qr_protocol::Frame::from_bytes(&frame_vec) {
@@ -86,7 +87,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
                 frame_vec.len(),
                 e
             ));
-            return INGEST_ERROR;
+            return ingest_status::INGEST_ERROR as jlong;
         }
     };
     let is_descriptor = frame.header.flags & qr_protocol::frame::FLAG_DESCRIPTOR != 0;
@@ -125,40 +126,12 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverInge
     } else {
         0
     };
-    pack_ingest_status(
+    ingest_status::pack(
         complete == 1,
         accepted == 1,
         p.session_mismatch_streak,
         p.received_symbols,
-    )
-}
-
-/// Error sentinel: received_symbols = u32::MAX (an unreachable real value), all
-/// flags clear. The Kotlin side treats this as "frame rejected / nothing to do".
-pub const INGEST_ERROR: jlong = (0xFFFF_FFFFu64 << 32) as jlong;
-
-/// Pack the per-frame status into the jlong layout documented on
-/// [`receiverIngest`].
-fn pack_ingest_status(
-    complete: bool,
-    accepted: bool,
-    mismatch_streak: u32,
-    received_symbols: u32,
-) -> jlong {
-    let mut bits: u64 = 0;
-    if complete {
-        bits |= 1;
-    }
-    if accepted {
-        bits |= 1 << 1;
-    }
-    // Clamp streak into 16 bits (it's reset well before 2^16 in practice).
-    let streak16 = (mismatch_streak & 0xFFFF) as u64;
-    bits |= streak16 << 8;
-    // Clamp received_symbols into 32 bits (a real transfer stays well below).
-    let recv32 = (received_symbols & 0xFFFF_FFFF) as u64;
-    bits |= recv32 << 32;
-    bits as jlong
+    ) as jlong
 }
 
 /// On-demand progress query (JSON). The UI calls this on its ~7 Hz refresh
@@ -371,9 +344,10 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLast
 
 fn progress_json(p: &Progress) -> String {
     format!(
-        r#"{{"decoded_symbols":{},"total_symbols":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
+        r#"{{"decoded_symbols":{},"total_symbols":{},"symbol_size":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
         p.decoded_symbols,
         p.total_symbols,
+        p.symbol_size,
         p.received_symbols,
         p.frames_seen,
         p.frames_duplicate,

@@ -6,13 +6,22 @@ use raptorq::ObjectTransmissionInformation;
 pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
 /// RFC 6330 ceiling on the number of source blocks (Z_max).
 pub const MAX_SOURCE_BLOCKS: usize = 256;
-/// Local receiver budget. RFC maxima describe the wire format, not what a
-/// phone or browser process can safely hold while RaptorQ state, decompressed
-/// output, an FFI copy and persistence buffers overlap. 32 MiB is deliberately
-/// conservative: a QR transfer of this size is already very long, while the
-/// previous 256 MiB allowance could exhaust a normal Android heap on a fully
-/// valid transfer.
+/// Wire (compressed) transfer ceiling. This bounds the **RaptorQ object length**
+/// — the compressed payload carried symbol-by-symbol over the QR stream
+/// (`ObjectMeta::transfer_length`). It is deliberately conservative: a 32 MiB
+/// QR transfer is already extremely long to play out, and it keeps the decoder's
+/// block-state allocations modest on phones and browsers.
 pub const MAX_OBJECT_BYTES: u64 = 32 * 1024 * 1024;
+/// Receiver budget for the **original (post-decompression) size**
+/// (`descriptor::FileMeta::original_size`). Kept separate from
+/// [`MAX_OBJECT_BYTES`] so a highly-compressible object — compressed under 32 MiB
+/// on the wire but expanding far beyond it — can still be recovered. This is a
+/// native-memory budget (Rust receiver allocates on the native heap, not the
+/// Android/JS GC heap). 256 MiB matches the pre-v1.1.4 allowance; it does NOT
+/// relax the wire/transfer ceiling ([`MAX_OBJECT_BYTES`] still caps what is
+/// actually transmitted), and the XZ decoder additionally enforces its own 128
+/// MiB streaming memory ceiling.
+pub const MAX_ORIGINAL_BYTES: u64 = 256 * 1024 * 1024;
 /// Bound the eager `Vec<Option<Symbol>>` allocations made by the upstream
 /// decoder independently from the encoded byte length.
 pub const MAX_TOTAL_SOURCE_SYMBOLS: u64 = 524_288;

@@ -1,6 +1,6 @@
 {
   "name": "@airferry/web",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "AirFerry web sender — static website that streams QR codes (reuses sender source).",
   "type": "module",
   "license": "MIT",
@@ -20,7 +20,8 @@
     "@foxglove/wasm-zstd": "^1.0.1",
     "lzma-wasm": "^1.0.7",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "zxing-wasm": "^3.1.2"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",

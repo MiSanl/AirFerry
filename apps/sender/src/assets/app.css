@@ -69,7 +69,6 @@ code {
 }
 
 .muted { color: var(--color-text-muted); font-size: 12px; }
-.hint { color: var(--color-text-secondary); font-size: 13px; line-height: 1.6; }
 .error { color: var(--color-error); font-size: 13px; }
 
 /* ───────────── 应用骨架 ───────────── */
@@ -112,12 +111,6 @@ code {
   font-weight: 700;
   letter-spacing: 0.01em;
 }
-.app-subtitle {
-  margin: 2px 0 0;
-  font-size: 13px;
-  color: var(--color-text-muted);
-}
-
 /* ───────────── 步骤条 ───────────── */
 
 .steps {
@@ -267,7 +260,13 @@ code {
 }
 .btn.primary:hover { background: var(--color-primary-hover); border-color: var(--color-primary-hover); }
 .btn.primary:active { background: var(--color-primary-active); }
-.btn.primary:disabled { box-shadow: none; }
+.btn.primary:disabled {
+  background: var(--color-border-strong);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-muted);
+  box-shadow: none;
+  opacity: 1;
+}
 
 .btn.secondary {
   background: var(--color-surface);
@@ -878,7 +877,6 @@ code {
   .app-logo { width: 38px; height: 38px; }
   .app-logo img { width: 26px; height: 26px; }
   .app-title h1 { font-size: 19px; }
-  .app-subtitle { font-size: 12px; }
   .app-main { padding: var(--space-page) 14px; min-height: 320px; border-radius: var(--radius-md); }
   .page h2 { font-size: 17px; }
 

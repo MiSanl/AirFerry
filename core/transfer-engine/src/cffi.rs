@@ -27,34 +27,14 @@
 
 #![cfg(feature = "cffi")]
 
+use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use qr_protocol::frame::SessionIdRaw;
 
-/// Pack a per-frame status into a 64-bit word (bit layout documented on
-/// [`airferry_receiver_ingest`]). Kept byte-for-byte identical to the JNI
-/// layer's `pack_ingest_status` so both hosts parse the same wire contract.
-const INGEST_ERROR: u64 = 0xFFFF_FFFFu64 << 32;
-
-fn pack_ingest_status(
-    complete: bool,
-    accepted: bool,
-    mismatch_streak: u32,
-    received_symbols: u32,
-) -> u64 {
-    let mut bits: u64 = 0;
-    if complete {
-        bits |= 1;
-    }
-    if accepted {
-        bits |= 1 << 1;
-    }
-    let streak16 = (mismatch_streak & 0xFFFF) as u64;
-    bits |= streak16 << 8;
-    let recv32 = received_symbols as u64;
-    bits |= recv32 << 32;
-    bits
-}
+// Per-frame status packing + the error sentinel now live in the shared
+// [`ingest_status`] module so the JNI, C ABI, and WASM bindings cannot drift
+// from the wire contract (bit layout documented there).
 
 /// Create a "cache-only" receiver. `sid_lo`/`sid_hi` split the 128-bit session
 /// id into its low/high 64-bit halves (host order). As on Android, no object
@@ -95,7 +75,7 @@ pub unsafe extern "C" fn airferry_receiver_destroy(handle: *mut ReceiverSession)
 ///   - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF)
 ///   - bits 32..63 : `received_symbols` (low 32 bits)
 ///
-/// Returns `INGEST_ERROR` (`received_symbols == u32::MAX`) on a null handle or
+/// Returns [`ingest_status::INGEST_ERROR`] (`received_symbols == u32::MAX`) on a null handle or
 /// a frame that fails wire validation (bad magic / CRC / version); the host
 /// treats this as "frame rejected, nothing to do".
 ///
@@ -109,12 +89,12 @@ pub unsafe extern "C" fn airferry_receiver_ingest(
     frame_len: usize,
 ) -> u64 {
     if handle.is_null() {
-        return INGEST_ERROR;
+        return ingest_status::INGEST_ERROR;
     }
     // SAFETY: caller guarantees `frame_bytes[..frame_len]` is a valid borrowed
     // slice for the duration of this call.
     let slice: &[u8] = if frame_bytes.is_null() || frame_len == 0 {
-        return INGEST_ERROR;
+        return ingest_status::INGEST_ERROR;
     } else {
         unsafe { std::slice::from_raw_parts(frame_bytes, frame_len) }
     };
@@ -124,7 +104,7 @@ pub unsafe extern "C" fn airferry_receiver_ingest(
         Ok(f) => f,
         Err(e) => {
             cffi_log(&format!("frame rejected (len={}): {:?}", slice.len(), e));
-            return INGEST_ERROR;
+            return ingest_status::INGEST_ERROR;
         }
     };
     let prev_received = session.progress().received_symbols;
@@ -134,7 +114,7 @@ pub unsafe extern "C" fn airferry_receiver_ingest(
     let p = session.progress();
     let complete = session.is_complete();
     let accepted = p.received_symbols > prev_received;
-    pack_ingest_status(
+    ingest_status::pack(
         complete,
         accepted,
         p.session_mismatch_streak,
@@ -346,9 +326,10 @@ fn write_cstr(s: &str, out: *mut u8, cap: usize) -> usize {
 
 fn progress_json(p: &Progress) -> String {
     format!(
-        r#"{{"decoded_symbols":{},"total_symbols":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
+        r#"{{"decoded_symbols":{},"total_symbols":{},"symbol_size":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
         p.decoded_symbols,
         p.total_symbols,
+        p.symbol_size,
         p.received_symbols,
         p.frames_seen,
         p.frames_duplicate,
@@ -376,31 +357,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_status_bit_layout() {
-        // bit 0 = complete, bit 1 = accepted
-        assert_eq!(pack_ingest_status(false, false, 0, 0), 0);
-        assert_eq!(pack_ingest_status(true, false, 0, 0), 1);
-        assert_eq!(pack_ingest_status(false, true, 0, 0), 1 << 1);
-        assert_eq!(pack_ingest_status(true, true, 0, 0), 0b11);
-        // bits 8..23 = streak
-        assert_eq!(pack_ingest_status(false, false, 1, 0), 1 << 8);
-        assert_eq!(pack_ingest_status(false, false, 0xFFFF, 0), 0xFFFF << 8);
-        // streak is clamped to 16 bits
-        assert_eq!(pack_ingest_status(false, false, 0x1FFFF, 0), 0xFFFF << 8);
-        // bits 32..63 = received_symbols
-        assert_eq!(pack_ingest_status(false, false, 0, 1), 1u64 << 32);
-        assert_eq!(
-            pack_ingest_status(true, true, 0x1234, 0x5678),
-            0b11 | (0x1234u64 << 8) | (0x5678u64 << 32)
-        );
-    }
-
-    #[test]
-    fn ingest_error_sentinel_matches_jni() {
-        // Must be bit-for-bit identical to jni.rs::INGEST_ERROR so the host
-        // unpack code can treat both bindings the same way.
-        assert_eq!(INGEST_ERROR, 0xFFFF_FFFFu64 << 32);
-        assert_eq!(((INGEST_ERROR >> 32) & 0xFFFF_FFFF), 0xFFFF_FFFF);
+    fn ingest_status_shared_contract_unchanged() {
+        // The bit layout + sentinel now live in `ingest_status`; this binding
+        // must still honor that contract. The dedicated layout/clamp/sentinel
+        // assertions live in `ingest_status::tests` — here we just guard that
+        // the C ABI still references the same shared symbol (no local copy
+        // silently drifted back in).
+        assert_eq!(ingest_status::INGEST_ERROR, 0xFFFF_FFFFu64 << 32);
+        assert_eq!(ingest_status::pack(true, true, 0x1234, 0x5678), 0b11 | (0x1234u64 << 8) | (0x5678u64 << 32));
     }
 
     #[test]
@@ -432,7 +396,7 @@ mod tests {
             // Null frame pointer → INGEST_ERROR, no crash.
             assert_eq!(
                 airferry_receiver_ingest(h, std::ptr::null(), 0),
-                INGEST_ERROR
+                ingest_status::INGEST_ERROR
             );
             // Accessors on a fresh (no-descriptor) session report empty/zero.
             assert_eq!(airferry_receiver_is_complete(h), 0);
@@ -463,7 +427,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 airferry_receiver_ingest(std::ptr::null_mut(), std::ptr::null(), 0),
-                INGEST_ERROR
+                ingest_status::INGEST_ERROR
             );
             assert_eq!(airferry_receiver_is_complete(std::ptr::null()), 0);
             let mut out_buf: *mut u8 = std::ptr::null_mut();

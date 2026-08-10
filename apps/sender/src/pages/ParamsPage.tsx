@@ -78,7 +78,6 @@ export function ParamsPage({
   return (
     <div className="page">
       <h2>传输参数</h2>
-      <p className="page-desc">确认内容与大小，按需调整冗余与速度后开始传输</p>
       <table className="kv">
         <tbody>
           <tr>

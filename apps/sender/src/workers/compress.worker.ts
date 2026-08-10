@@ -55,7 +55,7 @@
 import { preparePayload, initZstdFromBytes } from "@/wasm/compress"
 import { crc32 } from "@/wasm/crc32"
 import { contentFingerprint, deriveSessionId } from "@/wasm/session"
-import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
+import { buildBundle } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
 
@@ -210,10 +210,6 @@ function isCurrent(jobId: number): boolean {
 
 async function processFiles(files: File[], jobId: number) {
   try {
-    const selectedBytes = files.reduce((sum, file) => sum + file.size, 0)
-    if (!Number.isSafeInteger(selectedBytes) || selectedBytes > MAX_TRANSFER_BYTES) {
-      throw new Error(`所选内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
-    }
     if (files.length === 1 && files[0].size === 0) {
       throw new Error("暂不支持发送空文件（0 B）")
     }
@@ -267,9 +263,6 @@ async function processText(text: string, name: string | undefined, jobId: number
     if (!isCurrent(jobId)) return
     post({ phase: "reading", jobId })
     const raw = buildTextPayload(text)
-    if (raw.length > MAX_TRANSFER_BYTES) {
-      throw new Error(`文字内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
-    }
     const fp = computeFingerprint(raw)
     const displayName =
       normalizeDraftFilename(typeof name === "string" ? name : "") || TEXT_DISPLAY_NAME

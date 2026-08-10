@@ -84,6 +84,15 @@ interface ZstdWasmModule {
     src: number, srcSize: number,
     level: number
   ) => number
+  /**
+   * zstd decompress. Returns the decompressed byte count (>0) or a negative
+   * error code. Bound to the same emscripten module's `j` export (present in
+   * @foxglove/wasm-zstd's wasm-zstd.wasm but unused by the compress-only path).
+   */
+  _decompress: (
+    dst: number, dstCap: number,
+    src: number, srcSize: number
+  ) => number
 }
 
 /**
@@ -152,6 +161,7 @@ async function instantiateZstd(buffer: ArrayBuffer): Promise<ZstdWasmModule> {
     _free: instance.exports.g as ZstdWasmModule["_free"],
     _compressBound: instance.exports.h as ZstdWasmModule["_compressBound"],
     _compress: instance.exports.i as ZstdWasmModule["_compress"],
+    _decompress: instance.exports.j as ZstdWasmModule["_decompress"],
   }
 }
 
@@ -220,6 +230,51 @@ function compressWithWasm(wasm: ZstdWasmModule, data: Uint8Array): Uint8Array {
       throw new Error(`Zstd compress returned ${resultSize}`)
     }
 
+    return new Uint8Array(wasm.memory.buffer, dstPtr, resultSize).slice()
+  } finally {
+    wasm._free(srcPtr)
+    wasm._free(dstPtr)
+  }
+}
+
+/**
+ * Ensure the zstd WASM module is loaded (singleton). Used by the receive
+ * worker's decompress path to guarantee the module is ready before calling
+ * {@link zstdDecompress}.
+ */
+export async function ensureZstdLoaded(): Promise<void> {
+  await getWasm()
+}
+
+/**
+ * Decompress a zstd stream. `expectedSize` is the exact decompressed byte
+ * count (from the descriptor's `original_size`) — the caller must know it
+ * because the zstd frame may not embed a content size.
+ *
+ * Throws if the wasm is not available, the stream is corrupt, or the output
+ * does not match `expectedSize`.
+ */
+export async function zstdDecompress(
+  compressed: Uint8Array,
+  expectedSize: number
+): Promise<Uint8Array> {
+  const wasm = await getWasm()
+  const srcSize = compressed.byteLength
+  const srcPtr = wasm._malloc(srcSize)
+  // Allocate the exact expected output size (caller already capped it).
+  const dstCap = Math.max(1, expectedSize)
+  const dstPtr = wasm._malloc(dstCap)
+  try {
+    new Uint8Array(wasm.memory.buffer, srcPtr, srcSize).set(compressed)
+    const resultSize = wasm._decompress(dstPtr, dstCap, srcPtr, srcSize)
+    if (resultSize < 0) {
+      throw new Error(`zstd decompress 失败（错误码 ${resultSize}），数据可能损坏`)
+    }
+    if (resultSize !== expectedSize) {
+      throw new Error(
+        `zstd 解压大小 ${resultSize} 与预期 ${expectedSize} 不符`
+      )
+    }
     return new Uint8Array(wasm.memory.buffer, dstPtr, resultSize).slice()
   } finally {
     wasm._free(srcPtr)

@@ -135,7 +135,50 @@ class SenderSessionWasm {
 // QR 编码（独立函数）
 function encode_qr(frameBytes: Uint8Array, outSide: Uint32Array): Uint8Array
 // 返回扁平模块网格（1=深色, 0=浅色），outSide[0] = 边长
+
+// ReceiverSessionWasm（接收端，网页接收端用）
+class ReceiverSessionWasm {
+  // 方式一（推荐）：从首个描述符帧构造。内部校验完整帧 CRC + descriptor flag，
+  // 锁定 session id，摄入描述符使 meta 立即 confirmed。坏帧/非描述符/敌意
+  // payload 返回 Error —— JS 侧据此丢弃首个描述符前的数据帧，并重试下一个描述符。
+  static from_descriptor(frameBytes: Uint8Array): ReceiverSessionWasm
+
+  // 方式二：缓存引导（与 JNI receiverCreate / C ABI airferry_receiver_create 一致）。
+  // data frames 缓存直到首个校验过的描述符到来。sid_lo/hi 为 128 位 session id 的低/高 64 位。
+  constructor(sessionIdLo: bigint, sessionIdHi: bigint)
+
+  // 摄入一帧解码后的 QR 原始字节（header+payload+footer）。返回 packed u64：
+  //   bit0 complete | bit1 accepted | bits8..23 session_mismatch_streak | bits32..63 received_symbols
+  // 位布局与 JNI receiverIngest / C ABI airferry_receiver_ingest 完全一致（三端共享 ingest_status::pack）。
+  // received_symbols == 0xFFFFFFFF（INGEST_ERROR）= 帧被拒（CRC/长度校验失败）。
+  ingest(frameBytes: Uint8Array): bigint
+
+  progress_json(): string   // 同 JNI receiverProgressJson 的 JSON 字段
+  is_complete(): boolean
+
+  // 元数据（对齐 JNI receiverFileName/FileSize/Crc32/Crc32Known）
+  session_id_lo(): bigint
+  session_id_hi(): bigint
+  file_name(): string       // 空字符串直到描述符到来
+  original_size(): bigint   // 解压后原文件大小
+  compressed_size(): bigint // 传输载荷大小
+  compressed_size_known(): boolean
+  compression(): number     // 0=None,1=Zstd,2=Xz —— JS 侧据此选解压器
+  crc32(): number           // 注意 JS 侧用 >>> 0 读无符号（0xDEADBEEF 超有符号 32 位）
+  crc32_known(): boolean
+  meta_confirmed(): boolean
+
+  // 只重组不解压。返回传输字节（compressed_size_known 时截断到 compressed_size）。
+  // compression==NONE 时即原文件；Zstd/Xz 时 JS 侧用 @foxglove/wasm-zstd / lzma-wasm 解压
+  // 后校验长度==original_size、CRC32（crc32_known 时）。未完成返回空 Uint8Array。
+  assemble_raw(): Uint8Array
+}
 ```
+
+> **WASM 接收端不内置解压**：wasm32 构建下 `qr-protocol` 的 zstd/xz C 库无法编译，
+> `decompress_with_limit` 对 `COMPRESSION_ZSTD`/`COMPRESSION_XZ` **fail-closed**（返回 Err），
+> 仅 `COMPRESSION_NONE` 原样返回。因此网页接收端走 `assemble_raw` + JS 侧自解压，
+> 不调用会触发解压的 `assemble_result`。发送端压缩仍在 worker 内用 JS 侧 zstd/xz 完成，两端 on-wire 格式一致。
 
 > **构造参数来源**：`compressedPayload` / `sessionId` / `crc32` / `compression` 由 `src/workers/compress.worker.ts` 离线产出（避免同步 WASM 卡住 UI）。主线程仅在用户点「发送」后 postMessage（均带 `jobId` = 当前 epoch）：
 > - `{ jobId, text, name? }` → `processText`：包 `ETTEXTv1` 魔数后压缩（**仅**列表里恰好 1 条文字时）；`name` 经 `normalizeDraftFilename` 写入 descriptor 并参与 session 派生（缺省 `文字消息.txt`）

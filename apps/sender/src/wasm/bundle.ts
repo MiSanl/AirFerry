@@ -38,14 +38,22 @@
 export const BUNDLE_MAGIC = "ETBUNDL1"
 const BUNDLE_VERSION = 1
 /**
- * Product memory budget shared with `raptorq_core::MAX_OBJECT_BYTES`.
- *
- * Encoding/compression and native receivers necessarily overlap more than one
- * representation of a payload. Keeping this below the wire-format maximum
- * prevents a valid transfer from exhausting a phone or browser process.
+ * Wire (compressed) transfer ceiling, mirrored from
+ * `raptorq_core::MAX_OBJECT_BYTES`. Bounds the RaptorQ object that is actually
+ * transmitted symbol-by-symbol over the QR stream — not the post-decompression
+ * size. 32 MiB is already a very long QR playout.
  */
 export const MAX_TRANSFER_BYTES = 32 * 1024 * 1024
 export const MAX_TRANSFER_MIB = MAX_TRANSFER_BYTES / (1024 * 1024)
+/**
+ * Receiver budget for the original (post-decompression) size, mirrored from
+ * `raptorq_core::MAX_ORIGINAL_BYTES` / the JS receiver's
+ * `MAX_DECOMPRESSED_BYTES`. This is what the sender's select page checks against
+ * when warning about an oversized selection: a highly compressible object can
+ * be under the wire ceiling yet far above 32 MiB once expanded.
+ */
+export const MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
 export const MAX_BUNDLE_NAME_BYTES = 0xffff
 
 /** One file inside a bundle. `data` is the raw file content. */
@@ -110,8 +118,8 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
       throw new Error(`文件名 UTF-8 编码超过 ${MAX_BUNDLE_NAME_BYTES} 字节: ${files[i].name}`)
     }
     total += 2 + nameBytes[i].length + 8 + files[i].size
-    if (!Number.isSafeInteger(total) || total > MAX_TRANSFER_BYTES) {
-      throw new Error(`打包后内容超过 ${MAX_TRANSFER_MIB} MiB 接收上限`)
+    if (!Number.isSafeInteger(total)) {
+      throw new Error("打包后内容大小溢出")
     }
   }
 

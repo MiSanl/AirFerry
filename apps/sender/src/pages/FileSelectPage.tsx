@@ -1,13 +1,16 @@
 /**
  * Page 1: content selection — one unified pending list.
  *
- *  - 添加文件：full-page drop / click / folder walk → append file items
- *  - 添加文字：modal → text item (keeps content string; not just a File)
+ *  - 添加文件夹（上方左侧按钮）：directory picker
+ *    (showDirectoryPicker / <input webkitdirectory>) → recursively walk & append
+ *  - 添加文字（上方右侧按钮）：modal → text item (keeps content string)
+ *  - 添加文件（下方大拖放区 dropzone，全页拖放/点击）：append file items
  *  - 发送：explicit confirm → parent stages (single pure text → ETTEXTv1;
  *    otherwise files + text-as-.txt → processFiles / ETBUNDL1 when ≥2)
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
+import { MAX_ORIGINAL_BYTES, MAX_ORIGINAL_MIB } from "@/wasm/bundle"
 import type { PendingItem } from "@/types"
 
 interface Props {
@@ -215,6 +218,7 @@ function UploadIcon({ size = 24 }: { size?: number }) {
 
 export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const folderInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepthRef = useRef(0)
   const mountedRef = useRef(true)
   const activeDropReadsRef = useRef(0)
@@ -225,6 +229,8 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   const [dropError, setDropError] = useState<string | null>(null)
   const [textOpen, setTextOpen] = useState(false)
   const [listCollapsed, setListCollapsed] = useState(true)
+  /** When true, an oversized-transfer confirmation dialog is shown. */
+  const [oversizeConfirm, setOversizeConfirm] = useState(false)
 
   useEffect(() => {
     mountedRef.current = true
@@ -396,6 +402,46 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
     }
   }, [appendIncomingFiles])
 
+  /** Open a directory picker and append every file inside it (recursively). */
+  const handleBrowseFolderClick = useCallback(async () => {
+    const w = window as any
+    if (typeof w.showDirectoryPicker === "function") {
+      try {
+        const dirHandle = await w.showDirectoryPicker({ mode: "read" })
+        const root = dirHandle.name
+        const files: File[] = []
+        const walk = async (handle: any, relPath: string) => {
+          const children: Array<[string, any]> = []
+          for await (const [name, child] of handle.entries()) {
+            children.push([name, child])
+          }
+          for (const [name, child] of children) {
+            const childPath = relPath ? `${relPath}/${name}` : name
+            if (child.kind === "file") {
+              const f = await child.getFile()
+              Object.defineProperty(f, "webkitRelativePath", {
+                value: childPath,
+                writable: false,
+              })
+              files.push(f)
+            } else if (child.kind === "directory") {
+              await walk(child, childPath)
+            }
+          }
+        }
+        await walk(dirHandle, root)
+        appendIncomingFiles(files)
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          console.warn("Directory picker failed:", err)
+          folderInputRef.current?.click()
+        }
+      }
+    } else {
+      folderInputRef.current?.click()
+    }
+  }, [appendIncomingFiles])
+
   const handleAddText = useCallback(
     (name: string, content: string) => {
       const filename =
@@ -423,6 +469,22 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
         : items.length > 1
           ? `发送（${items.length} 项）`
           : "发送"
+  /** Total original bytes of the selected items (pre-compression). */
+  const selectedBytes = totalSize(items)
+  /**
+   * Send gate: warn (not block) when the selection's original size exceeds the
+   * receiver's post-decompression budget (256 MiB). A selection under this can
+   * be recovered as long as its *compressed* size stays under the wire ceiling
+   * (32 MiB); the receiver's original-size limit is what we can check here.
+   * On confirm we proceed with the normal send.
+   */
+  const handleSendClick = useCallback(() => {
+    if (selectedBytes > MAX_ORIGINAL_BYTES) {
+      setOversizeConfirm(true)
+      return
+    }
+    onSend()
+  }, [selectedBytes, onSend])
 
   return (
     <div className="page">
@@ -438,13 +500,10 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
         </div>
       )}
       <h2>选择要发送的内容</h2>
-      <p className="page-desc">
-        添加文件或文字到列表，确认后发送（多项会打包为一次传输）
-      </p>
 
       <div className="select-actions">
-        <button type="button" className="btn secondary select-action-btn" onClick={handleBrowseClick}>
-          <FolderIcon /> 添加文件
+        <button type="button" className="btn secondary select-action-btn" onClick={handleBrowseFolderClick}>
+          <FolderIcon /> 添加文件夹
         </button>
         <button type="button" className="btn secondary select-action-btn" onClick={() => setTextOpen(true)}>
           <PenIcon /> 添加文字
@@ -465,6 +524,18 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
             e.target.value = ""
           }}
         />
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          webkitdirectory=""
+          directory=""
+          style={{ display: "none" }}
+          onChange={(e) => {
+            handleFiles(e.target.files)
+            e.target.value = ""
+          }}
+        />
         <div className="dropzone-icon">
           {items.length > 0 ? <FolderIcon /> : <UploadIcon />}
         </div>
@@ -477,8 +548,8 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
           </>
         ) : (
           <>
-            <p className="dropzone-title">拖拽文件或文件夹到网页任意位置</p>
-            <p className="dropzone-hint">或点击此处 / 「添加文件」浏览选择</p>
+            <p className="dropzone-title">点击添加文件</p>
+            <p className="dropzone-hint">或拖拽文件到此处</p>
           </>
         )}
       </div>
@@ -550,13 +621,25 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
         type="button"
         className="btn primary page-cta"
         disabled={!canSend}
-        onClick={onSend}
+        onClick={handleSendClick}
       >
         {sendLabel}
       </button>
 
       {textOpen && (
         <AddTextModal onCancel={() => setTextOpen(false)} onConfirm={handleAddText} />
+      )}
+
+      {oversizeConfirm && (
+        <OversizeConfirmModal
+          totalMiB={selectedBytes / (1024 * 1024)}
+          limitMiB={MAX_ORIGINAL_MIB}
+          onCancel={() => setOversizeConfirm(false)}
+          onConfirm={() => {
+            setOversizeConfirm(false)
+            onSend()
+          }}
+        />
       )}
     </div>
   )
@@ -656,6 +739,58 @@ function AddTextModal({
           </button>
           <button type="button" className="btn primary" disabled={!canSubmit} onClick={submit}>
             添加到列表
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function OversizeConfirmModal({
+  totalMiB,
+  limitMiB,
+  onCancel,
+  onConfirm,
+}: {
+  totalMiB: number
+  limitMiB: number
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel()
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [onCancel])
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
+      <div
+        className="modal-card"
+        role="alertdialog"
+        aria-labelledby="oversize-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="oversize-title" className="modal-save-title">
+          内容超过接收上限
+        </h3>
+        <p className="hint" style={{ marginTop: 8 }}>
+          所选内容约 <strong>{totalMiB.toFixed(1)} MiB</strong>，超过接收端
+          <strong> {limitMiB} MiB</strong> 的原始内容接收上限。
+        </p>
+        <p className="hint" style={{ marginTop: 8 }}>
+          接收端（Android / Windows / 网页）为防内存耗尽设有此硬性上限，超限传输
+          <strong> 无法被完整接收</strong>；即使原始内容可压缩到 32 MiB 以下，也因
+          原始大小超过该上限而无法还原。仍要继续发送吗？
+        </p>
+        <div className="modal-actions-row">
+          <button type="button" className="btn secondary" onClick={onCancel}>
+            取消
+          </button>
+          <button type="button" className="btn primary" onClick={onConfirm}>
+            仍要发送
           </button>
         </div>
       </div>

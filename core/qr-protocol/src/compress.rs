@@ -15,7 +15,6 @@
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::Error;
 use crate::Result;
 
@@ -150,17 +149,46 @@ fn read_capped<R: std::io::Read>(r: R, max_output: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Stub for wasm32 (receiver never runs in the browser).
+/// wasm32 decompress stub.
+///
+/// The native zstd/xz C libraries do not compile under `wasm32-unknown-unknown`,
+/// so the browser cannot decompress inside the Rust core. Historically this was
+/// an identity stub (returning the input unchanged) because "the receiver never
+/// runs in the browser". That is no longer true: the web receiver now recovers
+/// files in the browser. Returning compressed bytes as-is would silently hand
+/// the JS layer a zstd/xz stream while claiming it is the original file.
+///
+/// Instead this is now **fail-closed**:
+/// - `COMPRESSION_NONE` returns the bytes unchanged (correct — nothing to do).
+/// - `COMPRESSION_ZSTD` / `COMPRESSION_XZ` return `Err`. The web receiver uses
+///   [`ReceiverSession::assemble_raw`] (no decompression) and decompresses with
+///   its own JS-side zstd/xz WASM, so it never relies on this path — but any
+///   caller that *does* hit `assemble_result` on a compressed payload gets a
+///   clear error instead of corrupted output.
 #[cfg(target_arch = "wasm32")]
-pub fn decompress_with_limit(data: &[u8], _compression: u8, _max_output: usize) -> Result<Vec<u8>> {
-    Ok(data.to_vec())
+pub fn decompress_with_limit(data: &[u8], compression: u8, _max_output: usize) -> Result<Vec<u8>> {
+    if compression == COMPRESSION_NONE {
+        Ok(data.to_vec())
+    } else {
+        Err(Error::Compress(format!(
+            "decompression is not available on wasm32 for compression tag {compression}; \
+             use assemble_raw + JS-side decompression"
+        )))
+    }
 }
 
-/// Stub for wasm32: the receiver is never exercised in the browser, but the
-/// module must compile so that the transfer-engine crate links under wasm-pack.
+/// wasm32 stub mirroring [`decompress_with_limit`] (no output cap). See that
+/// function for why compressed payloads fail-closed.
 #[cfg(target_arch = "wasm32")]
-pub fn decompress_with(data: &[u8], _compression: u8) -> Result<Vec<u8>> {
-    Ok(data.to_vec())
+pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
+    if compression == COMPRESSION_NONE {
+        Ok(data.to_vec())
+    } else {
+        Err(Error::Compress(format!(
+            "decompression is not available on wasm32 for compression tag {compression}; \
+             use assemble_raw + JS-side decompression"
+        )))
+    }
 }
 
 /// Compress `data` with XZ/LZMA2 at a high-ratio preset (level 6 + EXTREME).

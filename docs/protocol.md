@@ -51,7 +51,7 @@ session_id = FNV1a_128(
 
 无逐文件 CRC——整个 bundle 由传输层 CRC32（描述符）+ RaptorQ + 双层帧 CRC 保护。8 字节 magic 让它与普通单文件首字节的意外碰撞实际不可能。Android 接收端在 `BundleParser.kt` 中按相同布局解析。
 
-发送端在写入前验证 `file_count` 与每个 UTF-8 文件名均可无损表示为 u16；文件名超过 65535 字节会明确报错，不允许静默截断并造成容器错位。一次传输的原始/打包对象上限为 **32 MiB**，与接收端资源预算一致；单个 0 B 文件会在发送前明确拒绝（bundle 内的空条目仍可表示）。该产品上限为压缩输入、RaptorQ、FFI 与落盘缓冲重叠预留内存余量。
+发送端在写入前验证 `file_count` 与每个 UTF-8 文件名均可无损表示为 u16；文件名超过 65535 字节会明确报错，不允许静默截断并造成容器错位。接收端有**两个独立上限**：**压缩对象（wire）上限** `raptorq_core::MAX_OBJECT_BYTES` = **32 MiB**（即 RaptorQ 实际传输的压缩后字节，`ObjectMeta::transfer_length`），以及**原始（解压后）内容上限** `raptorq_core::MAX_ORIGINAL_BYTES` = **256 MiB**（`descriptor::FileMeta::original_size`）。两个上限分别约束"传输量"与"还原内存"，因此高度可压缩的对象（wire 小、原始大）只要原始 ≤ 256 MiB 且压缩后 ≤ 32 MiB 即可完整接收。**发送端不再硬性阻止超限内容**：所选内容原始大小超过 256 MiB 时，会在「发送」前弹出确认提示，告知接收端有该硬性上限、超限传输无法被完整接收；用户确认后仍会正常编码发送（浏览器接收端同样受 `MAX_DECOMPRESSED_BYTES` = 256 MiB 约束）。单个 0 B 文件会在发送前明确拒绝（bundle 内的空条目仍可表示）。
 
 ## 帧格式 (Frame Format)
 

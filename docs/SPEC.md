@@ -254,7 +254,7 @@ offset  size   field
 |------|------|------|
 | OTI 校验 | `core/raptorq-core/src/meta.rs` `ObjectMeta::validate` | 校验 T 的范围/对齐、OTI reserved/sub-block/alignment/整除关系、canonical SBN、块数/K/长度及本地资源预算；非法绝不构建解码器 |
 | 坐标守卫 | decoder 入参检查 + `ReceiverSession::ingest` | 拒绝 ESI≥2²⁴ / 载荷≠symbol_size |
-| 解压炸弹 | `compress.rs` + `receiver.rs` | XZ 解码器内存 128 MiB；输出与对象均封顶 32 MiB，并要求结果长度精确等于 `original_size`；32 MiB 产品预算为跨 FFI/解压/落盘的重叠缓冲留余量 |
+| 解压炸弹 | `compress.rs` + `receiver.rs` | XZ 解码器内存 128 MiB；**原始内容（解压后）**封顶 `MAX_ORIGINAL_BYTES`（256 MiB），**压缩对象（wire）**封顶 `MAX_OBJECT_BYTES`（32 MiB），并要求结果长度精确等于 `original_size`；两者独立约束——高度可压缩对象可 wire 小但原始大 |
 | 帧校验 | `Frame::from_bytes` | magic/version/双层 CRC |
 | 预描述符缓存封顶 | `receiver.rs` `PRE_META_SYMBOL_CACHE_MAX`（12000） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM |
 | 描述符冻结 | `receiver.rs` `descriptor_seen` | 首个通过全部校验的 descriptor 确立 OTI、文件元数据与压缩算法；同 session 后续描述符只可完全一致，禁止中途替换解码参数 |
@@ -264,32 +264,38 @@ offset  size   field
 
 ---
 
-## 7. JNI ingest 状态字位布局（权威）
+## 7. ingest 状态字位布局（权威，三端共享）
 
-⚠️ Android JNI 的 `receiverIngest` **不返回 JSON**（旧 `docs/api.md` 已过时）。返回一个 packed `jlong`，只携带摄入路径决策所需的最小信息；完整进度按需由 `receiverProgressJson`（~7Hz UI 节流）拉取。
+⚠️ Android JNI 的 `receiverIngest` / Windows C ABI 的 `airferry_receiver_ingest` / 浏览器 WASM 的 `ReceiverSessionWasm.ingest` **都不返回 JSON**。返回同一个 packed 64 位状态字（JNI 装入 `jlong`），只携带摄入路径决策所需的最小信息；完整进度按需由 `receiverProgressJson` / `airferry_receiver_progress_json` / `progress_json()`（~7Hz UI 节流）拉取。
 
-### 位布局（`jlong`，所有字段无符号）
+三端的打包逻辑由**共享模块** `core/transfer-engine/src/ingest_status.rs` 的 `pack()` + `INGEST_ERROR` 统一提供（JNI/C ABI/WASM 均引用之），位布局不再由各绑定重复实现，杜绝漂移。
+
+### 位布局（packed `u64`，所有字段无符号）
 
 | 位 | 字段 | 说明 |
 |----|------|------|
 | bit 0 | `complete` | 1 = 对象已完全解码 |
 | bit 1 | `accepted` | 1 = 本帧贡献了新符号 |
-| bits 8..23 | `session_mismatch_streak` | 连续 session 不匹配数（0..=0xFFFF） |
+| bits 8..23 | `session_mismatch_streak` | 连续 session 不匹配数（0..=0xFFFF，钳到 16 位） |
 | bits 32..63 | `received_symbols` | 已接收去重符号数（低 32 位） |
 
 ### 哨兵
 
 - 返回 **`0`**：null handle / 坏帧 / session 错误（调用方视作「无变化」）。
-- `received_symbols == u32::MAX`（`0xFFFFFFFF`）：**保留错误哨兵**（真实传输永不达到）。Kotlin `IngestStatus.unpack` 遇此返回 `null`。
+- `received_symbols == u32::MAX`（`0xFFFFFFFF`，即 [`ingest_status::INGEST_ERROR`]）：**保留错误哨兵**（真实传输永不达到）。Kotlin `IngestStatus.unpack` / C# `IngestStatus.Unpack` / JS 解包遇此视作「帧被拒」。
 
-### 双端对齐
+### 三端对齐
 
 | 端 | 源 |
 |----|-----|
-| Rust 打包 | `core/transfer-engine/src/jni.rs:67` `receiverIngest` / `:142` `pack_ingest_status` |
+| Rust 打包（**三端共享**） | `core/transfer-engine/src/ingest_status.rs` `pack` / `INGEST_ERROR` |
+| JNI 入口 | `core/transfer-engine/src/jni.rs` `receiverIngest`（引用 `ingest_status::pack`） |
+| C ABI 入口 | `core/transfer-engine/src/cffi.rs` `airferry_receiver_ingest`（引用 `ingest_status::pack`） |
+| WASM 入口 | `core/transfer-engine/src/wasm.rs` `ReceiverSessionWasm::ingest`（引用 `ingest_status::pack`） |
 | Kotlin 解包 | `apps/scanner/.../scan/ReceiverSessionManager.kt:68` `IngestStatus.unpack` |
+| C# 解包 | `apps/windows/AirFerry.Windows/Scan/IngestStatus.cs` `.Unpack(u64)` |
 
-> 改位布局时两端必须同步。
+> 改位布局时改 `ingest_status.rs` 一处，三端自动同步。
 
 ### 其他 JNI 函数（修正）
 
@@ -376,8 +382,9 @@ offset  size   field
 | early-exit 阈值 | `0.70`（70%） | `compress.ts:64` |
 | MAX_SOURCE_SYMBOLS_PER_BLOCK | `56403` | `meta.rs:6` |
 | MAX_SOURCE_BLOCKS | `256` | `meta.rs:8` |
-| MAX_OBJECT_BYTES | `32 MiB` | `meta.rs:15` |
+| MAX_OBJECT_BYTES | `32 MiB` | `meta.rs:14`（压缩/wire 对象上限） |
+| MAX_ORIGINAL_BYTES | `256 MiB` | `meta.rs:24`（原始/解压后上限） |
 | ESI 上限 | `2²⁴`（u24） | raptorq-core decoder 守卫 |
-| ingest 错误哨兵 | `received_symbols == u32::MAX` | `jni.rs:142` / `ReceiverSessionManager.kt:68` |
+| ingest 错误哨兵 | `received_symbols == u32::MAX` | `ingest_status.rs` `INGEST_ERROR`（三端共享）/ `ReceiverSessionManager.kt:68` |
 | 默认 symbol_size（浏览器/核心库） | 1400 / 1024 | `apps/sender/src/types.ts` `DEFAULT_CONFIG.symbolSize` / `config.rs:8` `DEFAULT_SYMBOL_SIZE` |
 | QR EC 级 / 版本 | L / 动态最小 | `qr_render::encode` / `min_version_for` |

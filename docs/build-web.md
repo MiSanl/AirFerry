@@ -64,6 +64,22 @@ apps/web/dist/
 
 > **不需要 COOP/COEP 头**：核心传输功能不依赖 `SharedArrayBuffer`（压缩在普通 Web Worker 里跑，QR 渲染在主线程 Canvas）。若未来引入多线程并行编码才需配置 `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp`。
 
+### 局域网 HTTPS 接收端测试（`serve-https.mjs`）
+
+**接收端（`receiver.html`）需要摄像头权限，而 `getUserMedia` 只在安全上下文（HTTPS 或 localhost）可用**。局域网真机扫码测试需用 HTTPS 静态服务器。仓库自带最小实现：
+
+```bash
+cd apps/web
+npm run build   # 构建 dist/（含 index.html + receiver.html 双入口）
+
+# 用法: node scripts/serve-https.mjs <serveDir> <crt> <key> [port]
+node scripts/serve-https.mjs dist .cert/selfsigned.crt .cert/selfsigned.key 8765
+```
+
+- 自签证书已就位在 `apps/web/.cert/`（`selfsigned.crt` + `selfsigned.key`）；浏览器访问会警告，点「高级」→「继续」即可。
+- 默认端口 **8765**，监听 `0.0.0.0`（本机 `https://localhost:8765/receiver.html`，局域网 `https://<LAN-IP>:8765/receiver.html`）。
+- 根路径 `/` 自动映射到 `receiver.html`（专注接收端测试；发送端走 `index.html`）。
+
 ## 与浏览器扩展的关系
 
 | 维度 | 浏览器扩展（apps/sender） | 网页端（apps/web） |

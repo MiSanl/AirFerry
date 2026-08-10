@@ -480,7 +480,6 @@ export default function App() {
         <div className="app-logo"><img src={iconUrl} alt="AirFerry" /></div>
         <div className="app-title">
           <h1>AirFerry</h1>
-          <p className="app-subtitle">无网文件传输 · 屏幕二维码流</p>
         </div>
       </header>
       <div className="steps">

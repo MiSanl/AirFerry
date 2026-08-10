@@ -24,6 +24,7 @@
 )]
 
 pub mod descriptor;
+pub mod ingest_status;
 pub mod progress;
 pub mod receiver;
 pub mod resume;

@@ -2,7 +2,7 @@
 
 use crate::{progress::Progress, Error, Result};
 use qr_protocol::{frame::SessionIdRaw, Frame};
-use raptorq_core::{Decoder, ObjectMeta, Symbol, MAX_OBJECT_BYTES};
+use raptorq_core::{Decoder, ObjectMeta, Symbol, MAX_ORIGINAL_BYTES};
 use std::collections::{HashMap, HashSet};
 use std::vec::Vec;
 
@@ -194,7 +194,7 @@ impl ReceiverSession {
                 // and `panic = "abort"` would crash the whole receiver.
                 let file_meta_invalid =
                     !qr_protocol::compress::is_known_compression_tag(info.file_meta.compression)
-                        || info.file_meta.original_size > MAX_OBJECT_BYTES
+                        || info.file_meta.original_size > MAX_ORIGINAL_BYTES
                         || (info.file_meta.compressed_size_known
                             && info.file_meta.compressed_size > info.meta.transfer_length);
                 if info.meta.validate().is_err() || file_meta_invalid {
@@ -456,7 +456,11 @@ impl ReceiverSession {
             // Bound the decompressed output against a decompression bomb in the
             // untrusted payload. The descriptor's original_size is the exact
             // expected output; fall back to a conservative ceiling when unknown.
-            let max_decompressed_bytes = usize::try_from(MAX_OBJECT_BYTES).unwrap_or(usize::MAX);
+            // The cap is MAX_ORIGINAL_BYTES (not MAX_OBJECT_BYTES) so a highly
+            // compressible object can legitimately expand well beyond the wire
+            // (transfer_length) ceiling yet still be recovered.
+            let max_decompressed_bytes =
+                usize::try_from(MAX_ORIGINAL_BYTES).unwrap_or(usize::MAX);
             let cap = if self.file_meta.original_size > 0 {
                 let expected = usize::try_from(self.file_meta.original_size).map_err(|_| {
                     Error::Compress("descriptor original_size does not fit this platform".into())
@@ -503,6 +507,9 @@ impl ReceiverSession {
     pub fn progress(&self) -> Progress {
         let mut progress = self.progress.clone();
         progress.meta_confirmed = self.meta_confirmed;
+        // Expose symbol_size so UIs can compute wire throughput even before
+        // meta is confirmed (pending_symbol_size caches the frame-header value).
+        progress.symbol_size = self.pending_symbol_size;
         progress
     }
 

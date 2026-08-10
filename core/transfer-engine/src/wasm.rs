@@ -343,3 +343,227 @@ pub fn encode_qr(frame_bytes: &[u8], out_side: &mut [u32]) -> Result<Vec<u8>, Js
 // serde_json is required by stats_json (serde_json::json!) and by the
 // serde-derived ObjectMeta re-exported here. The `wasm` feature implies
 // `serde` (see Cargo.toml), so no compile_error! guard is needed.
+
+// ─── receiver bindings ──────────────────────────────────────────────────────
+
+use crate::ingest_status;
+use crate::receiver::ReceiverSession;
+
+/// WASM-facing receiver session.
+///
+/// Mirrors the JNI (`receiverCreate`/`receiverIngest`/...) and C ABI
+/// (`airferry_receiver_*`) bindings so all three hosts share the same wire
+/// contract. Construct via [`ReceiverSessionWasm::from_descriptor`] (preferred:
+/// validates the first descriptor frame end-to-end) or
+/// [`ReceiverSessionWasm::new`] (cache-only bootstrap when the caller already
+/// split the session id out of band).
+///
+/// ## Compression / decompression split
+/// Unlike the native bindings, this WASM binding does **not** run the matching
+/// decompressor after RaptorQ recovery — the wasm32 build of `qr-protocol`
+/// cannot link the native zstd/xz C libraries. Instead the JS layer calls
+/// [`assemble_raw`](Self::assemble_raw) to get the transmitted (possibly
+/// compressed) bytes, then decompresses with its own zstd/xz WASM and verifies
+/// the CRC32. [`assemble_result`](crate::receiver::ReceiverSession::assemble_result)
+/// is intentionally not exposed because the wasm32 `decompress_with_limit` is a
+/// fail-closed stub for compressed payloads.
+#[wasm_bindgen]
+pub struct ReceiverSessionWasm {
+    inner: ReceiverSession,
+}
+
+#[wasm_bindgen]
+impl ReceiverSessionWasm {
+    /// Create a "cache-only" receiver — no metadata yet, data frames are
+    /// buffered until the first validated descriptor arrives. `session_id_lo`
+    /// /`session_id_hi` split the 128-bit session id into its low/high 64-bit
+    /// halves (host order), matching the JNI/C ABI `receiverCreate` /
+    /// `airferry_receiver_create` contract.
+    #[wasm_bindgen(constructor)]
+    pub fn new(session_id_lo: u64, session_id_hi: u64) -> ReceiverSessionWasm {
+        _start();
+        let sid = ((session_id_hi as u64 as u128) << 64) | session_id_lo as u64 as u128;
+        ReceiverSessionWasm {
+            inner: ReceiverSession::new_pending(sid),
+        }
+    }
+
+    /// Build a receiver from its first descriptor frame.
+    ///
+    /// Validates the full frame CRC + descriptor flag, locks the session id to
+    /// that frame's header, and ingests the descriptor so `meta` is confirmed
+    /// immediately. The JS layer should call this on the first descriptor it
+    /// observes and discard any earlier data frames.
+    ///
+    /// Returns `Err` if the bytes are not a valid frame, or a valid frame that
+    /// is not a descriptor, or the descriptor payload is hostile/unparseable
+    /// (the inner `ingest` rejects it without confirming meta — surfaced as an
+    /// error here so the JS caller retries with the next descriptor).
+    pub fn from_descriptor(frame_bytes: &[u8]) -> Result<ReceiverSessionWasm, JsValue> {
+        _start();
+        let frame = qr_protocol::Frame::from_bytes(frame_bytes)
+            .map_err(|e| err_to_js(crate::Error::Protocol(e)))?;
+        if frame.header.flags & qr_protocol::frame::FLAG_DESCRIPTOR == 0 {
+            return Err(JsValue::from_str(
+                "from_descriptor: frame is not a descriptor (FLAG_DESCRIPTOR clear)",
+            ));
+        }
+        let mut session = ReceiverSessionWasm::new(
+            frame.header.session_id as u64,
+            (frame.header.session_id >> 64) as u64,
+        );
+        // Ingest the descriptor; on success meta is confirmed. A hostile or
+        // unparseable descriptor payload is rejected by `ingest` (it bumps
+        // frames_corrupt and returns Ok without confirming meta), so we detect
+        // "meta still not confirmed" and surface it as an error to the caller.
+        let _ = session.ingest(frame_bytes);
+        if !session.inner.is_meta_confirmed() {
+            return Err(JsValue::from_str(
+                "from_descriptor: descriptor rejected (corrupt/hostile payload); meta not confirmed",
+            ));
+        }
+        Ok(session)
+    }
+
+    /// Ingest one decoded QR frame's raw bytes (header + payload + footer).
+    ///
+    /// Returns a packed `u64` status word with the SAME bit layout as the JNI
+    /// `receiverIngest` / C ABI `airferry_receiver_ingest` (see
+    /// [`ingest_status`]):
+    /// - bit  0      : `complete`
+    /// - bit  1      : `accepted` (this frame contributed a new symbol)
+    /// - bits 8..23  : `session_mismatch_streak`
+    /// - bits 32..63 : `received_symbols`
+    ///
+    /// Returns [`ingest_status::INGEST_ERROR`] (`received_symbols == u32::MAX`)
+    /// on a frame that fails CRC / length validation.
+    pub fn ingest(&mut self, frame_bytes: &[u8]) -> u64 {
+        let frame = match qr_protocol::Frame::from_bytes(frame_bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                android_log_wasm(&format!("frame rejected (len={}): {:?}", frame_bytes.len(), e));
+                return ingest_status::INGEST_ERROR;
+            }
+        };
+        let prev_received = self.inner.progress().received_symbols;
+        if let Err(e) = self.inner.ingest(frame) {
+            android_log_wasm(&format!("ingest error: {e}"));
+        }
+        let p = self.inner.progress();
+        let complete = self.inner.is_complete();
+        let accepted = p.received_symbols > prev_received;
+        ingest_status::pack(
+            complete,
+            accepted,
+            p.session_mismatch_streak,
+            p.received_symbols,
+        )
+    }
+
+    /// Live recovery progress as JSON (same fields as the JNI/C ABI
+    /// `progressJson`). The JS UI calls this on its refresh cadence instead of
+    /// parsing a value per ingested frame.
+    pub fn progress_json(&self) -> String {
+        let p = self.inner.progress();
+        format!(
+            r#"{{"decoded_symbols":{},"total_symbols":{},"symbol_size":{},"received_symbols":{},"frames_seen":{},"frames_duplicate":{},"frames_corrupt":{},"decoded_blocks":{},"total_blocks":{},"decoded_fraction":{:.4},"loss_ratio":{:.4},"complete":{},"meta_confirmed":{},"session_mismatch_streak":{}}}"#,
+            p.decoded_symbols,
+            p.total_symbols,
+            p.symbol_size,
+            p.received_symbols,
+            p.frames_seen,
+            p.frames_duplicate,
+            p.frames_corrupt,
+            p.decoded_blocks,
+            p.total_blocks,
+            p.decoded_fraction(),
+            p.loss_ratio(),
+            self.inner.is_complete(),
+            p.meta_confirmed,
+            p.session_mismatch_streak
+        )
+    }
+
+    /// 1 once the object is fully decoded, else 0.
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    // ─── metadata getters (mirror JNI `receiverFileName`/... + C ABI) ───────
+
+    /// Session id (low 64 bits).
+    pub fn session_id_lo(&self) -> u64 {
+        self.inner.session_id() as u64
+    }
+    /// Session id (high 64 bits).
+    pub fn session_id_hi(&self) -> u64 {
+        (self.inner.session_id() >> 64) as u64
+    }
+
+    /// Recovered file name (UTF-8). Empty until a descriptor has been accepted.
+    pub fn file_name(&self) -> String {
+        self.inner.file_meta().filename.clone()
+    }
+    /// Original (decompressed) file size in bytes. 0 until a descriptor arrives.
+    pub fn original_size(&self) -> u64 {
+        self.inner.file_meta().original_size
+    }
+    /// Transmitted (possibly compressed) payload length. 0 until known.
+    pub fn compressed_size(&self) -> u64 {
+        self.inner.file_meta().compressed_size
+    }
+    /// 1 if the descriptor supplied a real `compressed_size` (else 0). When 0,
+    /// the receiver operates on the raw padded bytes.
+    pub fn compressed_size_known(&self) -> bool {
+        self.inner.file_meta().compressed_size_known
+    }
+    /// Compression-algorithm tag (0=None, 1=Zstd, 2=Xz). The JS layer uses this
+    /// to pick the decompressor after [`assemble_raw`](Self::assemble_raw).
+    pub fn compression(&self) -> u8 {
+        self.inner.file_meta().compression
+    }
+    /// CRC32 of the original file (0 if unknown). Returned as `u32` — JS must
+    /// read it unsigned (`>>> 0`) since values like `0xDEADBEEF` exceed the
+    /// signed 32-bit range.
+    pub fn crc32(&self) -> u32 {
+        self.inner.file_meta().crc32
+    }
+    /// 1 if the descriptor supplied a real CRC32 (so the host should verify it
+    /// against the recovered bytes), else 0. CRC32 can legitimately be 0, so
+    /// `crc32() == 0` is not a safe "unknown" test.
+    pub fn crc32_known(&self) -> bool {
+        self.inner.file_meta().crc32_known
+    }
+    /// 1 once the authoritative OTI has been received via a descriptor frame.
+    /// Before this, data frames are only buffered (not decoded).
+    pub fn meta_confirmed(&self) -> bool {
+        self.inner.is_meta_confirmed()
+    }
+
+    /// Reassemble the RaptorQ object bytes exactly as transmitted (trimmed to
+    /// `compressed_size` when known), **without** applying decompression.
+    ///
+    /// Returns an empty `Vec` if decoding is incomplete. For
+    /// `compression == COMPRESSION_NONE` the bytes are the original file; for
+    /// Zstd/Xz the JS layer decompresses with its own WASM and verifies the
+    /// CRC32 against [`crc32`](Self::crc32) (when [`crc32_known`](Self::crc32_known)).
+    pub fn assemble_raw(&self) -> Vec<u8> {
+        // `assemble_raw` on the inner session returns the padded transmitted
+        // bytes; trim to compressed_size to match the contract the JS layer
+        // expects (the decompressor must not see symbol-padding zeros).
+        let mut raw = match self.inner.assemble_raw() {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+        let fm = self.inner.file_meta();
+        if fm.compressed_size_known {
+            if let Ok(len) = usize::try_from(fm.compressed_size) {
+                if len <= raw.len() {
+                    raw.truncate(len);
+                }
+            }
+        }
+        raw
+    }
+}
+

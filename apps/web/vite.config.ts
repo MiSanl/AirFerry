@@ -35,12 +35,43 @@ export default defineConfig({
       // reliable way to alias a path prefix under Vite/Rollup.
       { find: "@/", replacement: path.resolve(__dirname, "../sender/src/") + "/" },
       { find: "@airferry-wasm/", replacement: path.resolve(__dirname, "wasm-pkg/") + "/" },
+      // zxing-wasm + lzma-wasm live in web's node_modules; the QR/receive
+      // workers are compiled from sender source, so without these aliases
+      // Rollup searches sender/node_modules (which lacks them) first. Pin to
+      // the exact dist entry each subpath resolves to via package "exports".
+      {
+        find: "zxing-wasm/reader",
+        replacement: path.resolve(
+          __dirname,
+          "node_modules/zxing-wasm/dist/es/reader/index.js"
+        ),
+      },
+      {
+        find: /^zxing-wasm$/,
+        replacement: path.resolve(
+          __dirname,
+          "node_modules/zxing-wasm/dist/es/full/index.js"
+        ),
+      },
+      {
+        find: "lzma-wasm",
+        replacement: path.resolve(__dirname, "node_modules/lzma-wasm"),
+      },
     ],
   },
   // The transfer_engine wasm-pkg and the lzma/zstd loaders are only needed at
   // runtime; exclude them from Vite's dep pre-bundling to avoid mismatches.
+  // @foxglove/wasm-zstd ships an Emscripten CJS module that resolves its .wasm
+  // via require()/fetch() at runtime — pre-bundling makes Vite try to parse the
+  // inner `require("./wasm-zstd.wasm")` and fail on the ESM-wasm proposal.
   optimizeDeps: {
-    exclude: ["lzma-wasm"],
+    exclude: ["lzma-wasm", "@foxglove/wasm-zstd"],
+  },
+  // Receive/QR workers use dynamic imports (lzma-wasm, zxing-wasm/reader),
+  // which produce code-split chunks — that requires the "es" worker format
+  // (the default "iife" can't express splits).
+  worker: {
+    format: "es",
   },
   server: {
     // QR scanning requires a clean screen; a stable port makes local testing
@@ -54,6 +85,14 @@ export default defineConfig({
     // (e.g. username.github.io/repo/), not just site root.
     outDir: "dist",
     target: "esnext",
+    // Multi-page: index.html (sender) + receiver.html (receiver). Each is a
+    // thin entry mounting a shared sender-source component.
+    rollupOptions: {
+      input: {
+        index: path.resolve(__dirname, "index.html"),
+        receiver: path.resolve(__dirname, "receiver.html"),
+      },
+    },
   },
   // Relative asset base: index.html emits `./assets/...` so the site works
   // under any sub-path without rewriting URLs. Note the worker's runtime

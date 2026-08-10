@@ -201,14 +201,17 @@ build_windows() {
 }
 
 build_web() {
-  info "构建网页端 (apps/web → dist/) ..."
+  info "构建网页端 (apps/web → dist/，含发送端 index.html + 接收端 receiver.html) ..."
   # npm run build 已内嵌 prebuild（prepare-wasm.cjs）：校验 sender 的现代
-  # wasm-pkg-simd，持锁复制到 web 自有 wasm-pkg/，再拷 wasm-zstd.wasm 到
-  # public/。首次构建前须 cd apps/sender && npm run wasm；产物缺失时脚本
-  # 非零退出，npm run build 失败，set -e 中断。
+  # wasm-pkg-simd，持锁复制到 web 自有 wasm-pkg/，再拷 wasm-zstd.wasm +
+  # zxing_reader.wasm 到 public/。首次构建前须 cd apps/sender && npm run wasm；
+  # 产物缺失时脚本非零退出，npm run build 失败，set -e 中断。
+  # Vite 多页面构建产出 index.html（发送端）+ receiver.html（接收端），共享
+  # 同一份 assets（React + transfer_engine WASM + zstd + lzma）。接收端的
+  # zxing-wasm 解码 worker + receive worker 也作为独立 chunk 产出。
   cd "$ROOT/apps/web"
   npm run build 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done
-  info "网页端构建完成 → apps/web/dist/"
+  info "网页端构建完成 → apps/web/dist/（index.html 发送 + receiver.html 接收）"
 }
 
 # 打包 Chrome MV2/MV3 为已签名 .crx。
@@ -287,12 +290,14 @@ pack_dist() {
     warn "未找到 Windows 端 publish 产物。如需打包 Windows 端，请在 Windows 上运行: ./scripts/build-windows.ps1 -Pack"
   fi
 
-  # 网页端 zip（纯静态站点，解压即可托管到任意静态服务器）。与 Windows 同样用
-  # warn 而非 error：用户可能只想发扩展+APK 而不发网页端（web 是可选的发送入口）。
+  # 网页端 zip（纯静态站点，解压即可托管到任意静态服务器）。单个 zip 同时含
+  # 发送端（index.html）与接收端（receiver.html）入口，共享同一份 assets
+  # （React + transfer_engine/zstd/lzma WASM + zxing_reader.wasm）。与 Windows
+  # 同样用 warn 而非 error：用户可能只想发扩展+APK 而不发网页端。
   local web_dist="$ROOT/apps/web/dist"
   if [[ -d "$web_dist" ]]; then
     ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . )
-    info "网页发送端 → dist/airferry-sender-web-v${VER}.zip"
+    info "网页端（发送 index.html + 接收 receiver.html）→ dist/airferry-sender-web-v${VER}.zip"
   else
     warn "未找到网页端构建产物（${web_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
   fi

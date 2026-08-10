@@ -77,4 +77,36 @@ if (needCopy) {
   console.log("[prepare-wasm] wasm-zstd.wasm up to date")
 }
 
+// (3) Copy zxing_reader.wasm into public/ for the QR decode worker's runtime
+// fetch. zxing-wasm's Emscripten `locateFile` resolves it relative to the
+// worker location, so it must sit at the build output root (alongside
+// wasm-zstd.wasm).
+const zxingSrc = path.join(
+  webRoot,
+  "node_modules",
+  "zxing-wasm",
+  "dist",
+  "reader",
+  "zxing_reader.wasm"
+)
+const zxingDst = path.join(publicDir, "zxing_reader.wasm")
+if (fs.existsSync(zxingSrc)) {
+  const zNeed =
+    !fs.existsSync(zxingDst) ||
+    fs.statSync(zxingDst).size !== fs.statSync(zxingSrc).size ||
+    fs.statSync(zxingDst).mtimeMs < fs.statSync(zxingSrc).mtimeMs
+  if (zNeed) {
+    fs.copyFileSync(zxingSrc, zxingDst)
+    console.log(
+      `[prepare-wasm] copied zxing_reader.wasm → ${path.relative(webRoot, zxingDst)}`
+    )
+  } else {
+    console.log("[prepare-wasm] zxing_reader.wasm up to date")
+  }
+} else {
+  // zxing-wasm is only needed by the receiver; warn (not fail) if absent so
+  // sender-only builds still work.
+  console.warn("[prepare-wasm] zxing-wasm not installed — receiver QR decode will be unavailable")
+}
+
 console.log("[prepare-wasm] ready")
