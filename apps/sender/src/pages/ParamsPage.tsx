@@ -67,9 +67,12 @@ export function ParamsPage({
   const ratioBase = originalSize
   const ratio = ratioBase > 0 ? compressedSize / ratioBase : 1
 
-  // Pre-transfer ETA estimate (before encoder init).
+  // Pre-transfer ETA estimate (before encoder init). For a segmented transfer
+  // `compressedSize` is the WHOLE compressed stream, but the per-segment
+  // estimate must use a single segment's bytes (≈ whole / segmentCount).
   // Total frames ≈ source symbols × (1 + redundancy) + descriptor overhead.
-  const totalSymbols = Math.ceil(compressedSize / config.symbolSize)
+  const perSegmentBytes = isSegmented ? compressedSize / segmentCount : compressedSize
+  const totalSymbols = Math.ceil(perSegmentBytes / config.symbolSize)
   const totalFrames = Math.ceil(totalSymbols * (1 + config.redundancyPct / 100))
   const effectiveFps = config.fps > 0 ? config.fps : 60 // conservative display-refresh estimate
   const estimatedSeconds = totalFrames / effectiveFps
