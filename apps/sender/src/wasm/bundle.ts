@@ -55,6 +55,8 @@ export const MAX_TRANSFER_MIB = MAX_TRANSFER_BYTES / (1024 * 1024)
 export const MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 export const MAX_ORIGINAL_MIB = MAX_ORIGINAL_BYTES / (1024 * 1024)
 export const MAX_BUNDLE_NAME_BYTES = 0xffff
+/** Product cap that keeps bundle indexes and receiver history operations bounded. */
+export const MAX_BUNDLE_FILES = 4096
 
 /** One file inside a bundle. `data` is the raw file content. */
 export interface BundleEntry {
@@ -106,8 +108,8 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
   if (files.length === 0) {
     throw new Error("buildBundle: no files")
   }
-  if (files.length > 0xffff) {
-    throw new Error("buildBundle: too many files (max 65535)")
+  if (files.length > MAX_BUNDLE_FILES) {
+    throw new Error(`一次最多发送 ${MAX_BUNDLE_FILES} 个文件，请分批发送`)
   }
 
   // Validate the complete allocation before reading any file into memory.
@@ -120,6 +122,9 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
     total += 2 + nameBytes[i].length + 8 + files[i].size
     if (!Number.isSafeInteger(total)) {
       throw new Error("打包后内容大小溢出")
+    }
+    if (total > MAX_ORIGINAL_BYTES) {
+      throw new Error(`多文件包原始大小超过 ${MAX_ORIGINAL_MIB} MiB 接收上限，请分批发送`)
     }
   }
 

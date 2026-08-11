@@ -813,13 +813,18 @@ class ScanActivity : ComponentActivity() {
                     .format(java.util.Date())
                 val bundleId = java.util.UUID.randomUUID().toString()
                 val bundleTitle = "发送_$ts"
-                for ((idx, f) in bundle.files.withIndex()) {
-                    updateRecoveryStage("正在保存文件 (${idx + 1}/$totalFiles)…")
-                    val put = store.putBytes(
-                        this, f.name, f.data,
+                updateRecoveryStage("正在保存 $totalFiles 个文件…")
+                val puts = store.putBytesBatch(
+                    this,
+                    bundle.files.map { f ->
+                        com.airferry.app.scan.ContentStore.PutBytesRequest(
+                            f.name, f.data,
                         crcHex = "unknown", crcUnknown = true, kind = "file",
                         bundleId = bundleId, bundleTitle = bundleTitle,
-                    )
+                        )
+                    },
+                )
+                for ((f, put) in bundle.files.zip(puts)) {
                     paths.add(put.path.absolutePath)
                     names.add(f.name)
                     sizes.add(f.data.size.toString())
@@ -906,6 +911,9 @@ class ScanActivity : ComponentActivity() {
         val expectedSha256 = requireNotNull(session.rawSha256()) {
             "分段描述符缺少 SHA-256"
         }
+        val rootSha256 = requireNotNull(session.rootSha256()) {
+            "分段描述符缺少整文件 SHA-256"
+        }
 
         require(count in 1..com.airferry.app.scan.SegmentAssembler.MAX_SEGMENT_COUNT) {
             "分段数量超出安全上限"
@@ -921,6 +929,7 @@ class ScanActivity : ComponentActivity() {
             "分段实际长度 ${fileBytes.size} 与描述符 $segSize 不一致"
         }
         require(expectedSha256.size == 32) { "分段描述符 SHA-256 长度无效" }
+        require(rootSha256.size == 32) { "整文件 SHA-256 长度无效" }
         val expectedCount = (rootSize - 1) /
             com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES + 1
         val expectedLength = minOf(
@@ -955,11 +964,14 @@ class ScanActivity : ComponentActivity() {
         // the ledger and re-hash every earlier 8 MiB segment for each child.
         // Interleaved roots still open their own identity-bound assembler.
         val active = segAssembler
-        val asm = if (active != null && active.matches(lo, hi, count, rootSize, displayName)) {
+        val asm = if (
+            active != null &&
+            active.matches(lo, hi, count, rootSize, rootSha256, displayName)
+        ) {
             active
         } else {
             com.airferry.app.scan.SegmentAssembler.open(
-                root, lo, hi, count, rootSize, displayName
+                root, lo, hi, count, rootSize, rootSha256, displayName
             ).also { segAssembler = it }
         }
 
@@ -969,15 +981,14 @@ class ScanActivity : ComponentActivity() {
             return archiveSegmentedTransfer(asm, displayName, rootSize)
         }
 
-        // Out-of-order delivery: a segment may already be stored.
-        if (asm.hasSegment(index)) {
-            updateSegmentedProgress(asm)
-            clearRecoveryStage()
-            swapReceiverForNextSegment()
-            return null
-        }
         try {
-            asm.storeSegment(index, fileBytes, expectedSha256)
+            val stored = asm.storeSegment(index, fileBytes, expectedSha256)
+            if (!stored) {
+                updateSegmentedProgress(asm)
+                clearRecoveryStage()
+                swapReceiverForNextSegment()
+                return null
+            }
         } catch (e: Exception) {
             runOnUiThread {
                 Toast.makeText(this, "分段写入失败: ${e.message}", Toast.LENGTH_LONG).show()
@@ -1010,6 +1021,8 @@ class ScanActivity : ComponentActivity() {
         val put = com.airferry.app.scan.ContentStore.putFile(
             this, displayName, finalFile,
             crcHex = "unknown", crcUnknown = true, kind = "file",
+            expectedSha256Hex = asm.rootSha256Hex(), expectedSize = rootSize,
+            stableEntryId = "segment-${rootSessionIdHex(asm.rootSessionIdLo(), asm.rootSessionIdHi())}",
         )
         // ContentStore index is now durable; the resumable task can be removed.
         asm.commitArchived()

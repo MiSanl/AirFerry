@@ -611,7 +611,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong originalSize = payload.OriginalSize;
 
         RecoveryResult? result;
-        if (TextParser.IsText(bytes))
+        if (TextParser.IsText(bytes) &&
+            FileNameUtil.FitsTextUi(bytes.LongLength - TextParser.Magic.Length))
         {
             // Text payload → decode UTF-8, stage under the descriptor filename,
             // and carry the string for the copy/share UI. Checked BEFORE the
@@ -680,6 +681,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 session.FileSize(),
                 session.OriginalOffset(),
                 session.RawSha256(),
+                session.RootSha256(),
                 session.Crc32(),
                 session.Crc32Known());
         });
@@ -718,6 +720,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             throw new InvalidDataException("分段实际长度与描述符不一致");
         if (seg.RawSha256.Length != 32)
             throw new InvalidDataException("分段描述符缺少 SHA-256");
+        if (seg.RootSha256.Length != 32)
+            throw new InvalidDataException("分段描述符缺少整文件 SHA-256");
         if (seg.CrcKnown && Crc32.Compute(segBytes) != seg.ExpectedCrc)
             throw new InvalidDataException($"分段 {index + 1}/{count} CRC32 校验失败");
         if (_resumeRootId is not null &&
@@ -731,10 +735,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // the ledger and re-hash every earlier 8 MiB segment for each child.
         // Interleaved roots still open their own identity-bound assembler.
         var asm = _segAssembler is not null
-                  && _segAssembler.Matches(lo, hi, count, (long)rootSize, displayName)
+                  && _segAssembler.Matches(
+                      lo, hi, count, (long)rootSize, seg.RootSha256, displayName)
             ? _segAssembler
             : AirFerry.Windows.Bundle.SegmentAssembler.Open(
-                lo, hi, count, (long)rootSize, displayName);
+                lo, hi, count, (long)rootSize, seg.RootSha256, displayName);
         _segAssembler = asm;
 
         // Crash recovery: all segments may already be durable while history
@@ -742,16 +747,16 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (asm.IsComplete())
             return ArchiveSegmentedTransfer(asm, displayName, rootSize);
 
-        if (asm.HasSegment(index))
+        // A failure leaves all earlier verified segments untouched. The outer
+        // recovery boundary swaps in a fresh child receiver so this segment can
+        // be scanned again immediately.
+        bool stored = asm.StoreSegment(index, segBytes, seg.RawSha256);
+        if (!stored)
         {
             UpdateSegmentedProgress(asm);
             SwapReceiverForNextSegment(session, pool);
             return null;
         }
-        // A failure leaves all earlier verified segments untouched. The outer
-        // recovery boundary swaps in a fresh child receiver so this segment can
-        // be scanned again immediately.
-        asm.StoreSegment(index, segBytes, seg.RawSha256);
 
         if (!asm.IsComplete())
         {
@@ -773,7 +778,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 "分段账本已完成，但临时文件缺失或损坏");
         var put = AirFerry.Windows.Bundle.ContentStore.PutFile(
             displayName, finalPath,
-            crcHex: "unknown", crcUnknown: true, kind: "file");
+            crcHex: "unknown", crcUnknown: true, kind: "file",
+            expectedSha256Hex: asm.RootSha256Hex,
+            expectedSize: checked((long)rootSize),
+            stableEntryId: $"segment-{asm.RootSessionIdHex}");
         asm.CommitArchived();
         _segAssembler = null;
         _resumeRootId = null;
@@ -799,6 +807,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong OriginalSize,
         ulong OriginalOffset,
         byte[] RawSha256,
+        byte[] RootSha256,
         ulong ExpectedCrc,
         bool CrcKnown);
 
@@ -925,14 +934,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         string bundleId = Guid.NewGuid().ToString("N");
         string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
         var staged = new List<BundleFile>(bundle.Files.Count);
+        ContentStore.PutBytesBatch(bundle.Files.Select(f =>
+            new ContentStore.PutBytesRequest(
+                f.Name, f.Data, Kind: "file",
+                BundleId: bundleId, BundleTitle: bundleTitle)).ToList());
         foreach (BundleFile f in bundle.Files)
         {
-            ContentStore.PutResult put = ContentStore.PutBytes(
-                f.Name, f.Data, kind: "file",
-                bundleId: bundleId, bundleTitle: bundleTitle);
             // Keep in-memory bytes for the bundle UI; disk is content-addressed.
             staged.Add(new BundleFile(f.Name, f.Data));
-            _ = put;
         }
         return new RecoveryResult(
             SingleFilePath: null,

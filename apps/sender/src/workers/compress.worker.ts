@@ -67,6 +67,7 @@ import {
 import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
+import { ensureWasm, Sha256Wasm } from "@/wasm/loader"
 
 /** Decimal-string form of the 128-bit session id, clone-safe across threads. */
 export interface SessionIdDto {
@@ -121,6 +122,8 @@ export interface SegmentSpec {
   childSessionId: SessionIdDto
   /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
   rawSha256: ArrayBuffer
+  /** SHA-256 of the complete uncompressed root file. */
+  rootSha256: ArrayBuffer
   displayName: string
 }
 
@@ -143,6 +146,7 @@ type PendingJob =
       segmentIndex: number
       rootSessionId: SessionIdDto
       segmentCount: number
+      rootSha256: ArrayBuffer
     }
 
 /** Latest pending request while the worker is still waiting for first init. */
@@ -171,6 +175,7 @@ self.onmessage = async (
         segmentIndex: number
         rootSessionId: SessionIdDto
         segmentCount: number
+        rootSha256: ArrayBuffer
       }
   >
 ) => {
@@ -207,6 +212,7 @@ self.onmessage = async (
       segmentIndex: data.segmentIndex,
       rootSessionId: data.rootSessionId,
       segmentCount: data.segmentCount,
+      rootSha256: data.rootSha256,
     })
     return
   }
@@ -385,18 +391,25 @@ async function processSegmentedFile(file: File, jobId: number) {
 
   // Root session id: derive from the whole-file identity so every child segment
   // carries the same root (the receiver keys its assembler on it).
-  const fp = await contentFingerprintFile(file)
+  const rootSha256 = await sha256File(file, jobId)
   if (!isCurrent(jobId)) return
   const rootSessionId = deriveSessionId(
     file.name,
     BigInt(file.size),
     BigInt(file.lastModified),
-    fp
+    rootSha256
   )
 
   // Prepare only the first child. Later children are recompressed on demand,
   // so neither the worker nor React retains a root-sized list of buffers.
-  const first = await prepareSegmentSpec(file, rootSessionId, 0, count, jobId)
+  const first = await prepareSegmentSpec(
+    file,
+    rootSessionId,
+    rootSha256,
+    0,
+    count,
+    jobId
+  )
   if (!first || !isCurrent(jobId)) return
 
   const result: CompressResult = {
@@ -432,12 +445,15 @@ async function processRequestedSegment(
     if (segmentCountFor(job.file.size) !== job.segmentCount) {
       throw new Error("文件大小已变化，分段数量不再一致")
     }
-    const fp = await contentFingerprintFile(job.file)
+    const rootSha256 = new Uint8Array(job.rootSha256)
+    if (rootSha256.length !== 32) {
+      throw new Error("分段任务缺少完整文件 SHA-256")
+    }
     const root = deriveSessionId(
       job.file.name,
       BigInt(job.file.size),
       BigInt(job.file.lastModified),
-      fp
+      rootSha256
     )
     if (
       root.lo.toString() !== job.rootSessionId.lo ||
@@ -448,6 +464,7 @@ async function processRequestedSegment(
     const segment = await prepareSegmentSpec(
       job.file,
       root,
+      rootSha256,
       job.segmentIndex,
       job.segmentCount,
       job.jobId
@@ -473,6 +490,7 @@ async function processRequestedSegment(
 async function prepareSegmentSpec(
   file: File,
   rootSessionId: { lo: bigint; hi: bigint },
+  rootSha256: Uint8Array,
   segmentIndex: number,
   segmentCount: number,
   jobId: number
@@ -512,6 +530,7 @@ async function prepareSegmentSpec(
       lo: rootSessionId.lo.toString(),
       hi: rootSessionId.hi.toString(),
     },
+    rootSha256: rootSha256.slice().buffer as ArrayBuffer,
     childSessionId: {
       lo: childSessionId.lo.toString(),
       hi: childSessionId.hi.toString(),
@@ -530,19 +549,25 @@ async function sha256Bytes(bytes: Uint8Array): Promise<ArrayBuffer> {
   return digest
 }
 
-/**
- * Content fingerprint for a file without materialising the whole file. The
- * file size is already a separate input to `deriveSessionId`; the fingerprint
- * itself must exactly mirror Rust's `content_fingerprint(head, tail)`.
- */
-async function contentFingerprintFile(file: File): Promise<Uint8Array> {
-  const HEAD = 1024
-  const TAIL = 1024
-  const head = new Uint8Array(await file.slice(0, HEAD).arrayBuffer())
-  const tail = new Uint8Array(
-    await file.slice(Math.max(0, file.size - TAIL), file.size).arrayBuffer()
-  )
-  return contentFingerprint(head, tail)
+/** Stream a complete file through Rust's incremental SHA-256 implementation. */
+async function sha256File(file: File, jobId: number): Promise<Uint8Array> {
+  await ensureWasm()
+  const hasher = new Sha256Wasm()
+  const chunkBytes = 4 * 1024 * 1024
+  try {
+    for (let offset = 0; offset < file.size; offset += chunkBytes) {
+      if (!isCurrent(jobId)) throw new Error("分段准备已取消")
+      const chunk = new Uint8Array(
+        await file.slice(offset, Math.min(file.size, offset + chunkBytes)).arrayBuffer()
+      )
+      hasher.update(chunk)
+    }
+    const digest = hasher.digest()
+    if (digest.length !== 32) throw new Error("完整文件 SHA-256 计算失败")
+    return digest
+  } finally {
+    hasher.free()
+  }
 }
 
 /**

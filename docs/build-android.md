@@ -83,7 +83,7 @@ keyPassword=airferry
 
 > keystore 路径相对于 Gradle `rootProject`（即 `apps/scanner/`），解析到 `<repo>/dist/airferry-release.keystore`。`dist/` 与 `*.keystore` 均在 `.gitignore` 中，密钥随 release 产物一起放在 `dist/`、不入 git。
 >
-> 示例口令仅供本地说明；正式分发必须生成强口令的专用 keystore。缺少文件、字段或 keystore 时 `assembleRelease` 会直接失败，绝不会回退到 debug key。根脚本还会用 `apksigner` 验证证书并拒绝 Android Debug 签名；可设置 `AIRFERRY_ANDROID_CERT_SHA256` 固定预期证书指纹。
+> 示例口令仅供本地说明；正式分发必须使用 AirFerry 的固定 release keystore。缺少文件、字段或 keystore 时 `assembleRelease` 会直接失败，绝不会回退到 debug key。根脚本还会用 `apksigner` 核对内置的发布证书 SHA-256 指纹 `44577EDA2C6D4F44638C9D61DC161F08FDB30FCEE6A3410AADAEB7CE65A97FDD`；签名变化会直接终止打包。
 
 ## 安装到设备
 

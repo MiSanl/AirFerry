@@ -1,11 +1,12 @@
 /** Durable browser-side ledger for descriptor-v4 segmented receives. */
 
 const DB_NAME = "airferry-receive-v1"
-const DB_VERSION = 1
+const DB_VERSION = 2
 const TASKS = "tasks"
 const SEGMENTS = "segments"
 const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
 const MAX_SEGMENT_COUNT = 131_072
+const MIN_FREE_RESERVE_BYTES = 64 * 1024 * 1024
 
 export interface StoredSegmentTask {
   rootId: string
@@ -14,6 +15,8 @@ export interface StoredSegmentTask {
   fileName: string
   rootOriginalSize: number
   segmentCount: number
+  /** Complete-file digest shared by every descriptor-v4 segment. */
+  rootSha256: string
   received: number[]
   hashes: (string | null)[]
   state: "receiving" | "complete"
@@ -35,6 +38,7 @@ export interface StoreSegmentInput {
   segmentCount: number
   index: number
   sha256Hex: string
+  rootSha256Hex: string
   bytes: Uint8Array
 }
 
@@ -56,13 +60,20 @@ function transactionDone(tx: IDBTransaction): Promise<void> {
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION)
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (event) => {
       const db = req.result
       if (!db.objectStoreNames.contains(TASKS)) {
         db.createObjectStore(TASKS, { keyPath: "rootId" })
       }
       if (!db.objectStoreNames.contains(SEGMENTS)) {
         db.createObjectStore(SEGMENTS, { keyPath: ["rootId", "index"] })
+      }
+      // v1.1.6 descriptor-v4 tasks did not bind their segments to a
+      // complete-file digest and are unsafe to resume under revision 2.
+      if ((event as IDBVersionChangeEvent).oldVersion > 0 &&
+          (event as IDBVersionChangeEvent).oldVersion < 2) {
+        req.transaction?.objectStore(TASKS).clear()
+        req.transaction?.objectStore(SEGMENTS).clear()
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -96,9 +107,19 @@ export async function storeVerifiedSegment(
     input.index < 0 ||
     input.index >= input.segmentCount ||
     input.bytes.byteLength !== expectedLength ||
-    !/^[0-9a-f]{64}$/.test(input.sha256Hex)
+    !/^[0-9a-f]{64}$/.test(input.sha256Hex) ||
+    !/^[0-9a-f]{64}$/.test(input.rootSha256Hex)
   ) {
     throw new Error("拒绝写入非法的分段任务或分段长度")
+  }
+
+  const estimate = await navigator.storage?.estimate?.()
+  if (
+    estimate?.quota !== undefined &&
+    estimate.usage !== undefined &&
+    estimate.quota - estimate.usage < input.bytes.byteLength + MIN_FREE_RESERVE_BYTES
+  ) {
+    throw new Error("浏览器存储空间不足，无法安全持久化下一分段")
   }
 
   const rootId = rootIdHex(input.rootLo, input.rootHi)
@@ -127,6 +148,7 @@ export async function storeVerifiedSegment(
           fileName: input.fileName,
           rootOriginalSize: input.rootOriginalSize,
           segmentCount: input.segmentCount,
+          rootSha256: input.rootSha256Hex,
           received: [],
           hashes: new Array(input.segmentCount).fill(null),
           state: "receiving",
@@ -140,6 +162,7 @@ export async function storeVerifiedSegment(
       task.fileName !== input.fileName ||
       task.rootOriginalSize !== input.rootOriginalSize ||
       task.segmentCount !== input.segmentCount ||
+      task.rootSha256 !== input.rootSha256Hex ||
       task.hashes.length !== input.segmentCount ||
       task.received.some(
         (index) => !Number.isInteger(index) || index < 0 || index >= input.segmentCount

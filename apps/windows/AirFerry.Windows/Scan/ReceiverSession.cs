@@ -268,6 +268,20 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
+    /// <summary>32-byte SHA-256 of the complete root file, or empty if not segmented.</summary>
+    public byte[] RootSha256()
+    {
+        lock (_gate)
+        {
+            if (!_initialized) return Array.Empty<byte>();
+            var len = NativeBridge.ReceiverRootSha256(_handle, null, 0);
+            if (len == 0) return Array.Empty<byte>();
+            var buf = new byte[len];
+            NativeBridge.ReceiverRootSha256(_handle, buf, len);
+            return buf;
+        }
+    }
+
     /// <summary>
     /// Recover the assembled file bytes, trimming RaptorQ zero-padding back to
     /// the descriptor's original size (mirrors Android's

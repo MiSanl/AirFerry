@@ -6,6 +6,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /**
  * Disk-backed assembler for a descriptor-v4 large transfer.
@@ -15,7 +17,7 @@ import java.security.MessageDigest
  * each completed segment's *uncompressed* bytes at its canonical offset in a
  * single `.partial` file (random-access write), persists a completion bitmap
  * atomically, and once every segment has arrived renames the `.partial` to its
- * final name (optionally verifying per-segment SHA-256 first).
+ * final name after verifying both per-segment SHA-256 and the root SHA-256.
  *
  * Memory stays bounded to one segment at a time — unlike the in-memory
  * `TransferAssembler` in core, this streams to disk, which is what the core
@@ -30,6 +32,7 @@ class SegmentAssembler private constructor(
     private val rootSessionIdHi: Long,
     private val segmentCount: Int,
     private val rootOriginalSize: Long,
+    private val rootSha256: String,
     private val fileName: String,
     private val dir: File,
 ) {
@@ -74,6 +77,9 @@ class SegmentAssembler private constructor(
             return false
         }
         if (!dir.exists() && !dir.mkdirs()) return false
+        require(dir.usableSpace >= bytes.size.toLong() + MIN_FREE_RESERVE_BYTES) {
+            "存储空间不足（至少需要保留 ${MIN_FREE_RESERVE_BYTES / 1024 / 1024} MiB）"
+        }
 
         // Grow/truncate the partial file to the root size once, then write at offset.
         RandomAccessFile(partialFile, "rw").use { raf ->
@@ -107,9 +113,18 @@ class SegmentAssembler private constructor(
 
     fun rootSessionIdHi(): Long = rootSessionIdHi
 
-    fun matches(lo: Long, hi: Long, count: Int, size: Long, name: String): Boolean =
+    fun rootSha256Hex(): String = rootSha256
+
+    fun matches(
+        lo: Long,
+        hi: Long,
+        count: Int,
+        size: Long,
+        rootHash: ByteArray,
+        name: String,
+    ): Boolean =
         rootSessionIdLo == lo && rootSessionIdHi == hi && segmentCount == count &&
-            rootOriginalSize == size && fileName == name
+            rootOriginalSize == size && rootSha256 == rootHash.toHex() && fileName == name
 
     @Synchronized
     fun isComplete(): Boolean = receivedCount >= segmentCount
@@ -121,24 +136,37 @@ class SegmentAssembler private constructor(
 
     /**
      * Finish the transfer: rename `.partial` → the final name. Verifies the
-     * whole file's size matches [rootOriginalSize]. Returns the final file, or
-     * null if segments are still missing.
+     * whole file's size and root SHA-256. Returns the final file, or null if
+     * segments are still missing. If a previous crash already moved the file
+     * into ContentStore, the missing final path is returned so publication can
+     * be retried idempotently against the expected content hash.
      */
     @Synchronized
     fun finish(): File? {
         if (!isComplete()) return null
         val final = File(dir, "transfer.complete")
-        if (final.exists() && final.length() == rootOriginalSize) return final
-        if (partialFile.exists() && partialFile.length() != rootOriginalSize) return null
-        if (!partialFile.exists()) return null
-        if (!partialFile.renameTo(final)) {
-            // Same-directory rename should normally succeed. Keep the bitmap
-            // until ContentStore publishes its index so a crash can resume.
-            FileOutputStream(final, false).use { out ->
-                partialFile.inputStream().use { it.copyTo(out) }
-                out.fd.sync()
+        if (final.exists()) {
+            require(final.length() == rootOriginalSize && sha256Hex(final) == rootSha256) {
+                "整文件 SHA-256 校验失败"
             }
-            partialFile.delete()
+            return final
+        }
+        if (partialFile.exists() && partialFile.length() != rootOriginalSize) return null
+        if (!partialFile.exists()) return final
+        require(sha256Hex(partialFile) == rootSha256) { "整文件 SHA-256 校验失败" }
+        try {
+            Files.move(
+                partialFile.toPath(),
+                final.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+            Files.move(
+                partialFile.toPath(),
+                final.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
         }
         return final
     }
@@ -159,6 +187,7 @@ class SegmentAssembler private constructor(
         obj.put("rootHi", rootSessionIdHi.toString())
         obj.put("count", segmentCount)
         obj.put("rootSize", rootOriginalSize.toString())
+        obj.put("rootSha256", rootSha256)
         obj.put("name", fileName)
         obj.put("updatedAt", updatedAt)
         val arr = org.json.JSONArray()
@@ -185,6 +214,7 @@ class SegmentAssembler private constructor(
         val rootSessionIdHi: Long,
         val fileName: String,
         val rootOriginalSize: Long,
+        val rootSha256: String,
         val segmentCount: Int,
         val receivedCount: Int,
         val receivedIndices: List<Int>,
@@ -227,6 +257,7 @@ class SegmentAssembler private constructor(
         /** Fixed uncompressed segment size (mirrors core `SEGMENT_RAW_BYTES`). */
         const val SEGMENT_RAW_BYTES = 8L * 1024 * 1024
         const val MAX_SEGMENT_COUNT = 131_072
+        private const val MIN_FREE_RESERVE_BYTES = 64L * 1024 * 1024
 
         /**
          * Open (or resume) an assembler for a root transfer. `segmentCount` /
@@ -239,6 +270,7 @@ class SegmentAssembler private constructor(
             rootSessionIdHi: Long,
             segmentCount: Int,
             rootOriginalSize: Long,
+            rootSha256: ByteArray,
             fileName: String,
         ): SegmentAssembler {
             require(segmentCount in 1..MAX_SEGMENT_COUNT) { "segment count out of range" }
@@ -247,14 +279,32 @@ class SegmentAssembler private constructor(
             require(expectedCount == segmentCount.toLong()) {
                 "segment count inconsistent with root size"
             }
+            require(rootSha256.size == 32) { "root SHA-256 must be 32 bytes" }
             val hex = rootSessionIdHex(rootSessionIdLo, rootSessionIdHi)
             val dir = File(root, "seg/$hex")
+            val bm = File(dir, "bitmap.json")
+            // v1.1.6 ledgers did not bind segments to a root digest. They are
+            // unsafe to resume under the revised descriptor-v4 contract.
+            if (bm.exists()) {
+                try {
+                    val savedRootHash = JSONObject(bm.readText()).optString("rootSha256")
+                    if (savedRootHash.length != 64) dir.deleteRecursively()
+                } catch (_: Exception) {
+                    // A corrupt current-format ledger is handled below without
+                    // deleting its partial file, preserving forensic recovery.
+                }
+            }
+            if (!bm.exists()) {
+                require(root.usableSpace >= rootOriginalSize + MIN_FREE_RESERVE_BYTES) {
+                    "存储空间不足：大文件任务需要约 ${rootOriginalSize / 1024 / 1024} MiB 可用空间"
+                }
+            }
+            val rootHashHex = rootSha256.joinToString("") { "%02x".format(it) }
             val asm = SegmentAssembler(
                 rootSessionIdLo, rootSessionIdHi,
-                segmentCount, rootOriginalSize, fileName, dir
+                segmentCount, rootOriginalSize, rootHashHex, fileName, dir
             )
             // Resume from a persisted bitmap if present.
-            val bm = File(dir, "bitmap.json")
             if (bm.exists()) {
                 try {
                     val obj = JSONObject(bm.readText())
@@ -263,6 +313,7 @@ class SegmentAssembler private constructor(
                         obj.optString("rootLo") == rootSessionIdLo.toString() &&
                         obj.optString("rootHi") == rootSessionIdHi.toString() &&
                         obj.optString("rootSize") == rootOriginalSize.toString() &&
+                        obj.optString("rootSha256") == rootHashHex &&
                         obj.optString("name") == fileName
                     if (!sameTask) {
                         throw IllegalArgumentException("同一根任务的分段元数据冲突")
@@ -308,6 +359,10 @@ class SegmentAssembler private constructor(
                     val count = obj.getInt("count")
                     val size = obj.getString("rootSize").toLong()
                     if (count !in 1..MAX_SEGMENT_COUNT || size <= 0) return@mapNotNull null
+                    val rootSha256 = obj.optString("rootSha256")
+                    if (rootSha256.length != 64 ||
+                        rootSha256.any { it !in '0'..'9' && it !in 'a'..'f' }
+                    ) return@mapNotNull null
                     val recv = obj.optJSONArray("received")
                     val receivedIndices = (0 until count)
                         .filter { recv?.optBoolean(it) == true }
@@ -316,6 +371,7 @@ class SegmentAssembler private constructor(
                         rootSessionIdHi = obj.getString("rootHi").toLong(),
                         fileName = obj.optString("name", "received_file"),
                         rootOriginalSize = size,
+                        rootSha256 = rootSha256,
                         segmentCount = count,
                         receivedCount = receivedIndices.size,
                         receivedIndices = receivedIndices,
@@ -371,6 +427,19 @@ class SegmentAssembler private constructor(
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun sha256Hex(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(256 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                md.update(buffer, 0, read)
+            }
+        }
+        return md.digest().toHex()
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

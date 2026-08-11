@@ -115,7 +115,7 @@ impl Stats {
     fn push_sample_at(&mut self, t_ms: u64, bytes: u64) {
         self.window.push_back(RateSample { t_ms, bytes });
         let cutoff = t_ms.saturating_sub(STATS_WINDOW_MS);
-        while self.window.len() > 2 && self.window.front().map_or(false, |s| s.t_ms < cutoff) {
+        while self.window.len() > 2 && self.window.front().is_some_and(|s| s.t_ms < cutoff) {
             self.window.pop_front();
         }
         while self.window.len() > STATS_MAX_SAMPLES {
@@ -248,7 +248,7 @@ mod tests {
         let symbol_bytes: u64 = 1024;
         // 60s at 30fps → 1800 frames.
         for i in 0..1800u64 {
-            s.push_sample_at(0 + i * 1000 / 30, symbol_bytes);
+            s.push_sample_at(i * 1000 / 30, symbol_bytes);
         }
         // A 10s stall: no frames pushed.
         // Then 2s at 60fps → 120 frames.

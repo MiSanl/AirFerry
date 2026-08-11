@@ -8,6 +8,7 @@
 use crate::sender::{SenderConfig, SenderSession};
 use qr_protocol::SessionId;
 use raptorq_core::Config;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 
 /// Install a panic hook that routes Rust panic messages to the JS console.
@@ -21,6 +22,33 @@ pub fn _start() {
             web_sys::console::error_1(&format!("AirFerry WASM panic: {info}").into());
         }));
     });
+}
+
+/// Incremental SHA-256 for browser workers. WebCrypto only exposes a one-shot
+/// digest API, which would require materialising a multi-gigabyte file in one
+/// `ArrayBuffer`; this wrapper lets the sender hash `File.slice()` chunks while
+/// keeping memory bounded.
+#[wasm_bindgen]
+pub struct Sha256Wasm {
+    inner: Sha256,
+}
+
+#[wasm_bindgen]
+impl Sha256Wasm {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: Sha256::new(),
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    pub fn digest(&self) -> Vec<u8> {
+        self.inner.clone().finalize().to_vec()
+    }
 }
 
 /// WASM-facing sender session.
@@ -110,6 +138,7 @@ impl SenderSessionWasm {
         segment_count: u32,
         original_offset: u64,
         root_original_size: u64,
+        root_sha256: &[u8],
         raw_sha256: &[u8],
         redundancy_pct: u8,
         symbol_size: u32,
@@ -135,9 +164,13 @@ impl SenderSessionWasm {
             compressed_size_known: true,
             crc32_known: true,
         };
-        if raw_sha256.len() != 32 {
-            return Err(JsValue::from_str("raw_sha256 must be exactly 32 bytes"));
+        if root_sha256.len() != 32 || raw_sha256.len() != 32 {
+            return Err(JsValue::from_str(
+                "root_sha256 and raw_sha256 must be exactly 32 bytes",
+            ));
         }
+        let mut root_sha = [0u8; 32];
+        root_sha.copy_from_slice(&root_sha256[..32]);
         let mut sha = [0u8; 32];
         sha.copy_from_slice(&raw_sha256[..32]);
         let segment_meta = crate::segment::SegmentMeta {
@@ -146,6 +179,7 @@ impl SenderSessionWasm {
             segment_count,
             original_offset,
             root_original_size,
+            root_sha256: root_sha,
             raw_sha256: sha,
         };
         let inner =
@@ -695,6 +729,14 @@ impl ReceiverSessionWasm {
         self.inner
             .segment_meta()
             .map(|s| s.raw_sha256.to_vec())
+            .unwrap_or_default()
+    }
+    /// SHA-256 of the complete uncompressed root file, or an empty vector for
+    /// a legacy non-segmented descriptor.
+    pub fn root_sha256(&self) -> Vec<u8> {
+        self.inner
+            .segment_meta()
+            .map(|s| s.root_sha256.to_vec())
             .unwrap_or_default()
     }
 

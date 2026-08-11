@@ -45,6 +45,8 @@ pub struct TransferAssembler {
     total_segments: u32,
     /// Total uncompressed size of the root file.
     root_original_size: u64,
+    /// Complete-file digest shared by every descriptor-v4 segment.
+    root_sha256: [u8; 32],
     /// Per-segment uncompressed bytes. Index == segment_index.
     segments: Vec<Option<Vec<u8>>>,
     /// Per-segment descriptor metadata, used for length / SHA-256 validation.
@@ -96,6 +98,7 @@ impl TransferAssembler {
             filename: file_meta.filename.clone(),
             total_segments: seg.segment_count,
             root_original_size: seg.root_original_size,
+            root_sha256: seg.root_sha256,
             segments,
             meta,
             received_count: 0,
@@ -166,6 +169,11 @@ impl TransferAssembler {
                 "segment count does not match assembler",
             ));
         }
+        if seg.root_sha256 != self.root_sha256 {
+            return Err(Error::InvalidSegment(
+                "segment root sha256 does not match assembler",
+            ));
+        }
         if file_meta.filename != self.filename {
             return Err(Error::InvalidSegment(
                 "segment filename does not match assembler",
@@ -221,6 +229,9 @@ impl TransferAssembler {
                 return None;
             }
             out[off..end].copy_from_slice(bytes);
+        }
+        if Sha256::digest(&out).as_slice() != self.root_sha256 {
+            return None;
         }
         Some(out)
     }
@@ -318,7 +329,14 @@ mod tests {
         }
     }
 
-    fn seg_meta(root: u128, idx: u32, count: u32, root_size: u64, bytes: &[u8]) -> SegmentMeta {
+    fn seg_meta(
+        root: u128,
+        idx: u32,
+        count: u32,
+        root_size: u64,
+        root_sha256: [u8; 32],
+        bytes: &[u8],
+    ) -> SegmentMeta {
         let digest = Sha256::digest(bytes);
         let mut raw_sha256 = [0u8; 32];
         raw_sha256.copy_from_slice(&digest);
@@ -328,6 +346,7 @@ mod tests {
             segment_count: count,
             original_offset: u64::from(idx) * SEGMENT_RAW_BYTES,
             root_original_size: root_size,
+            root_sha256,
             raw_sha256,
         }
     }
@@ -339,8 +358,11 @@ mod tests {
         let seg0 = vec![7u8; SEGMENT_RAW_BYTES as usize];
         let seg1 = vec![9u8; 5 * 1024];
         let root_size = SEGMENT_RAW_BYTES + 5 * 1024;
-        let s0 = seg_meta(root, 0, 2, root_size, &seg0);
-        let s1 = seg_meta(root, 1, 2, root_size, &seg1);
+        let mut root_bytes = seg0.clone();
+        root_bytes.extend_from_slice(&seg1);
+        let root_sha: [u8; 32] = Sha256::digest(&root_bytes).into();
+        let s0 = seg_meta(root, 0, 2, root_size, root_sha, &seg0);
+        let s1 = seg_meta(root, 1, 2, root_size, root_sha, &seg1);
 
         // `new` validates the first segment's file_meta against its canonical
         // range: for segment 0 that is a full 8 MiB (== seg0.len()).
@@ -369,7 +391,8 @@ mod tests {
         let root = 1u128;
         let data = vec![3u8; 512];
         let root_size = 512;
-        let s0 = seg_meta(root, 0, 1, root_size, &data);
+        let root_sha = Sha256::digest(&data).into();
+        let s0 = seg_meta(root, 0, 1, root_size, root_sha, &data);
         let mut a = TransferAssembler::new(&s0, &file_meta("f.bin", root_size)).unwrap();
         assert!(a
             .add_segment(&s0, &file_meta("f.bin", data.len() as u64), data.clone())
@@ -386,7 +409,8 @@ mod tests {
         let root = 2u128;
         let data = vec![5u8; 1024];
         let root_size = 1024;
-        let mut s0 = seg_meta(root, 0, 1, root_size, &data);
+        let root_sha = Sha256::digest(&data).into();
+        let mut s0 = seg_meta(root, 0, 1, root_size, root_sha, &data);
         s0.raw_sha256[0] ^= 0xff; // corrupt the hash
         let mut a = TransferAssembler::new(&s0, &file_meta("t.bin", root_size)).unwrap();
         assert!(a
@@ -398,13 +422,43 @@ mod tests {
     #[test]
     fn rejects_wrong_root_id() {
         let data = vec![1u8; 64];
-        let s0 = seg_meta(0xAAAAu128, 0, 1, 64, &data);
+        let root_sha = Sha256::digest(&data).into();
+        let s0 = seg_meta(0xAAAAu128, 0, 1, 64, root_sha, &data);
         let mut a = TransferAssembler::new(&s0, &file_meta("x.bin", 64)).unwrap();
         // Segment claims a different root id.
-        let wrong = seg_meta(0xBBBBu128, 0, 1, 64, &data);
+        let wrong = seg_meta(0xBBBBu128, 0, 1, 64, root_sha, &data);
         assert!(a
             .add_segment(&wrong, &file_meta("x.bin", data.len() as u64), data.clone())
             .is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_root_digest_and_wrong_final_digest() {
+        let root = 3u128;
+        let data = vec![6u8; 1_024];
+        let correct_root_sha = Sha256::digest(&data).into();
+        let first = seg_meta(root, 0, 1, data.len() as u64, correct_root_sha, &data);
+        let mut assembler =
+            TransferAssembler::new(&first, &file_meta("root.bin", data.len() as u64)).unwrap();
+
+        let mut mixed = first.clone();
+        mixed.root_sha256[0] ^= 0xff;
+        assert!(assembler
+            .add_segment(
+                &mixed,
+                &file_meta("root.bin", data.len() as u64),
+                data.clone()
+            )
+            .is_err());
+
+        let mut wrong = first.clone();
+        wrong.root_sha256 = [0x77; 32];
+        let mut wrong_assembler =
+            TransferAssembler::new(&wrong, &file_meta("root.bin", data.len() as u64)).unwrap();
+        assert!(wrong_assembler
+            .add_segment(&wrong, &file_meta("root.bin", data.len() as u64), data)
+            .unwrap());
+        assert!(wrong_assembler.reassemble().is_none());
     }
 
     #[test]
@@ -417,6 +471,7 @@ mod tests {
             segment_count: 3,
             original_offset: 0,
             root_original_size: 64,
+            root_sha256: Sha256::digest(&data).into(),
             raw_sha256: Sha256::digest(&data).into(),
         };
         assert!(TransferAssembler::new(&bad, &file_meta("y.bin", 64)).is_err());

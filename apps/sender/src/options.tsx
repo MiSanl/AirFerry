@@ -125,6 +125,8 @@ interface PreparedSegment {
   rootOriginalSize: number
   rootSessionId: { lo: bigint; hi: bigint }
   childSessionId: { lo: bigint; hi: bigint }
+  /** SHA-256 shared by every segment of the complete root file. */
+  rootSha256: Uint8Array
   /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
   rawSha256: Uint8Array
   originalSize: number
@@ -143,6 +145,7 @@ function preparedSegmentFromMessage(sg: Record<string, unknown>): PreparedSegmen
     rootOriginalSize: sg.rootOriginalSize as number,
     rootSessionId: { lo: BigInt(root.lo), hi: BigInt(root.hi) },
     childSessionId: { lo: BigInt(child.lo), hi: BigInt(child.hi) },
+    rootSha256: new Uint8Array(sg.rootSha256 as ArrayBuffer),
     rawSha256: new Uint8Array(sg.rawSha256 as ArrayBuffer),
     originalSize: sg.originalSize as number,
   }
@@ -232,6 +235,7 @@ function buildSegmentSession(
     segment.segmentCount,
     BigInt(segment.originalOffset),
     BigInt(segment.rootOriginalSize),
+    segment.rootSha256,
     segment.rawSha256,
     cfg.redundancyPct,
     cfg.symbolSize,
@@ -620,6 +624,11 @@ export default function App() {
         setState((s) => ({ ...s, error: "无法读取原文件，请重新选择" }))
         return
       }
+      const rootSha256 = p.segments[0]?.rootSha256
+      if (!rootSha256 || rootSha256.length !== 32) {
+        setState((s) => ({ ...s, error: "分段任务缺少完整文件 SHA-256" }))
+        return
+      }
       // A segment switch is its own worker request. Giving every request a
       // fresh epoch prevents a slow result for an earlier rapid click from
       // resolving the promise that belongs to the latest requested segment.
@@ -641,6 +650,7 @@ export default function App() {
               lo: p.rootSessionId.lo.toString(),
               hi: p.rootSessionId.hi.toString(),
             },
+            rootSha256: rootSha256.slice().buffer,
           })
         })
         if (!mountedRef.current || epoch.current !== requestEpoch) return

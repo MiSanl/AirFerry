@@ -203,4 +203,9 @@ internal static class NativeBridge
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_receiver_raw_sha256")]
     public static extern nuint ReceiverRawSha256(IntPtr handle, byte[]? outBuf, nuint cap);
+
+    /// <summary>Copy the 32-byte SHA-256 of the complete root file.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_root_sha256")]
+    public static extern nuint ReceiverRootSha256(IntPtr handle, byte[]? outBuf, nuint cap);
 }

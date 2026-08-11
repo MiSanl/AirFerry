@@ -32,6 +32,7 @@ fn pseudo_random(n: usize) -> Vec<u8> {
 /// each independently compressed (here: no-op / COMPRESSION_NONE) and wrapped in
 /// a `SegmentMeta` whose `raw_sha256` is the SHA-256 of that raw slice.
 fn split_root(root: &[u8], root_session_id: u128) -> Vec<SegmentMeta> {
+    let root_sha256: [u8; 32] = Sha256::digest(root).into();
     let count = if root.is_empty() {
         1
     } else {
@@ -51,6 +52,7 @@ fn split_root(root: &[u8], root_session_id: u128) -> Vec<SegmentMeta> {
                 segment_count: count,
                 original_offset: (i as u64) * SEGMENT_RAW_BYTES,
                 root_original_size: root.len() as u64,
+                root_sha256,
                 raw_sha256,
             }
         })
@@ -126,8 +128,7 @@ fn recover_segment(
         Some(seg.segment_index),
         "receiver must expose descriptor-v4 segment meta"
     );
-    let out = rx.assemble().expect("assemble segment");
-    out
+    rx.assemble().expect("assemble segment")
 }
 
 /// Full segmented transfer: send every segment, recover each, assemble the root.
@@ -151,7 +152,7 @@ fn segmented_cycle(root: &[u8], redundancy: u8, drop_every: u32) -> Vec<u8> {
     };
 
     for (i, seg) in segments.iter().enumerate() {
-        let start = (i as usize) * SEGMENT_RAW_BYTES as usize;
+        let start = i * SEGMENT_RAW_BYTES as usize;
         let end = (start + SEGMENT_RAW_BYTES as usize).min(root.len());
         let recovered = recover_segment(
             root_session_id,

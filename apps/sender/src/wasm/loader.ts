@@ -16,6 +16,7 @@
 import init, {
   SenderSessionWasm,
   ReceiverSessionWasm,
+  Sha256Wasm,
   encode_qr,
 } from "@airferry-wasm/transfer_engine.js"
 import { base64ToBuffer } from "./base64"
@@ -43,4 +44,4 @@ export function ensureWasm(): Promise<void> {
   return initPromise
 }
 
-export { SenderSessionWasm, ReceiverSessionWasm, encode_qr }
+export { SenderSessionWasm, ReceiverSessionWasm, Sha256Wasm, encode_qr }

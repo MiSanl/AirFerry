@@ -211,7 +211,7 @@ npm run preview        # 本地预览构建产物
 - **`build_scanner` 自动跑 cargo-ndk**：在 `./gradlew assembleRelease` **之前**先用 `cargo ndk -t arm64-v8a ... build -p transfer-engine --features jni --release` 编译 `libtransfer_engine.so` 到 `jniLibs/`。这是为了避免打进过期 `.so`（AirFerry 重命名后旧符号 `com.easytransfer.*` 与 Kotlin 新包名对不上会 `UnsatisfiedLinkError` 闪退）。因此 `scanner`/`all`/`release` 子命令都自带这步，无需手动前置。
 - **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android 直接保留 v1.1.3 的 `scan_jni.cpp`，Windows 通过 `core/zxing-decoder/` 镜像同一解码选项与全帧/ROI 调度模式。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
 - **`build_web` 不编译 Rust**：`cd apps/web && npm run build`（Vite 静态站点），`prebuild` 会跑 `prepare-wasm.cjs` 校验 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`，持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` 到 `public/`。web 明确复用现代 WASM，**首次构建前须先 `cd apps/sender && npm run wasm`**。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
-- **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥固定在 `dist/airferry-extension.pem`——**首次运行自动生成并挪到此处，之后 MV2/MV3 复用同一私钥**，保证扩展 ID 稳定。找不到 Chrome 二进制时跳过 crx、仅留 zip。
+- **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥必须预先位于 `dist/airferry-extension.pem`；脚本核对固定公钥 SHA-256 后才签名，缺失/换钥直接失败，绝不自动生成新 ID。找不到 Chrome 二进制时跳过 crx、仅留 zip。
 - **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,receiver-web-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
 
 ### 2.7 构建目录布局
@@ -300,8 +300,8 @@ npm run preview        # 本地预览构建产物
    - `apps/scanner/app/build.gradle.kts` `versionName`（+ 通常 `versionCode++`）（→ APK 内嵌）
    - `Cargo.toml` `[workspace.package] version`（→ 核心库）
    - `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）
-   - `.github/workflows/windows.yml` `jobs.windows-pack.env.VER`（→ CI 产出的 Windows zip 名与 `gh release upload` 的 tag）
-   - 建议同步 `apps/web/package.json` `version`（展示用，不进 `build-all.sh` 文件名）
+   - `apps/web/package.json` `version`（→ web 包自身版本）
+   - Windows CI 不保存版本副本；手动触发时输入已存在的 `release_tag`，workflow 校验 tag commit 与 package/manifest 后派生文件名
 
 ### 2.9 Windows 发版（GitHub Actions workflow）
 
@@ -316,9 +316,9 @@ npm run preview        # 本地预览构建产物
 
 **发版步骤（Windows 端）**：
 
-1. 把上表版本（含 `windows.yml` 的 `VER`）改到目标版本（如 `1.1.1`），提交并推 `main`。
-2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`（若尚无 tag，workflow 会 **draft** 创建，之后可补 notes/其它 asset）。
-3. GitHub → Actions → **windows** → **Run workflow**（`workflow_dispatch`）。
+1. 把上表代码版本改到目标版本，提交、创建 tag，并先创建对应 Release。
+2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`。
+3. GitHub → Actions → **windows** → **Run workflow**，输入该现有 tag（如 `v1.2.0`）；workflow 会核对 tag、checkout commit 与 package/manifest 版本。
 4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset；asset 不设 label，见 §2.8）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
@@ -343,11 +343,11 @@ npm run preview        # 本地预览构建产物
 | 持续新鲜修复符号 | `core/transfer-engine/src/sender.rs`（`next_symbol_id`） | 源一遍→不重复修复；ESI 达 2²⁴ 时明确停止 |
 | **接收端摄入入口** | `core/transfer-engine/src/receiver.rs`（`pub fn ingest`） | 缓存引导→描述符确认 OTI→喂解码器；预描述符 `symbol_cache` 上限 `PRE_META_SYMBOL_CACHE_MAX=12000` |
 | 描述符载荷解析 | `core/transfer-engine/src/descriptor.rs`（`parse_payload`） | v1/v2/v3 + v2/v3 消歧；v4 分段尾段（`build_segment_payload`/`parse_segment_payload`） |
-| 大文件分段（descriptor v4） | `core/transfer-engine/src/segment.rs` + `assembler.rs` | 固定 `SEGMENT_RAW_BYTES=8 MiB`、`MAX_SEGMENT_COUNT=131072`；`SegmentMeta::validate` 强制 child id / 根大小 / 段数 / 规范偏移 / 精确段长。`TransferAssembler` 仅是 ≤256 MiB 的便利内存实现；Web 用 IndexedDB 段 Blob，Android/Windows 用磁盘 `.partial` |
+| 大文件分段（descriptor v4） | `core/transfer-engine/src/segment.rs` + `assembler.rs` | 固定 `SEGMENT_RAW_BYTES=8 MiB`、`MAX_SEGMENT_COUNT=131072`；v1.2.0 的 104B v4 尾部同时携带 `root_sha256` + `raw_sha256`，强制 child id / 根大小 / 段数 / 规范偏移 / 精确段长，并在发布前验证整文件摘要。`TransferAssembler` 仅是 ≤256 MiB 的便利内存实现；Web 用 IndexedDB，Android/Windows 用磁盘 `.partial` |
 | 进度快照 | `core/transfer-engine/src/progress.rs` | `Progress` / `Stats` |
 | 断点状态序列化 | `core/transfer-engine/src/resume.rs` + `receiver.rs` | `ResumeState`（serde-gated JSON）；JSON 封顶 128 MiB，恢复前校验 OTI/坐标/预算；**只有带载荷的符号才可回放并计入 received**。descriptor 后为控内存不保存全部 decoder 输入，普通当前对象重启需重扫；大文件跨重启靠宿主“已完成段”账本 |
-| **JNI 绑定（Android）** | `core/transfer-engine/src/jni.rs:67` | `receiverIngest` 返回**packed jlong**（非 JSON，见 SPEC §7）；打包逻辑三端共享 `ingest_status.rs`；`receiverLastAssembleError` 暴露组装/解压失败原因；descriptor-v4 段 getter：`receiverIsSegmented/SegmentIndex/SegmentCount/RootOriginalSize/OriginalOffset/RootSessionIdLo/Hi/RawSha256`（读 `session.segment_meta()`，WASM/C-ABI 同构） |
-| **C-ABI 绑定（Windows）** | `core/transfer-engine/src/cffi.rs` | `airferry_receiver_is_segmented/segment_index/segment_count/root_original_size/original_offset/root_session_id_lo/hi/raw_sha256`；Windows `NativeBridge.cs` + `ReceiverSession.cs` 对应转发 |
+| **JNI 绑定（Android）** | `core/transfer-engine/src/jni.rs` | `receiverIngest` 返回**packed jlong**（非 JSON，见 SPEC §7）；descriptor-v4 getter 含 `receiverRootSha256` / `receiverRawSha256`（WASM/C-ABI 同构） |
+| **C-ABI 绑定（Windows）** | `core/transfer-engine/src/cffi.rs` | 分段 getter 含 `airferry_receiver_root_sha256` / `airferry_receiver_raw_sha256`；Windows `NativeBridge.cs` + `ReceiverSession.cs` 对应转发 |
 | **C ABI 绑定（Windows/.NET P/Invoke）** | `core/transfer-engine/src/cffi.rs:106` | `airferry_receiver_ingest` 返回**packed u64**（位布局三端共享 `ingest_status.rs`）；assemble 用「Rust 分配+free」单次调用 |
 | **WASM 绑定（浏览器）** | `core/transfer-engine/src/wasm.rs` | **发送端** `SenderSessionWasm`：`next_qr` / `next_qr_multi` 为兼容 API；热路径用 `next_qr_scratch` 写入会话内固定缓冲，再用 `qr_scratch_view` 取得当帧 WASM 视图。**接收端** `ReceiverSessionWasm`（v1.1.6 新增，网页接收端用）：`from_descriptor`（校验完整帧 CRC+描述符 flag→锁定 session id→摄入使 meta confirmed）/ `new(sid_lo,sid_hi)` 缓存引导 / `ingest` 返回**packed u64**（位布局三端共享，见 §SPEC ingest 状态字）/ 元数据 getters（`file_name`/`original_size`/`compressed_size`/`compression`/`crc32`/`*_known`/`meta_confirmed`）/ `assemble_raw`（**只重组不解压**，JS 侧用 zstd/xz WASM 解压 + 校验 CRC32）/ `progress_json`。**不暴露 `assemble_result`**（wasm32 解压 fail-closed，见 §5 第10条） |
 | **Windows 相机 QR 解码核心** | `core/zxing-decoder/` | Windows C ABI 对 Android v1.1.3 ZXing 选项、全帧/多 ROI 与结果打包模式的等价实现；不是 Cargo crate |
@@ -363,19 +363,19 @@ npm run preview        # 本地预览构建产物
 | 单次 putImageData 绘制 | `apps/sender/src/components/QrStream.tsx`（`drawMatrix`） | 模块展开为像素后每码一次 putImageData |
 | **文字传输魔数（ETTEXTv1）** | `apps/sender/src/wasm/text.ts` | `buildTextPayload`/`isTextPayload`；与 `bundle.ts` 的 ETBUNDL1 并列。**单条纯文字**走 ETTEXTv1（收端 `ReceiveText` 可复制/分享/存 .txt）；描述符 filename = 选择页用户命名（默认 `文字消息.txt`）；**混发**时文字以命名 `.txt` 进 ETBUNDL1 |
 | **三算法选优压缩** | `apps/sender/src/wasm/compress.ts`（`preparePayload`） | raw/zstd/xz，早期退出阈值 **70%** |
-| 压缩 worker（离主线程） | `apps/sender/src/workers/compress.worker.ts` | 读→压缩→CRC32→会话 ID。`wasm-init`（可无 zstd）始终解锁队列；发送带 `jobId`/epoch，过期任务不 post。`1×text` → `processText({ jobId, text, name })`（name 规范化进描述符）；否则 `processFiles`。**descriptor-v4 大文件分段**：单文件原始 >32 MiB 走 `processSegmentedFile`；根指纹只读头/尾各 1 KiB；首次仅切片/压缩第 0 段，随后 `prepare-segment` 按需重读目标 8 MiB 段，worker 与 React 均只保留当前段。每段独立 CRC + SHA-256 + `deriveSegmentId(root,i)`；`PlayPage` 支持上/下一段及输入段号直达 |
+| 压缩 worker（离主线程） | `apps/sender/src/workers/compress.worker.ts` | 读→压缩→CRC32→会话 ID。**descriptor-v4 大文件分段**：单文件原始 >32 MiB 走 `processSegmentedFile`；用 `Sha256Wasm` 增量读取完整文件并把根摘要冻结到每段，随后按需重读目标 8 MiB 段。每段独立 CRC + SHA-256 + `deriveSegmentId(root,i)`；worker 与 React 均只保留当前段 |
 | WASM 加载器 | `apps/sender/src/wasm/loader.ts:22` | `ensureWasm` 一次性初始化 |
 | 会话 ID（TS 端，镜像 Rust） | `apps/sender/src/wasm/session.ts:17` | `deriveSessionId` |
-| 多文件容器 | `apps/sender/src/wasm/bundle.ts` | 打包格式（ETBUNDL1） |
+| 多文件容器 | `apps/sender/src/wasm/bundle.ts` | 打包格式（ETBUNDL1）；产品上限 4096 项、原始内容硬限 256 MiB。Android/Windows `ContentStore.putBytesBatch` 一次发布整批索引，避免 O(n²) 重写 |
 | 4 个页面 | `apps/sender/src/pages/*.tsx` | FileSelect / Params / Play / Stats |
 | **选择页（统一列表）** | `apps/sender/src/pages/FileSelectPage.tsx` + `options.tsx` + `types.PendingItem` | 无 Tab：上方按钮——**添加文件夹**（`showDirectoryPicker`/`<input webkitdirectory>`，递归加入）+ **添加文字**（弹窗，**保留 content**，文件名文案「收端展示/落盘名」）；**添加文件**由下方大拖放区（全页拖放/点选，追加）承担；全页拖放仅拦截文件，文件夹会递归读取；**仅**点「发送」才 stage。改列表/回步骤 1 会作废在途压缩（epoch/`jobId`）。`1×text`→ETTEXTv1；否则→`processFiles`/ETBUNDL1 |
 | 文字文件名规范化 | `apps/sender/src/storage/textDrafts.ts` | 仅 `normalizeDraftFilename`（IndexedDB 草稿已移除） |
 | **文本类可复制** | Android `TextLike.kt` / Windows `FileNameUtil.IsTextLikeName` | 扩展名启发式（txt/md/json/csv/源码…）：单文件、打包条目、历史列表均可进 `ReceiveText` 复制/分享/存盘。ETTEXTv1 仍优先 |
 
 | manifest 前/后处理 | `prepare-plasmo-icon.cjs` + `fix-manifest.cjs` | 前者从 icon128 生成 git-ignored 的 `assets/icon.png`（clean build 必需）；后者写入各尺寸图标/MV2 CSP/Firefox id，并兜底删 `default_popup` |
-| **★网页接收端（v1.1.6）** | `apps/sender/src/pages/ReceivePage.tsx` | 接收端主页面：相机 `getUserMedia`→`requestVideoFrameCallback` 取帧（1080 全分辨率）→QR worker→receive worker。进度对齐 Android，使用 3 秒窗口解码/有效吞吐；`initWorkers` 重建时 terminate 旧 worker，`scanningActiveRef` 阻止残留捕获循环。**大文件 UX**：历史卡展示已收/总段数与缺失范围；继续时锁定 `targetRootRef`，遇其他 root/non-segmented 会 reset 并继续扫描；完成任务优先逐段校验后流式写 File System Access，兼容浏览器回退 Blob。web 入口 `apps/web/src/receiver.tsx` + `apps/web/receiver.html` |
+| **★网页接收端（v1.1.6 起）** | `apps/sender/src/pages/ReceivePage.tsx` | 大文件完成后逐段复验并流式写 File System Access，同时增量验证根 SHA-256；无该 API 的 Blob 回退硬限 64 MiB，防止合并超大根文件耗尽内存。web 入口 `apps/web/src/receiver.tsx` + `apps/web/receiver.html` |
 | **接收端解压 + 解析** | `apps/sender/src/receive/{decompress,parse}.ts` | `decompressAndVerify`：NONE 原样/ZSTD 复用 sender 的 zstd Emscripten 单例（`zstdDecompress`）/XZ 用 `lzma-wasm`（**必须先 `await lzma.initWasm()` 再 `decompress`**，否则抛 `Please call initWasm()...`，曾漏掉），原始内容上限 `MAX_DECOMPRESSED_BYTES`=256 MiB（与 Rust `MAX_ORIGINAL_BYTES` 同步；wire 上限仍为 `MAX_OBJECT_BYTES`=32 MiB）+ CRC32 校验。`parseRecovered`：ETTEXTv1→text / ETBUNDL1→bundle / 否则→单文件（字节级镜像 Android/Windows） |
-| **receive worker** | `apps/sender/src/workers/receive.worker.ts` | 持 `ReceiverSessionWasm` 单例，`messageQueue` 串行整个 async handler；jobId/epoch 防过期；batch 含 descriptor 用 `from_descriptor`，否则从任意数据帧低/高 64 位建立 pending session。**descriptor-v4**：`assemble_raw`→JS 解压并强制 CRC32→`raw_sha256`→规范段数/偏移/长度；随后 `receive/taskStore.ts` 在同一 IndexedDB readwrite transaction 提交 Blob+账本。未齐发 `segment` 并 `dropSession()`；全齐发 `stored-result`，不在 worker 合并根数组。坏段发可重试 `segment-error`，已有段不删；重复段可修补丢失/损坏的 IDB Blob |
+| **receive worker** | `apps/sender/src/workers/receive.worker.ts` | descriptor-v4 解压后强制 CRC32、`raw_sha256`、规范坐标并冻结跨段 `root_sha256`；`taskStore.ts` 同一 IDB 事务提交 Blob+账本，写前检查 storage estimate。普通结果用 transferable ArrayBuffer 回主线程，避免 structured clone 复制 |
 | **QR decode worker（池）** | `apps/sender/src/workers/qr-decode.worker.ts` + `ReceivePage` 池管理 | **双后端**：① **FAST（M3 快路径，默认）**：自编译 ZXing-C++→WASM（`fastzxing/airferry_zxing.js/.wasm`，Emscripten 3.1.64 + `-O3 -msimd128`），吃 **Y 灰度平面**（主线程 `extractYPlane` = **canvas drawImage + getImageData + RGBA→Y**，stride 严格 = width）。**⚠️ 不要用 `VideoFrame.copyTo(I420)` 取 Y**：I420 的 Y 平面按 coded-stride(≥width)/codedWidth(≥displayWidth) 布局，`subarray(0,w*h)` + `rowStride=width` 会行错位、WASM 解不出（曾因此「扫不出来」）。canvas RGBA→Y 布局确定，虽然多一次 RGBA 转换，但正确。worker `decodeFastY` 调 `airferry_wasm_decode_multi_y`（复用 `core/zxing-decoder/airferry_zxing_core.cpp` 纯 C++，与 Windows/Android 同源）。实测合成四码 598px **10.4ms**（vs zxing-wasm ~22ms，~2×+）。**⚠️ 编译必须 `-fexceptions` + `-s STACK_SIZE=1MiB` + 固定 64MiB 内存（`ALLOW_MEMORY_GROWTH=0`）**：ZXing-C++ 在 1080p 大帧上会抛 C++ 异常，emscripten 默认 `-fno-exceptions` 会让它 trap 成 JS 数字异常（`解码失败: 638680`）→ fast 后端崩 → 「扫不出来」。开异常支持 + 大栈让 `catch(...)` 优雅跳过坏帧。② **COMPAT（回退）**：`zxing-wasm/reader` 的 `readBarcodesFromImageData`（RGBA）。**自动探测**：worker `init` 先 `loadFastBackend()`，成功 `ready{fast:true}`（main 喂 Y），失败回退 zxing-wasm `ready{fast:false}`（main 喂 RGBA）。**默认全帧解码**（`maxNumberOfSymbols:4`，码任意位置可检出）。**算法提速**：① `tryInvert:false`；② 两级 tryHarder。decode 可选 `roiGrid`（`{cols:2,rows:2}`）保留代码但**默认不启用**——固定 ROI 把真实拍摄偏移/倾斜的码切半导致难扫，故主链路走全图；`cropRgba` 仅在显式 `roiGrid` 时用。**⚠️ 无自适应 ROI 跟踪**：曾参考 Android `decodeYRegionTracked` 实现 ROI 跟踪，但 Android 实测 ROI 不可靠已回退，Web 同理走全图最稳。**ReceivePage 持 `QR_WORKER_POOL=4` 个 qr worker 池**：captureLoop 每帧派发给第一个空闲 worker（`qrBusyRef`），无空闲才丢帧——多帧跨核并行解码，镜像 Android 线程池；每个 worker 独立 zxing WASM 实例，`decoded` 后标记空闲并把 payloads 喂给单例 receive worker（ingest 仍串行）。**⚠️ 捕获循环用 `scanningActiveRef` 守卫**：`teardown`/`reset` 置 false，`startScanning` 置 true，captureLoop 开头检查——否则上次会话残留的 RVFC/rAF 回调不停止（`requestVideoFrameCallback` 的 handle 无法用 `cancelAnimationFrame` 取消），再点「开始接收」会**双循环重叠**，表现为「第二次很难扫出来」。快路径（自编译 ZXing-C++ WASM 灰度，M3）待落地 |
 
 ### 3.3 Android 扫码端
@@ -394,7 +394,7 @@ npm run preview        # 本地预览构建产物
 | 多文件包解包 | `app/.../scan/BundleParser.kt` | 恢复后拆包（ETBUNDL1） |
 | **文字载荷解析** | `app/.../scan/TextParser.kt` | `isText`/`parse`（ETTEXTv1 → UTF-8）；字节级镜像 TS `text.ts` 与 C# `TextParser.cs` |
 | **文本类启发式** | `app/.../scan/TextLike.kt` | 扩展名 + `decodeUtf8Strict`；与 Windows `FileNameUtil.IsTextLikeName` 对齐 |
-| **内容库（映射去重）** | `app/.../scan/ContentStore.kt` | `files/store/blobs/<hh>/<sha256>` + `index.json`；同内容一份；索引损坏会备份并停止写入。**大文件**：`putFile` 流式哈希后原子复制/发布 blob，只有索引成功才删除任务源；`SegmentAssembler.kt` 按规范偏移写 `.partial`、fsync 后原子位图、恢复时逐段重验 SHA。Windows 的 `Bundle/ContentStore.cs` / `SegmentAssembler.cs` 同构 |
+| **内容库（映射去重）** | `app/.../scan/ContentStore.kt` | `files/store/blobs/<hh>/<sha256>` + `index.json`。大文件新任务/逐段写入先检查空间；完成时验证根 SHA，成品同卷原子移动到内容地址，并以根任务派生的稳定条目 ID 做崩溃重试，既不重复历史记录也不产生常态 2× 占用。Windows 实现同构 |
 | 文件导出名 / MIME | `app/.../scan/FileTransfer.kt` + `AirFerryFileProvider.kt` | ContentStore 实体是无扩展名 SHA-256；四参数 URI 把逻辑名写入 `DISPLAY_NAME`，自定义 provider 覆盖 `getType`/`getTypeAnonymous` 返回逻辑 MIME；SAF 同样按扩展名选择 MIME，避免目标应用落成 `.bin` |
 | UI | `app/.../ui/{ReceiveDetail,ReceiveText,ReceiveBundle,FileList,Settings}Activity.kt` | 详情/文字/列表/设置。`recoverAndStage` 写入 ContentStore；Android 分享直出 blob，但 URI 携带逻辑文件名和 MIME |
 | **文字接收页（可复制/分享/存 .txt）** | `app/.../ui/ReceiveTextActivity.kt` | ETTEXTv1 或文本类；历史列表按 entry.kind / TextLike 打开 |
@@ -481,7 +481,7 @@ npm run preview        # 本地预览构建产物
    - **Rust 核心库**（`core/qr-protocol/src/compress.rs:24,53`）：Zstd **level 22**（`DEFAULT_LEVEL`）、Xz **level 6 + EXTREME**（`XZ_PRESET`）。
    - 两套编码默认值不同是**有意的**：浏览器发送端追求启动快（Zstd Lv1），Rust 原生压缩 API 追求压缩率（Zstd Lv22；XZ Lv6+EXTREME，见 `compress.rs:41-49`）。接收端按标准流解压，不依赖编码级别。引用压缩参数时**必须分清 TS 与 Rust 默认值**，不要合并描述。
 
-3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现 v1.0.0/v1.0.1/v1.1.0 漂移（含 `windows.yml` 的 `VER` 滞后）。**当前权威版本 `1.1.6`**（versionCode=11）。改版本时按 §2.8 第 5 条 + §2.9 全表同步，勿只改 `package.json`。
+3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.0`**（versionCode=12）。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
 
 4. **`derive_meta_from_totals` 已废弃**：`receiver.rs` 内仍保留 JNI/ABI 兼容符号，**新代码勿调用**（其 OTI 构建在大文件上会 assert）。现代路径：从描述符帧拿权威 OTI。
 

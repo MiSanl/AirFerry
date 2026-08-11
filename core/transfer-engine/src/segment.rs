@@ -32,6 +32,10 @@ pub struct SegmentMeta {
     pub original_offset: u64,
     /// Total uncompressed size of the root file.
     pub root_original_size: u64,
+    /// SHA-256 of the complete uncompressed root file. Every segment of the
+    /// same task carries the identical value so receivers cannot accidentally
+    /// combine individually-valid segments from different file revisions.
+    pub root_sha256: [u8; 32],
     /// SHA-256 of this segment's uncompressed bytes.
     pub raw_sha256: [u8; 32],
 }
@@ -122,6 +126,7 @@ mod tests {
             segment_count: 3,
             original_offset: SEGMENT_RAW_BYTES * 2,
             root_original_size: SEGMENT_RAW_BYTES * 2 + raw,
+            root_sha256: [8; 32],
             raw_sha256: [9; 32],
         };
         let child = SessionId::derive_segment(root, 2).0;
@@ -137,6 +142,7 @@ mod tests {
             segment_count: 2,
             original_offset: SEGMENT_RAW_BYTES,
             root_original_size: SEGMENT_RAW_BYTES + 5,
+            root_sha256: [2; 32],
             raw_sha256: [1; 32],
         };
         let fm = file_meta(5);

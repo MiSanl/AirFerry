@@ -35,6 +35,7 @@ public sealed class Bundle(IReadOnlyList<BundleFile> files)
 /// </remarks>
 public static class BundleParser
 {
+    private const int MaxBundleFiles = 4096;
     public static ReadOnlySpan<byte> Magic => "ETBUNDL1"u8;
 
     /// <summary>True if bytes starts with the 8-byte bundle magic.</summary>
@@ -63,7 +64,7 @@ public static class BundleParser
             return null;
         }
         int count = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(10, 2));
-        if (count == 0)
+        if (count is <= 0 or > MaxBundleFiles)
         {
             return null;
         }

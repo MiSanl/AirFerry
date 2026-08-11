@@ -466,6 +466,27 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRawS
     }
 }
 
+/// SHA-256 of the complete uncompressed root file, or null for a legacy
+/// non-segmented descriptor.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRootSha256(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jbyteArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    match session.segment_meta() {
+        Some(s) => match env.byte_array_from_slice(&s.root_sha256) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Last [`ReceiverSession::assemble_result`] error message, or empty if none.
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLastAssembleError(

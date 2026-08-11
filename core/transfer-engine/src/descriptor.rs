@@ -97,6 +97,7 @@ pub struct DescriptorInfo {
 ///   u32  segment_count
 ///   u64  original_offset
 ///   u64  root_original_size
+///   u8[32] root_sha256       (complete uncompressed root file)
 ///   u8[32] raw_sha256        (uncompressed segment bytes)
 ///
 /// Total v1 part = 28 + 16*B. v2 extension = 1 + filename_len + 8 + 4.
@@ -112,7 +113,7 @@ const DESC_V2_TAIL_FIXED: usize = 13;
 /// Size of the v3 extension fields: u8 compression + u64 compressed_size = 9.
 const DESC_V3_TAIL_FIXED: usize = 9;
 /// Size of the descriptor-v4 segment extension.
-const DESC_V4_TAIL_FIXED: usize = 16 + 4 + 4 + 8 + 8 + 32;
+const DESC_V4_TAIL_FIXED: usize = 16 + 4 + 4 + 8 + 8 + 32 + 32;
 
 /// Serialize object metadata + file metadata into a descriptor payload, padded
 /// with zeros to `symbol_size` bytes.
@@ -216,6 +217,8 @@ fn build_payload_inner(
         o += 8;
         buf[o..o + 8].copy_from_slice(&segment.root_original_size.to_be_bytes());
         o += 8;
+        buf[o..o + 32].copy_from_slice(&segment.root_sha256);
+        o += 32;
         buf[o..o + 32].copy_from_slice(&segment.raw_sha256);
     }
 
@@ -344,6 +347,9 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
         o += 8;
         let root_original_size = u64::from_be_bytes(payload[o..o + 8].try_into().ok()?);
         o += 8;
+        let mut root_sha256 = [0u8; 32];
+        root_sha256.copy_from_slice(&payload[o..o + 32]);
+        o += 32;
         let mut raw_sha256 = [0u8; 32];
         raw_sha256.copy_from_slice(&payload[o..o + 32]);
         Some(SegmentMeta {
@@ -352,6 +358,7 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
             segment_count,
             original_offset,
             root_original_size,
+            root_sha256,
             raw_sha256,
         })
     } else {
@@ -510,6 +517,39 @@ mod tests {
         assert_eq!(info.file_meta.original_size, 50_000);
         assert_eq!(info.file_meta.crc32, 0xCAFEBABE);
         assert!(info.file_meta.crc32_known);
+    }
+
+    #[test]
+    fn descriptor_roundtrip_v4_binds_root_sha256() {
+        let data = vec![0x5au8; 4_096];
+        let sender = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            FileMeta {
+                filename: "large.bin".to_string(),
+                original_size: data.len() as u64,
+                crc32: 0x12345678,
+                compression: qr_protocol::compress::COMPRESSION_NONE,
+                compressed_size: data.len() as u64,
+                compressed_size_known: true,
+                crc32_known: true,
+            },
+        )
+        .unwrap();
+        let segment = SegmentMeta {
+            root_session_id: 0x1234,
+            segment_index: 0,
+            segment_count: 1,
+            original_offset: 0,
+            root_original_size: data.len() as u64,
+            root_sha256: [0xa5; 32],
+            raw_sha256: [0x5a; 32],
+        };
+        let payload = build_segment_payload(sender.meta(), sender.file_meta(), &segment).unwrap();
+        assert_eq!(payload[1], DESC_VERSION);
+        let parsed = parse_payload(&payload).unwrap();
+        assert_eq!(parsed.segment, Some(segment));
     }
 
     #[test]

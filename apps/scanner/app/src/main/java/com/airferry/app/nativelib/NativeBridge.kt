@@ -101,4 +101,7 @@ object NativeBridge {
 
     /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes, or null if not segmented. */
     external fun receiverRawSha256(handle: Long): ByteArray?
+
+    /** SHA-256 (raw 32 bytes) of the complete root file, or null if not segmented. */
+    external fun receiverRootSha256(handle: Long): ByteArray?
 }

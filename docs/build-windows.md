@@ -108,7 +108,7 @@ dotnet run --project AirFerry.Windows -c Release
 
 1. **两个 native DLL 必须先于 C# 构建**：见 §4.1/§4.2。走 `build-windows.ps1` 会自动跑 cargo、CMake 与 CTest。
 2. **WPF 只能在 Windows 上构建**：`net8.0-windows` TFM 依赖 Windows SDK，无法在 macOS/Linux 上编译 C# 主项目。**协议层单元测试**（`AirFerry.Windows.Tests`）用纯 `net8.0` TFM，可在任何 OS 上跑（不依赖 P/Invoke，只测 IngestStatus 位域、FrameHeader 解析、BundleParser 等纯逻辑）。
-3. **版本号同步**：改版本时同时改 `apps/sender/package.json`（→ 文件名）+ `apps/scanner/app/build.gradle.kts` versionName（→ APK 内嵌）+ `Cargo.toml`（→ 核心库）+ `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）+ **`.github/workflows/windows.yml` `env.VER`**（→ CI zip 名与 release tag）。详见 [AGENTS.md](../AGENTS.md) §2.8 / §2.9。
+3. **版本号同步**：改版本时同时改 `apps/sender/package.json`（→ 文件名）+ `apps/web/package.json` + `apps/scanner/app/build.gradle.kts` versionName（→ APK 内嵌）+ `Cargo.toml`（→ 核心库）+ `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）。Windows workflow 不再硬编码版本。详见 [AGENTS.md](../AGENTS.md) §2.8 / §2.9。
 
 ---
 
@@ -120,7 +120,7 @@ macOS/Linux 无法编 WPF。正式 Windows 产物用 [`.github/workflows/windows
 push/PR（core/** 或 apps/windows/**）
   → rust-cffi (ubuntu) + csharp-tests (ubuntu) + windows-build (windows-2022)
 
-workflow_dispatch（手动）且上述三 job 成功
+workflow_dispatch（手动输入已存在的 `release_tag`）且上述三 job 成功
   → windows-pack：
        cargo build --features cffi --release
        拷贝 transfer_engine.dll → apps/windows/AirFerry.Windows/runtime/
@@ -129,10 +129,10 @@ workflow_dispatch（手动）且上述三 job 成功
        dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
        Compress-Archive → airferry-receiver-windows-x64-v${VER}.zip
        gh release upload v${VER} … --clobber
-       （若 tag/release 不存在则 gh release create --draft）
+       （tag commit、package/manifest 版本与 release 任一不一致即失败）
 ```
 
-操作：Actions → **windows** → **Run workflow**。`VER` 在 workflow 文件顶部 `env.VER`，发版前与四处版本号一并改。
+操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.0`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。
 
 本地 Windows 仍可用 `.\scripts\build-windows.ps1 -Pack`（产物进 `dist/`）。
 

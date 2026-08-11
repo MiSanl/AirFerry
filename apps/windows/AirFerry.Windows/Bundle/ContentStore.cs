@@ -35,6 +35,15 @@ public static class ContentStore
 
     public sealed record PutResult(Entry Entry, string Path, bool Deduped);
 
+    public sealed record PutBytesRequest(
+        string DisplayName,
+        byte[] Bytes,
+        string CrcHex = "unknown",
+        bool CrcUnknown = true,
+        string Kind = "file",
+        string? BundleId = null,
+        string? BundleTitle = null);
+
     public static string RootDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
             "AirFerry", "store");
@@ -68,6 +77,18 @@ public static class ContentStore
         string? bundleId = null,
         string? bundleTitle = null)
     {
+        return PutBytesBatch(
+        [
+            new PutBytesRequest(
+                displayName, bytes, crcHex, crcUnknown, kind, bundleId, bundleTitle)
+        ]).Single();
+    }
+
+    /// <summary>Archive a bundle with one index read/write instead of O(n²) rewrites.</summary>
+    public static IReadOnlyList<PutResult> PutBytesBatch(
+        IReadOnlyList<PutBytesRequest> requests)
+    {
+        if (requests.Count == 0) return [];
         lock (Gate)
         {
             // Fail closed before writing a blob. Treating a corrupt index as an
@@ -75,35 +96,41 @@ public static class ContentStore
             // entry and orphan otherwise-valid content-addressed blobs.
             var all = LoadIndex();
             Directory.CreateDirectory(RootDir);
-            string hash = Sha256Hex(bytes);
-            string path = BlobPath(hash);
-            bool deduped = FileMatchesHash(path, hash, bytes.LongLength);
-            if (!deduped)
+            long createdAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var results = new List<PutResult>(requests.Count);
+            foreach (PutBytesRequest request in requests)
             {
-                WriteAllBytesAtomic(path, bytes);
+                string hash = Sha256Hex(request.Bytes);
+                string path = BlobPath(hash);
+                bool deduped = FileMatchesHash(path, hash, request.Bytes.LongLength);
+                if (!deduped)
+                {
+                    WriteAllBytesAtomic(path, request.Bytes);
+                }
+                var entry = new Entry(
+                    Id: Guid.NewGuid().ToString("N"),
+                    Name: FileNameUtil.Sanitize(request.DisplayName),
+                    Hash: hash,
+                    Size: request.Bytes.LongLength,
+                    CrcHex: request.CrcHex,
+                    CrcUnknown: request.CrcUnknown,
+                    Kind: request.Kind,
+                    CreatedAt: createdAt,
+                    BundleId: request.BundleId,
+                    BundleTitle: request.BundleTitle);
+                all.Add(entry);
+                results.Add(new PutResult(entry, path, deduped));
             }
-            var entry = new Entry(
-                Id: Guid.NewGuid().ToString("N"),
-                Name: FileNameUtil.Sanitize(displayName),
-                Hash: hash,
-                Size: bytes.LongLength,
-                CrcHex: crcHex,
-                CrcUnknown: crcUnknown,
-                Kind: kind,
-                CreatedAt: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                BundleId: bundleId,
-                BundleTitle: bundleTitle);
-            all.Add(entry);
             SaveIndex(all);
-            return new PutResult(entry, path, deduped);
+            return results;
         }
     }
 
     /// <summary>
     /// Archive an existing file (e.g. a fully-assembled large-transfer) into the
-    /// content-addressed store by streaming its hash and atomically copying it
-    /// into the blob tree — no full-file in-memory copy. The task-owned source
-    /// is deleted only after the history index is durably published.
+    /// content-addressed store by streaming its hash and atomically moving it
+    /// into the blob tree — no full-file in-memory or on-disk copy. If index
+    /// publication fails, the task ledger can retry against the verified blob.
     /// </summary>
     public static PutResult PutFile(
         string displayName,
@@ -112,21 +139,58 @@ public static class ContentStore
         bool crcUnknown = true,
         string kind = "file",
         string? bundleId = null,
-        string? bundleTitle = null)
+        string? bundleTitle = null,
+        string? expectedSha256Hex = null,
+        long? expectedSize = null,
+        string? stableEntryId = null)
     {
         lock (Gate)
         {
             var all = LoadIndex();
             Directory.CreateDirectory(RootDir);
-            string hash = Sha256HexFile(filePath);
+            string? expectedHash = expectedSha256Hex?.ToLowerInvariant();
+            if (expectedHash is not null &&
+                (expectedHash.Length != 64 || expectedHash.Any(c => !Uri.IsHexDigit(c))))
+                throw new ArgumentException("Invalid expected SHA-256 hash",
+                    nameof(expectedSha256Hex));
+            bool sourceExists = File.Exists(filePath);
+            long sourceLength = sourceExists
+                ? new FileInfo(filePath).Length
+                : expectedSize ?? throw new FileNotFoundException(
+                    "Assembled task file is missing", filePath);
+            if (expectedSize is not null && sourceLength != expectedSize.Value)
+                throw new InvalidDataException("assembled file length differs from descriptor");
+            string hash = sourceExists ? Sha256HexFile(filePath) : expectedHash!;
+            if (expectedHash is not null &&
+                !string.Equals(hash, expectedHash, StringComparison.Ordinal))
+                throw new InvalidDataException("assembled file SHA-256 differs from descriptor");
             string path = BlobPath(hash);
-            bool deduped = FileMatchesHash(path, hash, new FileInfo(filePath).Length);
+            bool deduped = FileMatchesHash(path, hash, sourceLength);
             if (!deduped)
             {
-                CopyFileAtomic(filePath, path);
+                if (!sourceExists)
+                    throw new FileNotFoundException(
+                        "Assembled source and verified content blob are both missing", filePath);
+                MoveFileAtomic(filePath, path);
+            }
+            Entry? existing = stableEntryId is null
+                ? null
+                : all.FirstOrDefault(e => e.Id == stableEntryId);
+            if (existing is not null)
+            {
+                if (!string.Equals(existing.Hash, hash, StringComparison.Ordinal) ||
+                    existing.Size != sourceLength)
+                    throw new InvalidDataException(
+                        "stable content entry id conflicts with existing history");
+                if (!string.Equals(Path.GetFullPath(filePath), Path.GetFullPath(path),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    try { File.Delete(filePath); } catch { /* task cleanup retries */ }
+                }
+                return new PutResult(existing, path, true);
             }
             var entry = new Entry(
-                Id: Guid.NewGuid().ToString("N"),
+                Id: stableEntryId ?? Guid.NewGuid().ToString("N"),
                 Name: FileNameUtil.Sanitize(displayName),
                 Hash: hash,
                 Size: new FileInfo(path).Length,
@@ -320,26 +384,11 @@ public static class ContentStore
         }
     }
 
-    private static void CopyFileAtomic(string source, string target)
+    private static void MoveFileAtomic(string source, string target)
     {
         string? dir = Path.GetDirectoryName(target);
         if (dir is null) throw new IOException("Blob path has no directory");
         Directory.CreateDirectory(dir);
-        string temp = Path.Combine(dir, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp");
-        try
-        {
-            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
-            using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
-                       FileShare.None, 64 * 1024, FileOptions.WriteThrough))
-            {
-                input.CopyTo(output);
-                output.Flush(flushToDisk: true);
-            }
-            File.Move(temp, target, overwrite: true);
-        }
-        finally
-        {
-            if (File.Exists(temp)) File.Delete(temp);
-        }
+        File.Move(source, target, overwrite: true);
     }
 }

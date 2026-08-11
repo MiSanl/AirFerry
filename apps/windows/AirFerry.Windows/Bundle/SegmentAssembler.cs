@@ -14,11 +14,13 @@ public sealed class SegmentAssembler
 {
     public const long SegmentRawBytes = 8L * 1024 * 1024;
     public const int MaxSegmentCount = 131_072;
+    private const long MinFreeReserveBytes = 64L * 1024 * 1024;
 
     private readonly ulong _rootLo;
     private readonly ulong _rootHi;
     private readonly int _segmentCount;
     private readonly long _rootOriginalSize;
+    private readonly string _rootSha256;
     private readonly string _fileName;
     private readonly string _dir;
     private readonly bool[] _received;
@@ -38,6 +40,7 @@ public sealed class SegmentAssembler
         ulong RootHi,
         string FileName,
         long RootOriginalSize,
+        string RootSha256,
         int SegmentCount,
         int ReceivedCount,
         IReadOnlyList<int> ReceivedIndices,
@@ -47,12 +50,14 @@ public sealed class SegmentAssembler
     }
 
     private SegmentAssembler(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize, string fileName)
+        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        byte[] rootSha256, string fileName)
     {
         _rootLo = rootLo;
         _rootHi = rootHi;
         _segmentCount = segmentCount;
         _rootOriginalSize = rootOriginalSize;
+        _rootSha256 = Convert.ToHexString(rootSha256).ToLowerInvariant();
         _fileName = fileName;
         _dir = Path.Combine(SegmentAssemblerRoot, RootSessionIdHex);
         _received = new bool[segmentCount];
@@ -61,7 +66,8 @@ public sealed class SegmentAssembler
     }
 
     public static SegmentAssembler Open(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize, string fileName)
+        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        byte[] rootSha256, string fileName)
     {
         if (segmentCount is <= 0 or > MaxSegmentCount)
             throw new InvalidDataException("segment count out of range");
@@ -70,10 +76,25 @@ public sealed class SegmentAssembler
         long expected = checked((rootOriginalSize - 1) / SegmentRawBytes + 1);
         if (expected != segmentCount)
             throw new InvalidDataException("segment count inconsistent with root size");
+        if (rootSha256.Length != 32)
+            throw new InvalidDataException("root SHA-256 must be 32 bytes");
 
         var asm = new SegmentAssembler(
-            rootLo, rootHi, segmentCount, rootOriginalSize,
+            rootLo, rootHi, segmentCount, rootOriginalSize, rootSha256,
             string.IsNullOrWhiteSpace(fileName) ? "received_file" : fileName);
+        if (File.Exists(asm.BitmapPath) && IsLegacyLedger(asm.BitmapPath))
+        {
+            // v1.1.6 tasks lack a complete-file digest and cannot be resumed
+            // safely. Start them over under the revised descriptor-v4 contract.
+            Directory.Delete(asm._dir, recursive: true);
+        }
+        if (!File.Exists(asm.BitmapPath))
+        {
+            long available = AvailableBytes(ContentStore.RootDir);
+            if (available < rootOriginalSize + MinFreeReserveBytes)
+                throw new IOException(
+                    $"存储空间不足：大文件任务需要约 {rootOriginalSize / 1024 / 1024} MiB 可用空间");
+        }
         asm.Resume();
         return asm;
     }
@@ -89,6 +110,7 @@ public sealed class SegmentAssembler
                         && root.GetProperty("rootHi").GetString() == _rootHi.ToString()
                         && root.GetProperty("count").GetInt32() == _segmentCount
                         && root.GetProperty("rootSize").GetString() == _rootOriginalSize.ToString()
+                        && root.GetProperty("rootSha256").GetString() == _rootSha256
                         && root.GetProperty("name").GetString() == _fileName;
             if (!same) throw new InvalidDataException("同一根任务的分段元数据冲突");
 
@@ -147,6 +169,9 @@ public sealed class SegmentAssembler
             }
 
             Directory.CreateDirectory(_dir);
+            if (AvailableBytes(_dir) < bytes.LongLength + MinFreeReserveBytes)
+                throw new IOException(
+                    $"存储空间不足（至少需要保留 {MinFreeReserveBytes / 1024 / 1024} MiB）");
             using (var fs = new FileStream(PartialPath, FileMode.OpenOrCreate, FileAccess.Write,
                        FileShare.None, 64 * 1024, FileOptions.WriteThrough))
             {
@@ -169,7 +194,8 @@ public sealed class SegmentAssembler
     public int SegmentCount() { lock (this) return _segmentCount; }
     public bool IsComplete() { lock (this) return _receivedCount == _segmentCount; }
     public bool Matches(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize, string fileName)
+        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        byte[] rootSha256, string fileName)
     {
         string normalizedName = string.IsNullOrWhiteSpace(fileName) ? "received_file" : fileName;
         lock (this)
@@ -177,6 +203,11 @@ public sealed class SegmentAssembler
             return _rootLo == rootLo && _rootHi == rootHi
                    && _segmentCount == segmentCount
                    && _rootOriginalSize == rootOriginalSize
+                   && rootSha256.Length == 32
+                   && string.Equals(
+                       _rootSha256,
+                       Convert.ToHexString(rootSha256).ToLowerInvariant(),
+                       StringComparison.Ordinal)
                    && string.Equals(_fileName, normalizedName, StringComparison.Ordinal);
         }
     }
@@ -196,11 +227,17 @@ public sealed class SegmentAssembler
             if (!IsComplete()) return null;
             if (File.Exists(CompletePath))
             {
-                if (new FileInfo(CompletePath).Length == _rootOriginalSize) return CompletePath;
-                throw new InvalidDataException("completed segment file has the wrong size");
+                if (new FileInfo(CompletePath).Length != _rootOriginalSize ||
+                    !string.Equals(Sha256HexFile(CompletePath), _rootSha256,
+                        StringComparison.Ordinal))
+                    throw new InvalidDataException("整文件 SHA-256 校验失败");
+                return CompletePath;
             }
-            if (!File.Exists(PartialPath) || new FileInfo(PartialPath).Length != _rootOriginalSize)
-                return null;
+            if (!File.Exists(PartialPath)) return CompletePath;
+            if (new FileInfo(PartialPath).Length != _rootOriginalSize) return null;
+            if (!string.Equals(Sha256HexFile(PartialPath), _rootSha256,
+                    StringComparison.Ordinal))
+                throw new InvalidDataException("整文件 SHA-256 校验失败");
             File.Move(PartialPath, CompletePath, overwrite: false);
             return CompletePath;
         }
@@ -230,6 +267,9 @@ public sealed class SegmentAssembler
                 int count = root.GetProperty("count").GetInt32();
                 long size = long.Parse(root.GetProperty("rootSize").GetString()!);
                 if (count is <= 0 or > MaxSegmentCount || size <= 0) continue;
+                string rootSha256 = root.GetProperty("rootSha256").GetString() ?? "";
+                if (rootSha256.Length != 64 || rootSha256.Any(c => !Uri.IsHexDigit(c)))
+                    continue;
                 JsonElement recv = root.GetProperty("received");
                 var receivedIndices = new List<int>();
                 for (int i = 0; i < count && i < recv.GetArrayLength(); i++)
@@ -241,6 +281,7 @@ public sealed class SegmentAssembler
                         ? name.GetString() ?? "received_file"
                         : "received_file",
                     size,
+                    rootSha256,
                     count,
                     receivedIndices.Count,
                     receivedIndices,
@@ -272,6 +313,7 @@ public sealed class SegmentAssembler
             rootHi = _rootHi.ToString(),
             count = _segmentCount,
             rootSize = _rootOriginalSize.ToString(),
+            rootSha256 = _rootSha256,
             name = _fileName,
             updatedAt = _updatedAt,
             received = _received,
@@ -325,6 +367,39 @@ public sealed class SegmentAssembler
         }
         catch
         {
+            return false;
+        }
+    }
+
+    public string RootSha256Hex => _rootSha256;
+
+    private static string Sha256HexFile(string path)
+    {
+        using var sha = SHA256.Create();
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
+    }
+
+    private static long AvailableBytes(string path)
+    {
+        string full = Path.GetFullPath(path);
+        string root = Path.GetPathRoot(full)
+            ?? throw new IOException("cannot resolve storage volume");
+        return new DriveInfo(root).AvailableFreeSpace;
+    }
+
+    private static bool IsLegacyLedger(string bitmapPath)
+    {
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(bitmapPath));
+            return !doc.RootElement.TryGetProperty("rootSha256", out JsonElement hash)
+                   || hash.ValueKind != JsonValueKind.String
+                   || hash.GetString() is not { Length: 64 };
+        }
+        catch
+        {
+            // Preserve unreadable current ledgers for forensic/manual recovery.
             return false;
         }
     }

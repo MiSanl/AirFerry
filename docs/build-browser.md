@@ -92,7 +92,7 @@ npm run build:firefox-mv2   # Firefox MV2
 | `airferry-sender-chrome-mv2-v<VER>.zip` | Chrome/Edge MV2（解压加载回退） |
 | `airferry-sender-firefox-mv3-v<VER>.xpi` | Firefox MV3（zip→xpi） |
 | `airferry-sender-firefox-mv2-v<VER>.xpi` | Firefox MV2（zip→xpi） |
-| `airferry-extension.pem` | Chrome 签名私钥（首次自动生成，git-ignored） |
+| `airferry-extension.pem` | Chrome 固定签名私钥（须预先配置，git-ignored；脚本核对公钥指纹，绝不自动换钥） |
 
 ### Chrome crx 签名机制
 

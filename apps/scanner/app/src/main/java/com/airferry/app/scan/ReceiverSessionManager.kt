@@ -274,6 +274,10 @@ class ReceiverSessionManager {
     fun rawSha256(): ByteArray? =
         if (initialized) NativeBridge.receiverRawSha256(handle) else null
 
+    /** SHA-256 (raw 32 bytes) of the complete root file, or null. */
+    fun rootSha256(): ByteArray? =
+        if (initialized) NativeBridge.receiverRootSha256(handle) else null
+
     /** Recover the assembled file bytes, or null if not complete / on failure. */
     fun assemble(): ByteArray? {
         if (!initialized) return null

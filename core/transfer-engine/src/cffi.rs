@@ -456,6 +456,35 @@ pub unsafe extern "C" fn airferry_receiver_raw_sha256(
     }
 }
 
+/// Copy the 32-byte SHA-256 of the complete uncompressed root file into `out`.
+/// The return/capacity contract matches [`airferry_receiver_raw_sha256`].
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally
+/// serialized; `out[..cap]` must be writable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_root_sha256(
+    handle: *const ReceiverSession,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    match session.segment_meta() {
+        None => 0,
+        Some(seg) => {
+            const N: usize = 32;
+            if out.is_null() || cap < N {
+                return N;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(seg.root_sha256.as_ptr(), out, N) };
+            N
+        }
+    }
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 /// Write `s` as a NUL-terminated byte sequence into `out[..cap]`. If `out` is

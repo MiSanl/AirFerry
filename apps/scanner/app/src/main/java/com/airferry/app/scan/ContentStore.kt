@@ -50,6 +50,16 @@ object ContentStore {
         val deduped: Boolean,
     )
 
+    data class PutBytesRequest(
+        val displayName: String,
+        val bytes: ByteArray,
+        val crcHex: String = "unknown",
+        val crcUnknown: Boolean = true,
+        val kind: String = "file",
+        val bundleId: String? = null,
+        val bundleTitle: String? = null,
+    )
+
     fun root(ctx: Context): File {
         val base = ctx.getExternalFilesDir(null) ?: ctx.filesDir
         return File(base, DIR_NAME).also { if (!it.exists()) it.mkdirs() }
@@ -95,41 +105,58 @@ object ContentStore {
         bundleId: String? = null,
         bundleTitle: String? = null,
     ): PutResult {
+        return putBytesBatch(
+            ctx,
+            listOf(
+                PutBytesRequest(
+                    displayName, bytes, crcHex, crcUnknown, kind, bundleId, bundleTitle,
+                )
+            ),
+        ).single()
+    }
+
+    /** Archive a bundle with one index read/write instead of O(n²) rewrites. */
+    @Synchronized
+    fun putBytesBatch(ctx: Context, requests: List<PutBytesRequest>): List<PutResult> {
+        if (requests.isEmpty()) return emptyList()
         // Read and validate the index before touching blob storage. A corrupt
-        // index must never be interpreted as an empty history and overwritten
-        // by the next received file.
+        // index must never be interpreted as an empty history and overwritten.
         val all = loadIndex(ctx).toMutableList()
-        val hash = sha256Hex(bytes)
-        val blob = blobPath(ctx, hash)
-        val deduped = blob.exists() && blob.length() == bytes.size.toLong() &&
-            try { sha256Hex(blob) == hash } catch (_: Exception) { false }
-        if (!deduped) {
-            blob.parentFile?.mkdirs()
-            writeBytesAtomic(blob, bytes)
+        val results = ArrayList<PutResult>(requests.size)
+        val createdAt = System.currentTimeMillis()
+        for (request in requests) {
+            val hash = sha256Hex(request.bytes)
+            val blob = blobPath(ctx, hash)
+            val deduped = blob.exists() && blob.length() == request.bytes.size.toLong() &&
+                try { sha256Hex(blob) == hash } catch (_: Exception) { false }
+            if (!deduped) {
+                blob.parentFile?.mkdirs()
+                writeBytesAtomic(blob, request.bytes)
+            }
+            val entry = Entry(
+                id = UUID.randomUUID().toString(),
+                name = FileNameUtil.sanitize(request.displayName).ifBlank { "received_file" },
+                hash = hash,
+                size = request.bytes.size.toLong(),
+                crcHex = request.crcHex,
+                crcUnknown = request.crcUnknown,
+                kind = request.kind,
+                createdAt = createdAt,
+                bundleId = request.bundleId,
+                bundleTitle = request.bundleTitle,
+            )
+            all.add(entry)
+            results.add(PutResult(entry, blob, deduped))
         }
-        val entry = Entry(
-            id = UUID.randomUUID().toString(),
-            name = FileNameUtil.sanitize(displayName).ifBlank { "received_file" },
-            hash = hash,
-            size = bytes.size.toLong(),
-            crcHex = crcHex,
-            crcUnknown = crcUnknown,
-            kind = kind,
-            createdAt = System.currentTimeMillis(),
-            bundleId = bundleId,
-            bundleTitle = bundleTitle,
-        )
-        all.add(entry)
         saveIndex(ctx, all)
-        return PutResult(entry, blob, deduped)
+        return results
     }
 
     /**
      * Archive an existing file (e.g. a fully-assembled large-transfer) into the
-     * content-addressed store by streaming its hash and atomically copying it
-     * into the blob tree — no full-file in-memory copy. The source is deleted
-     * only after the history index is durably published, so a crash/index error
-     * cannot destroy the only recoverable assembled copy.
+     * content-addressed store by streaming its hash and atomically moving it
+     * into the blob tree — no full-file in-memory or on-disk copy. If index
+     * publication fails, the task ledger retries against the verified blob.
      */
     @Synchronized
     fun putFile(
@@ -141,22 +168,48 @@ object ContentStore {
         kind: String = "file",
         bundleId: String? = null,
         bundleTitle: String? = null,
+        expectedSha256Hex: String? = null,
+        expectedSize: Long? = null,
+        stableEntryId: String? = null,
     ): PutResult {
         val all = loadIndex(ctx).toMutableList()
-        val hash = sha256Hex(file)
+        val expectedHash = expectedSha256Hex?.lowercase()
+        if (expectedHash != null) {
+            require(expectedHash.length == 64 && expectedHash.all { it in '0'..'9' || it in 'a'..'f' }) {
+                "invalid expected SHA-256 hash"
+            }
+        }
+        val sourceExists = file.isFile
+        val sourceLength = if (sourceExists) file.length() else expectedSize
+            ?: throw java.io.FileNotFoundException(file.absolutePath)
+        require(expectedSize == null || sourceLength == expectedSize) {
+            "assembled file length differs from descriptor"
+        }
+        val hash = if (sourceExists) sha256Hex(file) else requireNotNull(expectedHash)
+        require(expectedHash == null || hash == expectedHash) {
+            "assembled file SHA-256 differs from descriptor"
+        }
         val blob = blobPath(ctx, hash)
-        val sourceLength = file.length()
         val deduped = blob.exists() && blob.length() == sourceLength &&
             try { sha256Hex(blob) == hash } catch (_: Exception) { false }
         if (!deduped) {
+            require(sourceExists) { "assembled source and verified content blob are both missing" }
             blob.parentFile?.mkdirs()
-            copyFileAtomic(file, blob)
+            moveFileAtomic(file, blob)
             if (!blob.isFile || blob.length() != sourceLength) {
                 throw java.io.IOException("content blob length changed during publish")
             }
         }
+        val existing = stableEntryId?.let { id -> all.firstOrNull { it.id == id } }
+        if (existing != null) {
+            require(existing.hash == hash && existing.size == sourceLength) {
+                "stable content entry id conflicts with existing history"
+            }
+            if (file.canonicalPath != blob.canonicalPath) file.delete()
+            return PutResult(existing, blob, true)
+        }
         val entry = Entry(
-            id = UUID.randomUUID().toString(),
+            id = stableEntryId ?: UUID.randomUUID().toString(),
             name = FileNameUtil.sanitize(displayName).ifBlank { "received_file" },
             hash = hash,
             size = blob.length(),
@@ -367,33 +420,22 @@ object ContentStore {
         }
     }
 
-    /** Stream-copy [source] to [target] through a same-directory atomic temp. */
-    private fun copyFileAtomic(source: File, target: File) {
+    /** Move an assembled task into content storage without a second full copy. */
+    private fun moveFileAtomic(source: File, target: File) {
         target.parentFile?.mkdirs()
-        val temp = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}.tmp")
         try {
-            FileOutputStream(temp).use { out ->
-                source.inputStream().use { it.copyTo(out) }
-                out.fd.sync()
-            }
-            try {
-                java.nio.file.Files.move(
-                    temp.toPath(),
-                    target.toPath(),
-                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                )
-            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-                // Same-filesystem replacement remains a single move on Android
-                // filesystems even when the provider cannot promise ATOMIC_MOVE.
-                java.nio.file.Files.move(
-                    temp.toPath(),
-                    target.toPath(),
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                )
-            }
-        } finally {
-            if (temp.exists()) temp.delete()
+            java.nio.file.Files.move(
+                source.toPath(),
+                target.toPath(),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+            java.nio.file.Files.move(
+                source.toPath(),
+                target.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
         }
     }
 }

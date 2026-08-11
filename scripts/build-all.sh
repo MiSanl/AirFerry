@@ -22,7 +22,7 @@ set -euo pipefail
 #   airferry-sender-firefox-mv3-v<VER>.xpi      Firefox MV3（zip→xpi）
 #   airferry-sender-firefox-mv2-v<VER>.xpi
 #   airferry-sender-web-v<VER>.zip              网页发送端静态站点
-#   airferry-extension.pem                      Chrome 签名私钥（首次自动生成）
+#   airferry-extension.pem                      Chrome 签名私钥（须预先配置）
 #
 # 版本号取自 apps/sender/package.json，与扩展 manifest 一致。
 # ====================================================================
@@ -47,6 +47,8 @@ VER="$(read_version)"
 
 # Chrome 二进制路径（macOS 标准安装位置）。找不到时跳过 crx 签名，仅留 zip。
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+EXPECTED_ANDROID_CERT_SHA256="44577EDA2C6D4F44638C9D61DC161F08FDB30FCEE6A3410AADAEB7CE65A97FDD"
+EXPECTED_CHROME_PUBLIC_KEY_SHA256="b6059f0bf2184bbdb153013b15eee99cf8176fd653e46fcda4123868a05e2986"
 
 verify_apk_signature() {
   local apk="$1"
@@ -84,9 +86,8 @@ verify_apk_signature() {
   local actual_sha
   actual_sha="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<<"$cert_info" | head -1 | tr '[:lower:]' '[:upper:]')"
   [[ -n "$actual_sha" ]] || error "无法读取 APK 签名证书指纹"
-  if [[ -n "${AIRFERRY_ANDROID_CERT_SHA256:-}" ]] && \
-     [[ "$actual_sha" != "${AIRFERRY_ANDROID_CERT_SHA256^^}" ]]; then
-    error "APK 签名证书与 AIRFERRY_ANDROID_CERT_SHA256 不一致"
+  if [[ "$actual_sha" != "$EXPECTED_ANDROID_CERT_SHA256" ]]; then
+    error "APK 签名证书不是 AirFerry 固定发布证书（实际: $actual_sha）"
   fi
   info "APK 签名已验证 (SHA-256: $actual_sha)"
 }
@@ -217,9 +218,8 @@ build_web() {
 
 # 打包 Chrome MV2/MV3 为已签名 .crx。
 #
-# Chrome --pack-extension 在「未给 --pack-extension-key」时会新生成一个
-# <dir>.pem 私钥；首次运行我们把它挪到 dist/airferry-extension.pem，之后
-# MV2/MV3 复用同一私钥 → 扩展 ID 稳定，便于升级替换。
+# Chrome 发布必须复用固定私钥，并核对其公钥指纹。缺失或换钥直接失败，
+# 防止无意生成新的扩展 ID、让已安装用户无法原位升级。
 pack_chrome_crx() {
   local prod_dir="$1"   # 如 chrome-mv3-prod
   local plat="${prod_dir%-prod}"   # chrome-mv3
@@ -230,23 +230,17 @@ pack_chrome_crx() {
     return 0
   fi
 
-  if [[ -f "$key" ]]; then
-    # 复用已有私钥，保证扩展 ID 与历史一致。
-    "$CHROME_BIN" --pack-extension="$ROOT/apps/sender/build/$prod_dir" \
-                  --pack-extension-key="$key" >/dev/null 2>&1 || {
-      warn "${plat} 的 .crx 打包失败，仅保留 .zip"
-      return 0
-    }
-  else
-    # 首次：让 Chrome 生成私钥，再挪到固定位置。
-    "$CHROME_BIN" --pack-extension="$ROOT/apps/sender/build/$prod_dir" >/dev/null 2>&1 || {
-      warn "${plat} 的 .crx 打包失败，仅保留 .zip"
-      return 0
-    }
-    mv "$ROOT/apps/sender/build/${prod_dir}.pem" "$key" 2>/dev/null || true
-    [[ ! -f "$key" ]] || chmod 600 "$key"
-    info "已生成 Chrome 签名私钥 → dist/airferry-extension.pem（请妥善保管）"
-  fi
+  [[ -f "$key" ]] || error "缺少固定 Chrome 签名私钥: $key（拒绝生成新扩展 ID）"
+  command -v openssl >/dev/null 2>&1 || error "找不到 openssl，无法核对 Chrome 公钥指纹"
+  local actual_key_sha
+  actual_key_sha="$(openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+  [[ "$actual_key_sha" == "$EXPECTED_CHROME_PUBLIC_KEY_SHA256" ]] || \
+    error "Chrome 签名密钥不是 AirFerry 固定发布密钥（实际公钥 SHA-256: $actual_key_sha）"
+  "$CHROME_BIN" --pack-extension="$ROOT/apps/sender/build/$prod_dir" \
+                --pack-extension-key="$key" >/dev/null 2>&1 || {
+    warn "${plat} 的 .crx 打包失败，仅保留 .zip"
+    return 0
+  }
 
   # Chrome 把 .crx 产物写到 build/<prod_dir>.crx，搬到 dist 并按规范命名。
   mv "$ROOT/apps/sender/build/${prod_dir}.crx" \

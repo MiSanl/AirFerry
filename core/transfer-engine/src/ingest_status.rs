@@ -16,7 +16,7 @@
 //! - bit  1      : `accepted` (1 if this frame contributed a new symbol)
 //! - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF, clamped)
 //! - bits 32..63 : `received_symbols` (low 32 bits; real transfers stay well
-//!                 below 2^32)
+//!   below 2^32)
 //!
 //! `received_symbols == u32::MAX` (i.e. bits 32..63 all set, flags clear) is
 //! reserved as the [`INGEST_ERROR`] sentinel — a real transfer never reaches it.
@@ -48,7 +48,7 @@ pub fn pack(complete: bool, accepted: bool, mismatch_streak: u32, received_symbo
     let streak_mask: u64 = (1u64 << STREAK_WIDTH) - 1;
     bits |= ((mismatch_streak as u64) & streak_mask) << STREAK_OFFSET;
     // Clamp received_symbols into 32 bits (a real transfer stays well below).
-    let recv32 = (received_symbols & 0xFFFF_FFFF) as u64;
+    let recv32 = u64::from(received_symbols);
     bits |= recv32 << RECEIVED_OFFSET;
     bits
 }

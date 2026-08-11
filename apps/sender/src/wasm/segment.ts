@@ -124,6 +124,7 @@ export async function sliceSegment(file: File, segmentIndex: number): Promise<Ui
  */
 export async function buildSegmentMeta(
   rootSessionId: { lo: bigint; hi: bigint },
+  rootSha256: Uint8Array,
   segmentIndex: number,
   segmentCount: number,
   rootOriginalSize: number,
@@ -138,6 +139,7 @@ export async function buildSegmentMeta(
     segmentCount,
     originalOffset: segmentOffset(segmentIndex),
     rootOriginalSize,
+    rootSha256,
     rawSha256: sha
   }
 }
@@ -157,6 +159,8 @@ export interface SegmentMetaWasm {
   segmentCount: number
   originalOffset: number
   rootOriginalSize: number
+  /** SHA-256 of the complete uncompressed root file (32 bytes). */
+  rootSha256: Uint8Array
   /** SHA-256 of this segment's uncompressed bytes (32 bytes). */
   rawSha256: Uint8Array
 }

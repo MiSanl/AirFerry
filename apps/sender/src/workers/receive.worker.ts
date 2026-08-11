@@ -80,8 +80,20 @@ let activeJobId = 0
 let ready = false
 let lastMetaSent = false
 
-function post(msg: unknown): void {
-  ;(postMessage as (m: unknown) => void)(msg)
+function post(msg: unknown, transfer: Transferable[] = []): void {
+  ;(postMessage as (m: unknown, transfer?: Transferable[]) => void)(msg, transfer)
+}
+
+function recoveredTransferables(recovered: Recovered): Transferable[] {
+  const buffers = new Set<ArrayBuffer>()
+  const add = (bytes: Uint8Array) => {
+    if (bytes.buffer instanceof ArrayBuffer) buffers.add(bytes.buffer)
+  }
+  if (recovered.kind === "file") add(recovered.data)
+  if (recovered.kind === "bundle") {
+    for (const entry of recovered.entries) add(entry.data)
+  }
+  return [...buffers]
 }
 
 /** Drop the current session (if any); called on a new job / reset. */
@@ -328,8 +340,9 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
 
   // Descriptor v4 requires a SHA-256 over the uncompressed segment bytes.
   const expectedSha = session.raw_sha256()
-  if (expectedSha.length !== 32) {
-    throw new Error("分段描述符缺少有效的 SHA-256")
+  const expectedRootSha = session.root_sha256()
+  if (expectedSha.length !== 32 || expectedRootSha.length !== 32) {
+    throw new Error("分段描述符缺少有效的分段或整文件 SHA-256")
   }
   const actualSha = new Uint8Array(
     await crypto.subtle.digest(
@@ -366,6 +379,10 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
   }
 
   const sha256Hex = Array.from(actualSha, (b) => b.toString(16).padStart(2, "0")).join("")
+  const rootSha256Hex = Array.from(
+    expectedRootSha,
+    (b) => b.toString(16).padStart(2, "0")
+  ).join("")
   const { task } = await storeVerifiedSegment({
     rootLo: seg.rootLo,
     rootHi: seg.rootHi,
@@ -374,6 +391,7 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
     segmentCount: seg.count,
     index: seg.index,
     sha256Hex,
+    rootSha256Hex,
     bytes: verify.bytes,
   })
   post({
@@ -465,13 +483,15 @@ async function onMessage(e: MessageEvent): Promise<void> {
         return
       }
       const { verify, recovered } = await assembleAndRecover(activeJobId)
+      const transfer = recoveredTransferables(recovered)
+      dropSession()
       post({
         type: "result",
         recovered,
         crcOk: verify.crcOk,
         crcKnown: verify.crcKnown,
         jobId: activeJobId,
-      })
+      }, transfer)
     } catch (err) {
       post({
         type: segmented ? "segment-error" : "error",
@@ -481,7 +501,7 @@ async function onMessage(e: MessageEvent): Promise<void> {
             : String(err),
         jobId: activeJobId,
       })
-      if (segmented) dropSession()
+      dropSession()
     }
     return
   }

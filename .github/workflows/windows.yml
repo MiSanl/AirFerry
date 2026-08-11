@@ -13,6 +13,11 @@ on:
       - 'apps/windows/**'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to build (for example v1.2.0)'
+        required: true
+        type: string
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -28,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -59,6 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
 
       - name: Setup .NET 8 SDK
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
@@ -83,6 +92,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -149,8 +160,8 @@ jobs:
   # ④ Compress publish/ → airferry-receiver-windows-x64-v${VER}.zip
   # ⑤ gh release upload 到 v${VER}（tag 已存在，--clobber 覆盖同名 asset）
   # 只在 workflow_dispatch + 打包后手动触发上传（避免每次 push 都发 release）。
-  # 版本号与 apps/sender/package.json、build.gradle.kts、Cargo.toml、csproj 四处
-  # 手动保持同步（AGENTS.md §2.7 关键依赖顺序第 5 条）。发版时改这一处即可。
+  # 版本号从手动输入的现有 release_tag 派生，并与 checkout commit 及
+  # sender package/manifest 核对；workflow 内不保存另一份版本副本。
   windows-pack:
     name: Windows receiver publish + upload to release
     needs: [rust-cffi, csharp-tests, windows-build]
@@ -160,12 +171,30 @@ jobs:
     permissions:
       contents: write   # gh release upload 需要
     env:
-      # Keep in sync with apps/sender/package.json, build.gradle.kts,
-      # Cargo.toml workspace version, AirFerry.Windows.csproj <Version>
-      # (AGENTS.md §2.8 版本号同步 + Windows 发版).
-      VER: '1.1.6'
+      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Verify release tag, commit and version identity
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Invalid release tag: $env:RELEASE_TAG"
+          }
+          $ver = $env:RELEASE_TAG.Substring(1)
+          $package = Get-Content apps/sender/package.json -Raw | ConvertFrom-Json
+          if ($package.version -ne $ver -or $package.manifest.version -ne $ver) {
+            throw "Tag version $ver does not match sender package/manifest"
+          }
+          $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $headCommit = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $headCommit) {
+            throw "Checked-out commit $headCommit does not match tag $env:RELEASE_TAG ($tagCommit)"
+          }
+          "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -274,13 +303,9 @@ jobs:
         run: |
           $ZipName = "airferry-receiver-windows-x64-v${env:VER}.zip"
           $Tag = "v${env:VER}"
-          # Prefer an existing release tag (created when packaging sender/APK).
-          # If missing, create a draft release so upload still works when Windows
-          # is packed first via workflow_dispatch.
-          $exists = gh release view $Tag 2>$null
+          gh release view $Tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "Release $Tag not found — creating draft"
-            gh release create $Tag --draft --title $Tag --notes "Windows build from CI (workflow_dispatch)"
+            throw "Release $Tag does not exist; refusing to upload to an implicit tag"
           }
           # --clobber：覆盖同名 asset（覆盖式发布）。asset 不设 label（见 AGENTS.md §2.8）。
           gh release upload $Tag "$ZipName" --clobber

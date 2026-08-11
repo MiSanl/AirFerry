@@ -18,6 +18,7 @@ import "@/assets/app.css"
 import "@/assets/receive.css"
 import iconUrl from "../../assets/icon128.png"
 import type { Recovered } from "@/receive/parse"
+import { ensureWasm, Sha256Wasm } from "@/wasm/loader"
 import {
   deleteStoredTask,
   listStoredTasks,
@@ -113,6 +114,11 @@ interface SaveFileHandleLike {
 }
 
 const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
+const FALLBACK_BLOB_MAX_BYTES = 64 * 1024 * 1024
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+}
 
 async function readVerifiedStoredSegment(
   task: StoredSegmentTask,
@@ -151,6 +157,10 @@ async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
   ) {
     throw new Error("任务尚未完整恢复")
   }
+  if (!/^[0-9a-f]{64}$/.test(task.rootSha256)) {
+    throw new Error("任务缺少整文件 SHA-256，不能安全导出")
+  }
+  await ensureWasm()
   const picker = (window as unknown as {
     showSaveFilePicker?: (options: {
       suggestedName: string
@@ -162,38 +172,65 @@ async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
       suggestedName: task.fileName || "received_file",
     })
     const writable = await handle.createWritable()
+    const rootHasher = new Sha256Wasm()
     try {
       let written = 0
       for (let i = 0; i < task.segmentCount; i++) {
         if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
         const bytes = await readVerifiedStoredSegment(task, i)
+        rootHasher.update(bytes)
         await writable.write(bytes)
         written += bytes.byteLength
       }
       if (written !== task.rootOriginalSize) {
         throw new Error(`已写入大小 ${written} 与原文件 ${task.rootOriginalSize} 不一致`)
       }
+      if (bytesToHex(rootHasher.digest()) !== task.rootSha256) {
+        throw new Error("整文件 SHA-256 校验失败，已取消导出")
+      }
       await writable.close()
     } catch (e) {
       await writable.abort?.().catch(() => undefined)
       throw e
+    } finally {
+      rootHasher.free()
     }
     return
   }
 
   // Compatibility fallback for browsers without File System Access. It still
-  // avoids a second merged Uint8Array, although Blob parts remain in memory
-  // until the download starts.
+  // avoids a second merged Uint8Array. Bound the fallback because Blob parts
+  // remain resident until the download starts; large tasks require a browser
+  // with showSaveFilePicker so export remains streaming and memory-bounded.
+  if (task.rootOriginalSize > FALLBACK_BLOB_MAX_BYTES) {
+    throw new Error(
+      `当前浏览器不支持流式保存；${formatSize(task.rootOriginalSize)} 文件请使用 Chrome/Edge 桌面版导出`
+    )
+  }
   const parts: BlobPart[] = []
   let total = 0
-  for (let i = 0; i < task.segmentCount; i++) {
-    if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
-    const bytes = await readVerifiedStoredSegment(task, i)
-    total += bytes.byteLength
-    parts.push(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
-  }
-  if (total !== task.rootOriginalSize) {
-    throw new Error(`已恢复大小 ${total} 与原文件 ${task.rootOriginalSize} 不一致`)
+  const rootHasher = new Sha256Wasm()
+  try {
+    for (let i = 0; i < task.segmentCount; i++) {
+      if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
+      const bytes = await readVerifiedStoredSegment(task, i)
+      rootHasher.update(bytes)
+      total += bytes.byteLength
+      parts.push(
+        bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength
+        ) as ArrayBuffer
+      )
+    }
+    if (total !== task.rootOriginalSize) {
+      throw new Error(`已恢复大小 ${total} 与原文件 ${task.rootOriginalSize} 不一致`)
+    }
+    if (bytesToHex(rootHasher.digest()) !== task.rootSha256) {
+      throw new Error("整文件 SHA-256 校验失败，已取消导出")
+    }
+  } finally {
+    rootHasher.free()
   }
   const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }))
   const anchor = document.createElement("a")

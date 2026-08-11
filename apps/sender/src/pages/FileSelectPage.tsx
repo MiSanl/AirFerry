@@ -472,19 +472,18 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
   /** Total original bytes of the selected items (pre-compression). */
   const selectedBytes = totalSize(items)
   /**
-   * Send gate: warn (not block) when the selection's original size exceeds the
-   * receiver's post-decompression budget (256 MiB). A selection under this can
-   * be recovered as long as its *compressed* size stays under the wire ceiling
-   * (32 MiB); the receiver's original-size limit is what we can check here.
-   * On confirm we proceed with the normal send.
+   * A single real file can use descriptor-v4 segmentation and therefore has no
+   * 256 MiB root-size ceiling. Text and multi-file bundles are still one
+   * RaptorQ object, so their post-decompression cap is a hard gate.
    */
   const handleSendClick = useCallback(() => {
-    if (selectedBytes > MAX_ORIGINAL_BYTES) {
+    const isSegmentableSingleFile = items.length === 1 && items[0].kind === "file"
+    if (selectedBytes > MAX_ORIGINAL_BYTES && !isSegmentableSingleFile) {
       setOversizeConfirm(true)
       return
     }
     onSend()
-  }, [selectedBytes, onSend])
+  }, [items, selectedBytes, onSend])
 
   return (
     <div className="page">
@@ -634,10 +633,6 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
           totalMiB={selectedBytes / (1024 * 1024)}
           limitMiB={MAX_ORIGINAL_MIB}
           onCancel={() => setOversizeConfirm(false)}
-          onConfirm={() => {
-            setOversizeConfirm(false)
-            onSend()
-          }}
         />
       )}
     </div>
@@ -749,12 +744,10 @@ function OversizeConfirmModal({
   totalMiB,
   limitMiB,
   onCancel,
-  onConfirm,
 }: {
   totalMiB: number
   limitMiB: number
   onCancel: () => void
-  onConfirm: () => void
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -780,16 +773,13 @@ function OversizeConfirmModal({
           <strong> {limitMiB} MiB</strong> 的原始内容接收上限。
         </p>
         <p className="hint" style={{ marginTop: 8 }}>
-          接收端（Android / Windows / 网页）为防内存耗尽设有此硬性上限，超限传输
-          <strong> 无法被完整接收</strong>；即使原始内容可压缩到 32 MiB 以下，也因
-          原始大小超过该上限而无法还原。仍要继续发送吗？
+          多文件包和文字会作为单个内存对象处理，接收端（Android / Windows / 网页）
+          为防内存耗尽设有此硬性上限，因此本次选择不能发送。大于该上限的内容请改为
+          单独选择一个文件，系统会自动使用分段传输。
         </p>
         <div className="modal-actions-row">
-          <button type="button" className="btn secondary" onClick={onCancel}>
-            取消
-          </button>
-          <button type="button" className="btn primary" onClick={onConfirm}>
-            仍要发送
+          <button type="button" className="btn primary" onClick={onCancel}>
+            知道了
           </button>
         </div>
       </div>

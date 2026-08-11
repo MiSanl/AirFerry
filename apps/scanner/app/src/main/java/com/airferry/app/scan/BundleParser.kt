@@ -26,6 +26,8 @@ import java.nio.ByteOrder
  */
 object BundleParser {
 
+    private const val MAX_BUNDLE_FILES = 4096
+
     private val MAGIC = byteArrayOf(
         'E'.code.toByte(), 'T'.code.toByte(), 'B'.code.toByte(), 'U'.code.toByte(),
         'N'.code.toByte(), 'D'.code.toByte(), 'L'.code.toByte(), '1'.code.toByte()
@@ -62,7 +64,7 @@ object BundleParser {
         val version = buf.short.toInt() and 0xFFFF
         if (version != 1) return null
         val count = buf.short.toInt() and 0xFFFF
-        if (count == 0) return null
+        if (count == 0 || count > MAX_BUNDLE_FILES) return null
 
         val files = ArrayList<BundleFile>(count)
         for (i in 0 until count) {

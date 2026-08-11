@@ -7,7 +7,7 @@
  */
 
 import { isTextPayload, TEXT_MAGIC } from "@/wasm/text"
-import { isBundle, BUNDLE_MAGIC } from "@/wasm/bundle"
+import { isBundle, BUNDLE_MAGIC, MAX_BUNDLE_FILES } from "@/wasm/bundle"
 
 export type RecoveredKind = "text" | "bundle" | "file"
 
@@ -56,23 +56,14 @@ function readU64BE(bytes: Uint8Array, offset: number): number {
  * is false so the caller can offer "save as file" instead of rendering.
  */
 function decodeUtf8Strict(bytes: Uint8Array): { text: string; valid: boolean } {
-  const decoder = new TextDecoder("utf-8", { fatal: false })
-  const text = decoder.decode(bytes)
-  // Re-encode round-trip check: valid iff every byte is consumed and the
-  // decoder didn't emit U+FFFD. TextDecoder with fatal:false emits U+FFFD on
-  // errors; detecting it distinguishes "valid UTF-8" from "lossy fallback".
-  const reencoded = new TextEncoder().encode(text)
-  let valid = reencoded.length === bytes.length
-  if (valid) {
-    for (let i = 0; i < bytes.length; i++) {
-      if (reencoded[i] !== bytes[i]) {
-        valid = false
-        break
-      }
-    }
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), valid: true }
+  } catch {
+    return { text: new TextDecoder("utf-8").decode(bytes), valid: false }
   }
-  return { text, valid }
 }
+
+const MAX_TEXT_UI_BYTES = 8 * 1024 * 1024
 
 /**
  * Parse a recovered, decompressed payload into a text / bundle / file result.
@@ -87,6 +78,9 @@ export function parseRecovered(
   // Text magic takes priority (a single text message).
   if (isTextPayload(bytes)) {
     const body = bytes.subarray(TEXT_MAGIC.length)
+    if (body.byteLength > MAX_TEXT_UI_BYTES) {
+      return { kind: "file", name: descriptorName || "文字消息.txt", data: body }
+    }
     const { text, valid } = decodeUtf8Strict(body)
     return { kind: "text", text, validUtf8: valid }
   }
@@ -115,6 +109,9 @@ export function parseBundle(bytes: Uint8Array): RecoveredBundle {
   }
   const count = readU16BE(bytes, o)
   o += 2
+  if (count <= 0 || count > MAX_BUNDLE_FILES) {
+    throw new ParseError(`bundle 文件数 ${count} 超出上限 ${MAX_BUNDLE_FILES}`)
+  }
   const entries: RecoveredFile[] = []
   for (let i = 0; i < count; i++) {
     if (o + 2 > bytes.length) {
@@ -136,8 +133,9 @@ export function parseBundle(bytes: Uint8Array): RecoveredBundle {
         `bundle 条目 ${i}（${name}）内容越界: 需要 ${size} 字节，剩 ${bytes.length - o}`
       )
     }
-    // Copy out so the entry doesn't pin the whole bundle buffer.
-    const data = bytes.slice(o, o + size)
+    // Keep views into one buffer; the receive worker transfers that buffer to
+    // the UI once instead of cloning the entire bundle plus every member.
+    const data = bytes.subarray(o, o + size)
     o += size
     entries.push({ kind: "file", name, data })
   }

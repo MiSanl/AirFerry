@@ -35,7 +35,7 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 
 ### 大文件根任务与子会话
 
-大文件的 `root_session_id` 仍按上式从完整文件身份派生（指纹只读取头/尾各 1 KiB，不把整文件读入内存）。每个 8 MiB 分段使用独立、确定性的 child session id：
+大文件的 `root_session_id` 仍按上式从完整文件身份派生，但指纹改为完整文件的 SHA-256；发送 worker 用 4 MiB `File.slice()` 增量哈希，不把整文件读入内存。每个 8 MiB 分段使用独立、确定性的 child session id：
 
 ```
 child_session_id = FNV1a_128(
@@ -138,9 +138,10 @@ child_session_id = FNV1a_128(
 | R+20 | 4 | segment_count | u32 BE，1..=131072 |
 | R+24 | 8 | original_offset | u64 BE，必须为 `index × 8 MiB` |
 | R+32 | 8 | root_original_size | u64 BE |
-| R+40 | 32 | raw_sha256 | 当前段解压后原始字节的 SHA-256 |
+| R+40 | 32 | root_sha256 | 完整根文件原始字节的 SHA-256；每段必须一致 |
+| R+72 | 32 | raw_sha256 | 当前段解压后原始字节的 SHA-256 |
 
-非分段对象仍写 version 3；分段对象必须写 version 4 且携带完整 72 字节尾段。接收端在分配或定位写入前同时验证 child id、根大小推导出的精确段数、索引、规范偏移、当前段精确长度及 SHA-256。
+非分段对象仍写 version 3；分段对象必须写 version 4 且携带完整 104 字节尾段。接收端在分配或定位写入前同时验证 child id、根大小推导出的精确段数、索引、规范偏移、当前段精确长度、逐段 SHA-256 与跨段不变的根 SHA-256；全部段齐后发布前再流式计算根摘要，防止混合两个文件修订版中“各自合法”的分段。
 
 ### v2/v3 消歧规则（关键，易踩坑）
 
@@ -381,13 +382,13 @@ offset  size   field
 
 | 源 | 当前 |
 |----|------|
-| `Cargo.toml` `[workspace.package] version` | `1.1.6` |
-| `apps/sender/package.json` `version` + `manifest.version` | `1.1.6` |
-| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.1.6` / `11` |
-| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.1.6` |
-| `.github/workflows/windows.yml` `env.VER`（Windows 发版 zip 名 + release tag） | `1.1.6` |
+| `Cargo.toml` `[workspace.package] version` | `1.2.0` |
+| `apps/sender/package.json` `version` + `manifest.version` | `1.2.0` |
+| `apps/web/package.json` `version` | `1.2.0` |
+| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.2.0` / `12` |
+| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.2.0` |
 
-`scripts/build-all.sh` 的 release 打包文件名版本号由 `read_version()` 从 `apps/sender/package.json` 动态读取，与 `manifest.version` 同源，**无需在脚本里手改**。Windows 发版 zip 名由 workflow 的 `VER` 控制，**须与上表同步**。
+`scripts/build-all.sh` 的 release 打包文件名版本号由 `read_version()` 从 `apps/sender/package.json` 动态读取，与 `manifest.version` 同源，**无需在脚本里手改**。Windows 发版必须给 workflow 的 `release_tag` 输入一个已存在 tag；workflow 从该 tag 检出、核对 tag commit 与 package/manifest 版本后再派生 `VER`，不再维护可漂移的硬编码版本。
 
 ---
 
@@ -401,7 +402,7 @@ offset  size   field
 | `FLAG_DESCRIPTOR` | `0x01` | `frame.rs:22` |
 | 描述符 magic | `0xD5` | `descriptor.rs:95` |
 | 描述符版本 | 普通对象 `3` / 分段对象 `4` | `descriptor.rs` `DESC_V3_VERSION` / `DESC_VERSION` |
-| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 72（v4） | `descriptor.rs` |
+| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 104（v4） | `descriptor.rs` |
 | SEGMENT_RAW_BYTES / MAX_SEGMENT_COUNT | 8 MiB / 131072 | `transfer-engine/src/segment.rs` |
 | 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:27-29` |
 | Zstd level（浏览器） | `1` | `compress.ts:56` |
