@@ -162,21 +162,22 @@ impl SenderSession {
             source_cursor: 0,
             repair_cursor: 0,
             frame_index: 0,
-            // Descriptor every ~16 frames (~0.5s at 30fps). Each descriptor is a
-            // full frame that carries no source data, so it is pure overhead:
-            // the old value of 5 wasted ~20% of the channel on metadata at
-            // exactly the time (high frame loss) when every data frame counts.
-            // A receiver needs just *one* descriptor to join, and the fountain
-            // stream loops forever, so 0.5s is still a fast rejoin cadence
-            // while reclaiming ~15% of the wire for real symbols.
-            descriptor_interval: 16,
+            // Descriptor every ~17 frames (~0.6s at 30fps). 17 is deliberately
+            // coprime with the UI's 2/4-code layouts: descriptors rotate through
+            // every physical QR slot instead of always landing in slot 0 (the
+            // old interval 16 did exactly that). A camera that persistently
+            // misses one screen corner can therefore confirm metadata from a
+            // different slot instead of caching data forever at "同步中".
+            // Overhead remains ~6%, versus ~20% with the old interval of 5.
+            descriptor_interval: 17,
             started: false,
             start_ms: 0, // Set on first next_frame() call
             stats: Stats::default(),
         })
     }
 
-    /// How often (in frames) a descriptor frame is emitted. Default 16.
+    /// How often (in frames) a descriptor frame is emitted. Default 17 so the
+    /// descriptor rotates across 2/4-code screen slots.
     pub fn set_descriptor_interval(&mut self, interval: u32) {
         self.descriptor_interval = interval.max(1);
     }
@@ -624,13 +625,41 @@ mod tests {
         )
         .unwrap();
         // <=20% of the wire for descriptors means interval >= 5; we default to
-        // 16 (~6%), so this guards against accidentally dropping it back to the
+        // 17 (~6%), so this guards against accidentally dropping it back to the
         // old wasteful 5.
         assert!(
             s.descriptor_interval >= 16,
             "descriptor interval too low: {}",
             s.descriptor_interval
         );
+    }
+
+    /// Consecutive frames are laid out into fixed physical slots in multi-QR
+    /// mode. The default descriptor cadence must visit every 2/4-code slot;
+    /// otherwise a camera that consistently misses one corner never sees OTI.
+    #[test]
+    fn default_descriptor_rotates_across_multi_qr_slots() {
+        let data = payload(50_000);
+        for slots in [2usize, 4usize] {
+            let mut sender = SenderSession::new(
+                &data,
+                SessionId::zero(),
+                SenderConfig::default(),
+                test_file_meta(),
+            )
+            .unwrap();
+            let mut seen = vec![false; slots];
+            for frame_index in 0..(sender.descriptor_interval as usize * slots) {
+                let frame = sender.next_frame().unwrap();
+                if frame.header.flags & qr_protocol::frame::FLAG_DESCRIPTOR != 0 {
+                    seen[frame_index % slots] = true;
+                }
+            }
+            assert!(
+                seen.iter().all(|&slot| slot),
+                "descriptor did not visit every {slots}-QR slot: {seen:?}"
+            );
+        }
     }
 
     /// A receiver that never sees a single source symbol — only fresh repair

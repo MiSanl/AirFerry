@@ -140,7 +140,7 @@ AirFerry/
 - **打包层**：≥2 文件先打包成 ETBUNDL1 容器，整批走单条压缩 + 单条 RaptorQ 流
 - **压缩层**：三算法选优（Raw / Zstd Lv1 / Xz Lv9），70% Zstd early-exit 启发式跳过慢速 Xz
 - **传输层**：60 字节帧头 + symbol_size 负载（浏览器默认 1400）+ 4 字节 CRC，编码为**最小版本** EC-L 二维码（**1464B 帧 → V27 125×125**）；4 码模式同帧 tile 4 个符号、吞吐 ~4×
-- **协议层**：Descriptor 帧（每 16 帧，首帧即描述符）携带 OTI + 文件元数据（文件名、大小、CRC32、压缩标签）
+- **协议层**：Descriptor 帧（每 17 帧，首帧即描述符）携带 OTI + 文件元数据（文件名、大小、CRC32、压缩标签）；17 与 2/4 多码布局互质，使描述符轮流经过所有屏幕码位
 - **接收层**：Android 用 CameraX，并固定采用 v1.1.3 的 Kotlin 调度器与 JNI ZXing-C++ 解码路径；Windows 用 OpenCvSharp DirectShow，并通过 `core/zxing-decoder/` 镜像同一套 v1.1.3 全帧/ROI 模式。两端均为 2–6 worker、4 符号批摄入和串行 Rust 摄入。Windows Gray 帧仅池化复制一次，UI 以约 7Hz 展示 3 秒窗口速率和有效吞吐
 
 ## 文档

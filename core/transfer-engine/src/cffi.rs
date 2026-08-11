@@ -335,12 +335,12 @@ pub unsafe extern "C" fn airferry_decompress_bytes(
     // passing a huge / usize::MAX-equivalent max_output.
     let cap = (max_output.min(MAX_ORIGINAL_BYTES)) as usize;
     let out = match qr_protocol::compress::decompress_with_limit(input, compression, cap) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                cffi_log(&format!("decompress_bytes failed: {e}"));
-                return 0;
-            }
-        };
+        Ok(bytes) => bytes,
+        Err(e) => {
+            cffi_log(&format!("decompress_bytes failed: {e}"));
+            return 0;
+        }
+    };
     if out.is_empty() {
         return 0;
     }

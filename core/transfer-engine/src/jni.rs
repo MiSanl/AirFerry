@@ -10,10 +10,10 @@ use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use jni::objects::{JByteArray, JClass, JString};
-use raptorq_core::MAX_ORIGINAL_BYTES;
 use jni::sys::{jboolean, jint, jlong, jsize};
 use jni::JNIEnv;
 use qr_protocol::frame::SessionIdRaw;
+use raptorq_core::MAX_ORIGINAL_BYTES;
 
 /// ABI / protocol capability version of this JNI library.
 ///

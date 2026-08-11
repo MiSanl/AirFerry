@@ -268,7 +268,7 @@ npm run preview        # 本地预览构建产物
 | Firefox MV2 | `airferry-sender-firefox-mv2-v{VER}.xpi` | Firefox 91+ |
 | 网页发送端 | `airferry-sender-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。v1.1.6 起**仅含发送端**（`build_web` 产 `apps/web/dist/`，打包排除 `zxing_reader.wasm`）。`pack_dist` 自动打包（须先跑 `build-all.sh web`，缺失时 warn 跳过） |
 | 网页接收端 | `airferry-receiver-web-v{VER}.zip` | **接收端独立 zip**（`receiver.html` + assets + `wasm-zstd.wasm` + `zxing_reader.wasm`）。v1.1.6 起与发送端 web 拆分，可独立部署；`build:receiver` 产 `apps/web/dist-receiver/`。⚠️ **不能双击运行**，需部署到 HTTPS / localhost（`getUserMedia` 摄像头仅安全上下文可用）。`pack_dist` 自动打包（缺失时 warn 跳过） |
-| 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `cd apps/web && npm run build:standalone` 产出（`dist-standalone/index.html` → 改名）。不进 `pack_dist`（与静态站点 zip 不同，单文件是 `.html` 无需 zip），手动上传 Release |
+| 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `npm run build:standalone` 产出 `apps/web/dist-standalone/index.html`。**v1.2.0 起 `build_web` 自动构建并按版本规范复制到 `dist/`**（`airferry-sender-web-standalone-v{VER}.html`），随 `release`/`all`/`web` 一并产出，纳入发布流程——不再手动改名上传 |
 
 #### 发布流程（GitHub Release 怎么来）
 
@@ -346,7 +346,7 @@ npm run preview        # 本地预览构建产物
 | 会话 ID 派生（FNV-1a 128） | `core/qr-protocol/src/session.rs:23` | `derive`——必须与 TS 端位一致 |
 | 压缩分发 + 解压炸弹防护 | `core/qr-protocol/src/compress.rs:75,106` | `compress_with` / `decompress_with_limit` |
 | QR 矩阵（动态最小版本） | `core/qr-protocol/src/qr_render.rs`（`encode` / `min_version_for`） | fast_qr；1464B(T=1400)→V27，1088B(T=1024)→V23，576B(T=512)→V16 |
-| **发送端帧流入口** | `core/transfer-engine/src/sender.rs`（`next_frame`） | 每16帧插描述符，首帧即描述符 |
+| **发送端帧流入口** | `core/transfer-engine/src/sender.rs`（`next_frame`） | 每17帧插描述符，首帧即描述符；17 与 2/4 多码布局互质，描述符会轮转所有物理码位，勿改回 16 |
 | 持续新鲜修复符号 | `core/transfer-engine/src/sender.rs`（`next_symbol_id`） | 源一遍→不重复修复；ESI 达 2²⁴ 时明确停止 |
 | **接收端摄入入口** | `core/transfer-engine/src/receiver.rs`（`pub fn ingest`） | 缓存引导→描述符确认 OTI→喂解码器；预描述符 `symbol_cache` 上限 `pre_meta_cache_max()` 动态缩放（下限 `PRE_META_SYMBOL_CACHE_MAX`=12000，预算 `MAX_OBJECT_BYTES`≈32 MiB） |
 | 描述符载荷解析 | `core/transfer-engine/src/descriptor.rs`（`parse_payload`） | v1/v2/v3 + v2/v3 消歧；v5 分段尾段构造用 `build_segment_payload`，v5 解析统一在 `parse_payload` 内（无独立 `parse_segment_payload`） |
