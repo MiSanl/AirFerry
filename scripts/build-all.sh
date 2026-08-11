@@ -22,9 +22,19 @@ set -euo pipefail
 #   airferry-sender-firefox-mv3-v<VER>.xpi      Firefox MV3（zip→xpi）
 #   airferry-sender-firefox-mv2-v<VER>.xpi
 #   airferry-sender-web-v<VER>.zip              网页发送端静态站点
+#   airferry-receiver-web-v<VER>.zip            网页接收端静态站点（receiver.html）
+#   airferry-sender-web-standalone-v<VER>.html  网页发送端单文件版（双击即用，file:// 可运行）
 #   airferry-extension.pem                      Chrome 签名私钥（须预先配置）
 #
-# 版本号取自 apps/sender/package.json，与扩展 manifest 一致。
+# 版本号规范：
+#   • 唯一来源：apps/sender/package.json 的 version（read_version() 读取），
+#     扩展 manifest 同步；改版本只改这一处。
+#   • 产物统一命名 airferry-<端>-<平台>-v<VER>.<ext>，VER 即该来源版本号。
+#   • 手动同步项（无自动派生，改版本时须同步）：
+#       - apps/scanner/app/build.gradle.kts  versionCode/versionName
+#       - apps/web/package.json               version
+#       - apps/windows/.../AssemblyInfo       版本
+#   • Android versionCode 需随版本递增（1.2.0 → 14），versionName 与 VER 一致。
 # ====================================================================
 
 cd "$(dirname "$0")/.."
@@ -231,6 +241,18 @@ build_web() {
   # ② 接收端：vite.receiver.config.ts 单入口 receiver.html → dist-receiver/
   npm run build:receiver 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done
   info "接收端网页构建完成 → apps/web/dist-receiver/（receiver.html）"
+  # ③ 发送端单文件版：vite.standalone.config.ts + build-standalone.cjs → dist-standalone/index.html
+  #    产物按版本规范命名并复制到 dist/（airferry-sender-web-standalone-v<VER>.html），
+  #    双击即可在 file:// 下运行（发送端，不含接收端）。
+  npm run build:standalone 2>&1 | grep -E 'Standalone|error|✖' | while read -r line; do info "$line"; done
+  if [[ -f "$ROOT/apps/web/dist-standalone/index.html" ]]; then
+    mkdir -p "$ROOT/dist"
+    cp "$ROOT/apps/web/dist-standalone/index.html" \
+       "$ROOT/dist/airferry-sender-web-standalone-v${VER}.html"
+    info "发送端单文件版 → dist/airferry-sender-web-standalone-v${VER}.html（双击即用）"
+  else
+    warn "单文件版构建产物缺失：apps/web/dist-standalone/index.html，跳过复制到 dist/"
+  fi
 }
 
 # 打包 Chrome MV2/MV3 为已签名 .crx。
@@ -281,6 +303,7 @@ pack_dist() {
         "$ROOT/dist"/airferry-chrome-*.zip \
         "$ROOT/dist"/airferry-firefox-*.xpi \
         "$ROOT/dist"/airferry-sender-web-*.zip \
+        "$ROOT/dist"/airferry-sender-web-standalone-*.html \
         "$ROOT/dist"/airferry-receiver-web-*.zip \
         "$ROOT/dist"/airferry-web-*.zip
 
