@@ -277,6 +277,82 @@
   padding: 13px 20px;
 }
 
+/* ───────────── 分段恢复历史 ───────────── */
+
+.task-history {
+  margin-top: 18px;
+  padding: 14px;
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+.task-history-title,
+.task-card-head,
+.task-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.task-history-title h2 {
+  margin: 0;
+  font-size: 17px;
+  color: var(--color-text);
+}
+.task-history-title span,
+.task-card-head time,
+.task-meta {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+.task-missing {
+  margin-top: 3px;
+  color: var(--color-primary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+.task-card {
+  padding: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+.task-name {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+}
+.task-progress {
+  height: 7px;
+  margin: 10px 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--color-border);
+}
+.task-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--color-primary), var(--color-success));
+}
+.task-actions {
+  justify-content: flex-end;
+}
+.task-actions .btn {
+  padding: 7px 12px;
+}
+
 /* ───────────── 响应式：手机 ≤600px ───────────── */
 
 @media (max-width: 600px) {
@@ -287,4 +363,7 @@
   .camera-video { height: 40vh; }
   .progress-pct-lg { font-size: 19px; }
   .progress-file-name { font-size: 15px; }
+  .task-card-head { align-items: flex-start; }
+  .task-card-head time { display: none; }
+  .task-actions .btn { flex: 1; }
 }

@@ -150,9 +150,15 @@ fn packed_status_matches_golden_layout() {
     assert_eq!(ingest_status::pack(false, true, 0, 0), 1 << 1);
     // Bits 8..23 = streak (clamped to 16 bits).
     assert_eq!(ingest_status::pack(false, false, 0x1234, 0), 0x1234u64 << 8);
-    assert_eq!(ingest_status::pack(false, false, 0x1FFFF, 0), 0xFFFFu64 << 8);
+    assert_eq!(
+        ingest_status::pack(false, false, 0x1FFFF, 0),
+        0xFFFFu64 << 8
+    );
     // Bits 32..63 = received_symbols.
-    assert_eq!(ingest_status::pack(false, false, 0, 0x5678), 0x5678u64 << 32);
+    assert_eq!(
+        ingest_status::pack(false, false, 0, 0x5678),
+        0x5678u64 << 32
+    );
     // Combined + error sentinel.
     assert_eq!(
         ingest_status::pack(true, true, 0x1234, 0x5678),
@@ -197,7 +203,10 @@ fn assemble_raw_recovers_original_bytes_uncompressed() {
             }
         }
     }
-    assert!(rx.is_complete(), "receiver must recover despite loss/dup/reorder");
+    assert!(
+        rx.is_complete(),
+        "receiver must recover despite loss/dup/reorder"
+    );
     // assemble_raw returns the padded bytes; trim to compressed_size as the
     // WASM binding does.
     let mut raw = rx.assemble_raw().expect("complete -> Some");

@@ -33,6 +33,18 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 
 > ⚠️ 改其中任一端的哈希实现或输入顺序，另一端必须同步，否则断点恢复失效。
 
+### 大文件根任务与子会话
+
+大文件的 `root_session_id` 仍按上式从完整文件身份派生（指纹只读取头/尾各 1 KiB，不把整文件读入内存）。每个 8 MiB 分段使用独立、确定性的 child session id：
+
+```
+child_session_id = FNV1a_128(
+    ASCII("AirFerry.segment.v1") || BE128(root_session_id) || BE32(segment_index)
+)
+```
+
+域标签、根 ID 的大端字节序和 0 起段号均为协议常量。Rust 权威实现为 `SessionId::derive_segment`，TS 镜像为 `deriveSegmentId`。
+
 ---
 
 ## 2. 线帧格式（Wire Frame）
@@ -88,7 +100,7 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
 | 0 | 1 | magic | `0xD5` |
-| 1 | 1 | version | `3`（当前；2/1 为旧版） |
+| 1 | 1 | version | 普通对象 `3`；分段对象 `4`；2/1 为旧版 |
 | 2 | 2 | num_blocks | u16 BE |
 | 4 | 8 | transfer_length | u64 BE（RaptorQ 对象字节数，含填充） |
 | 12 | 4 | symbol_size | u32 BE |
@@ -116,6 +128,19 @@ fingerprint = FNV1a_64( head_1KiB || tail_1KiB )   → 输出 8 字节（小端�
 | Q+1 | 8 | compressed_size（u64 BE，压缩后负载字节，RaptorQ 填充前） |
 
 剩余零填充。固定开销 28 + 每块 16 + v2 尾 13 + filename_len + v3 尾 9，默认 1024 symbol 下数百块内轻松装入。
+
+**v4 扩展**仅用于大文件分段子对象，紧跟 v3 尾部（`R = Q + 9`）：
+
+| 偏移 | 长度 | 字段 | 说明 |
+|------|------|------|------|
+| R | 16 | root_session_id | u128 BE |
+| R+16 | 4 | segment_index | u32 BE，0 起 |
+| R+20 | 4 | segment_count | u32 BE，1..=131072 |
+| R+24 | 8 | original_offset | u64 BE，必须为 `index × 8 MiB` |
+| R+32 | 8 | root_original_size | u64 BE |
+| R+40 | 32 | raw_sha256 | 当前段解压后原始字节的 SHA-256 |
+
+非分段对象仍写 version 3；分段对象必须写 version 4 且携带完整 72 字节尾段。接收端在分配或定位写入前同时验证 child id、根大小推导出的精确段数、索引、规范偏移、当前段精确长度及 SHA-256。
 
 ### v2/v3 消歧规则（关键，易踩坑）
 
@@ -258,6 +283,7 @@ offset  size   field
 | 帧校验 | `Frame::from_bytes` | magic/version/双层 CRC |
 | 预描述符缓存封顶 | `receiver.rs` `PRE_META_SYMBOL_CACHE_MAX`（12000） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM |
 | 描述符冻结 | `receiver.rs` `descriptor_seen` | 首个通过全部校验的 descriptor 确立 OTI、文件元数据与压缩算法；同 session 后续描述符只可完全一致，禁止中途替换解码参数 |
+| v4 分段坐标 | `segment.rs` `SegmentMeta::validate` | 校验 child id、段数上限与根大小一致性、规范偏移、精确段长；宿主落盘前再校验 CRC32 + SHA-256 |
 | WASM symbol_size | `wasm.rs` `Config::new(symbol_size)` | 仅接受 64..=65528 的 8 字节倍数，禁止按字段构造绕过 |
 
 > 接收端扫描的是**任意屏幕**的二维码，描述符/帧元数据均**不可信**。CRC32 仅保完整性、不认证——上述参数校验才是真正防线。
@@ -355,11 +381,11 @@ offset  size   field
 
 | 源 | 当前 |
 |----|------|
-| `Cargo.toml` `[workspace.package] version` | `1.1.4` |
-| `apps/sender/package.json` `version` + `manifest.version` | `1.1.4` |
-| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.1.4` / `9` |
-| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.1.4` |
-| `.github/workflows/windows.yml` `env.VER`（Windows 发版 zip 名 + release tag） | `1.1.4` |
+| `Cargo.toml` `[workspace.package] version` | `1.1.6` |
+| `apps/sender/package.json` `version` + `manifest.version` | `1.1.6` |
+| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.1.6` / `11` |
+| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.1.6` |
+| `.github/workflows/windows.yml` `env.VER`（Windows 发版 zip 名 + release tag） | `1.1.6` |
 
 `scripts/build-all.sh` 的 release 打包文件名版本号由 `read_version()` 从 `apps/sender/package.json` 动态读取，与 `manifest.version` 同源，**无需在脚本里手改**。Windows 发版 zip 名由 workflow 的 `VER` 控制，**须与上表同步**。
 
@@ -374,8 +400,9 @@ offset  size   field
 | 帧头/尾 | 60 / 4 字节 | `frame.rs:16,17` |
 | `FLAG_DESCRIPTOR` | `0x01` | `frame.rs:22` |
 | 描述符 magic | `0xD5` | `descriptor.rs:95` |
-| 描述符版本 | `3` | `descriptor.rs:96` |
-| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3） | `descriptor.rs:97-102` |
+| 描述符版本 | 普通对象 `3` / 分段对象 `4` | `descriptor.rs` `DESC_V3_VERSION` / `DESC_VERSION` |
+| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 72（v4） | `descriptor.rs` |
+| SEGMENT_RAW_BYTES / MAX_SEGMENT_COUNT | 8 MiB / 131072 | `transfer-engine/src/segment.rs` |
 | 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:27-29` |
 | Zstd level（浏览器） | `1` | `compress.ts:56` |
 | XZ level（浏览器） | `9` | `compress.ts:58` |

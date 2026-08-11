@@ -111,6 +111,43 @@ async function initializeCompressWorker(worker: Worker): Promise<void> {
 
 export type { Page, PendingItem, TransferConfig }
 
+/** One descriptor-v4 large-transfer segment (independently compressed). */
+interface PreparedSegment {
+  /** This segment's compressed payload (fed to SenderSessionWasm.new_segment). */
+  compressed: Uint8Array
+  /** Compression algorithm of this segment's payload. */
+  compressionAlgorithm: number
+  /** CRC32 over this segment's raw bytes. */
+  preCrc32: number
+  segmentIndex: number
+  segmentCount: number
+  originalOffset: number
+  rootOriginalSize: number
+  rootSessionId: { lo: bigint; hi: bigint }
+  childSessionId: { lo: bigint; hi: bigint }
+  /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
+  rawSha256: Uint8Array
+  originalSize: number
+}
+
+function preparedSegmentFromMessage(sg: Record<string, unknown>): PreparedSegment {
+  const root = sg.rootSessionId as { lo: string; hi: string }
+  const child = sg.childSessionId as { lo: string; hi: string }
+  return {
+    compressed: new Uint8Array(sg.compressed as ArrayBuffer),
+    compressionAlgorithm: sg.algorithm as number,
+    preCrc32: sg.preCrc32 as number,
+    segmentIndex: sg.segmentIndex as number,
+    segmentCount: sg.segmentCount as number,
+    originalOffset: sg.originalOffset as number,
+    rootOriginalSize: sg.rootOriginalSize as number,
+    rootSessionId: { lo: BigInt(root.lo), hi: BigInt(root.hi) },
+    childSessionId: { lo: BigInt(child.lo), hi: BigInt(child.hi) },
+    rawSha256: new Uint8Array(sg.rawSha256 as ArrayBuffer),
+    originalSize: sg.originalSize as number,
+  }
+}
+
 /** A "send unit": either one real file, a text message, or a bundle of several. */
 interface PreparedPayload {
   /** Final bytes fed to the RaptorQ encoder (already compressed). */
@@ -127,6 +164,16 @@ interface PreparedPayload {
   sessionId: { lo: bigint; hi: bigint }
   /** True when staged as a pure ETTEXTv1 text transfer (receiver copy UI). */
   isText: boolean
+  /** True when this transfer was split into descriptor-v4 segments. */
+  needsSegmentation: boolean
+  /** Root session id of the segmented transfer (== sessionId when segmented). */
+  rootSessionId: { lo: bigint; hi: bigint }
+  /** Total segment count (1 when non-segmented). */
+  segmentCount: number
+  /** Total original (uncompressed) size of the root file. */
+  rootOriginalSize: number
+  /** Currently prepared segment only when segmented; empty otherwise. */
+  segments: PreparedSegment[]
 }
 
 export interface AppState {
@@ -139,6 +186,12 @@ export interface AppState {
   /** The prepared transfer unit (after compress worker). Null until ready. */
   prepared: PreparedPayload | null
   session: SenderSessionWasm | null
+  /**
+   * Active segment index for a segmented large transfer (0-based). For a
+   * non-segmented transfer this is always 0. Bumped by PlayPage when the user
+   * advances to the next segment.
+   */
+  activeSegmentIndex: number
   config: TransferConfig
   /** Loading state while WASM encoder is being initialized (can be slow for large files). */
   initializing: boolean
@@ -160,6 +213,33 @@ function freeSenderSession(session: SenderSessionWasm | null | undefined): void 
   if (!session || freedSessions.has(session)) return
   freedSessions.add(session)
   session.free()
+}
+
+/**
+ * Build a descriptor-v4 segment sender session for `segment` of the segmented
+ * transfer `p`. Mirrors `SenderSessionWasm.new_segment(...)` in Rust.
+ */
+function buildSegmentSession(
+  p: PreparedPayload,
+  segment: PreparedSegment,
+  cfg: TransferConfig
+): SenderSessionWasm {
+  return SenderSessionWasm.new_segment(
+    segment.compressed,
+    segment.rootSessionId.lo,
+    segment.rootSessionId.hi,
+    segment.segmentIndex,
+    segment.segmentCount,
+    BigInt(segment.originalOffset),
+    BigInt(segment.rootOriginalSize),
+    segment.rawSha256,
+    cfg.redundancyPct,
+    cfg.symbolSize,
+    p.displayName,
+    BigInt(segment.originalSize),
+    segment.preCrc32,
+    segment.compressionAlgorithm
+  )
 }
 
 /** Materialise pending items as File[] for the file/bundle worker path. */
@@ -193,6 +273,7 @@ export default function App() {
     items: [],
     prepared: null,
     session: null,
+    activeSegmentIndex: 0,
     config: loadConfig(),
     initializing: false,
     compressPhase: null,
@@ -228,13 +309,24 @@ export default function App() {
   const issuedEpoch = useRef(-1)
   const workerRef = useRef<Worker | null>(null)
   const restartWorkerRef = useRef<() => void>(() => undefined)
+  const segmentRequestRef = useRef<{
+    resolve: (segment: PreparedSegment) => void
+    reject: (error: Error) => void
+  } | null>(null)
   /** Items snapshot at compress start (for prepared.isText). */
   const compressItemsRef = useRef<PendingItem[]>([])
+
+  const cancelSegmentRequest = useCallback((message: string) => {
+    const pending = segmentRequestRef.current
+    segmentRequestRef.current = null
+    pending?.reject(new Error(message))
+  }, [])
 
   const go = useCallback((page: Page) => {
     // Navigating back to select while compressing must cancel the in-flight
     // worker result (same as editing the list).
     if (page === "select") {
+      cancelSegmentRequest("已取消分段准备")
       epoch.current += 1
       if (issuedEpoch.current >= 0) restartWorkerRef.current()
       issuedEpoch.current = -1
@@ -246,7 +338,7 @@ export default function App() {
       return
     }
     setState((s) => ({ ...s, page }))
-  }, [])
+  }, [cancelSegmentRequest])
 
   useEffect(() => {
     let worker: Worker | null = null
@@ -262,32 +354,65 @@ export default function App() {
         return
       }
 
-      if (msg.phase === "done") {
+      if (msg.phase === "segment-done") {
+        issuedEpoch.current = -1
+        const pending = segmentRequestRef.current
+        segmentRequestRef.current = null
+        if (!pending) return
+        try {
+          pending.resolve(
+            preparedSegmentFromMessage(msg.segment as Record<string, unknown>)
+          )
+          setState((s) => ({ ...s, compressPhase: null }))
+        } catch (e) {
+          pending.reject(e instanceof Error ? e : new Error(String(e)))
+        }
+      } else if (msg.phase === "done") {
         issuedEpoch.current = -1
         const itemsSnap = compressItemsRef.current
         const pureText =
           itemsSnap.length === 1 && itemsSnap[0].kind === "text"
-        const compressed = new Uint8Array(msg.compressed as ArrayBuffer)
+        const needsSegmentation = msg.needsSegmentation === true
+        const rootSessionId = {
+          lo: BigInt(msg.rootSessionId.lo),
+          hi: BigInt(msg.rootSessionId.hi),
+        }
+        const segments: PreparedSegment[] = (msg.segments ?? []).map(
+          (sg: Record<string, unknown>) => preparedSegmentFromMessage(sg)
+        )
+        const compressed = needsSegmentation
+          ? null
+          : new Uint8Array(msg.compressed as ArrayBuffer)
         setState((s) => ({
           ...s,
           prepared: {
-            compressed,
+            compressed: compressed ?? new Uint8Array(0),
             compressionAlgorithm: msg.algorithm,
             preCrc32: msg.preCrc32,
-            displayName: msg.displayName,
-            originalSize: msg.originalSize,
-            sessionId: {
-              lo: BigInt(msg.sessionId.lo),
-              hi: BigInt(msg.sessionId.hi),
-            },
+            displayName: msg.rootDisplayName ?? msg.displayName,
+            originalSize: msg.rootOriginalSize ?? msg.originalSize,
+            sessionId: rootSessionId,
             isText: pureText,
+            needsSegmentation,
+            rootSessionId,
+            segmentCount: msg.segmentCount ?? 1,
+            rootOriginalSize: msg.rootOriginalSize ?? msg.originalSize,
+            segments,
           },
+          activeSegmentIndex: 0,
           compressPhase: null,
           page: "params",
           error: null,
         }))
       } else if (msg.phase === "error") {
         issuedEpoch.current = -1
+        const pending = segmentRequestRef.current
+        segmentRequestRef.current = null
+        if (pending) {
+          pending.reject(new Error(msg.message))
+          setState((s) => ({ ...s, compressPhase: null }))
+          return
+        }
         setState((s) => ({
           ...s,
           compressPhase: null,
@@ -306,6 +431,9 @@ export default function App() {
       if (disposed) return
       epoch.current += 1
       issuedEpoch.current = -1
+      const pending = segmentRequestRef.current
+      segmentRequestRef.current = null
+      pending?.reject(new Error(message))
       setState((s) => ({
         ...s,
         compressPhase: null,
@@ -346,6 +474,9 @@ export default function App() {
     startWorker()
     return () => {
       disposed = true
+      const pending = segmentRequestRef.current
+      segmentRequestRef.current = null
+      pending?.reject(new Error("文件处理线程已关闭"))
       restartWorkerRef.current = () => undefined
       worker?.terminate()
       workerRef.current = null
@@ -358,6 +489,7 @@ export default function App() {
    * Changing the list invalidates prepared/session and cancels in-flight compress.
    */
   const onItemsChange = useCallback((items: PendingItem[]) => {
+    cancelSegmentRequest("发送内容已变化")
     releaseOwnedSession()
     epoch.current += 1
     if (issuedEpoch.current >= 0) restartWorkerRef.current()
@@ -368,11 +500,12 @@ export default function App() {
       items,
       prepared: null,
       session: null,
+      activeSegmentIndex: 0,
       compressPhase: null,
       error: null,
       page: "select",
     }))
-  }, [releaseOwnedSession])
+  }, [releaseOwnedSession, cancelSegmentRequest])
 
   /**
    * Explicit send:
@@ -430,17 +563,25 @@ export default function App() {
         }
         return
       }
-      const session = new SenderSessionWasm(
-        p.compressed,
-        p.sessionId.lo,
-        p.sessionId.hi,
-        cfg.redundancyPct,
-        cfg.symbolSize,
-        p.displayName,
-        BigInt(p.originalSize),
-        p.preCrc32,
-        p.compressionAlgorithm
+      const activeSegment = p.segments.find(
+        (segment) => segment.segmentIndex === state.activeSegmentIndex
       )
+      if (p.needsSegmentation && !activeSegment) {
+        throw new Error(`分段 ${state.activeSegmentIndex + 1} 尚未准备完成`)
+      }
+      const session = p.needsSegmentation
+        ? buildSegmentSession(p, activeSegment!, cfg)
+        : new SenderSessionWasm(
+            p.compressed,
+            p.sessionId.lo,
+            p.sessionId.hi,
+            cfg.redundancyPct,
+            cfg.symbolSize,
+            p.displayName,
+            BigInt(p.originalSize),
+            p.preCrc32,
+            p.compressionAlgorithm
+          )
       if (!mountedRef.current || epoch.current !== startEpoch) {
         freeSenderSession(session)
         releaseOwnedSession()
@@ -460,7 +601,85 @@ export default function App() {
         error: `编码器初始化失败: ${e?.message || e}`
       }))
     }
-  }, [state.prepared, state.config, releaseOwnedSession])
+  }, [state.prepared, state.config, state.activeSegmentIndex, releaseOwnedSession])
+
+  /**
+   * Advance a segmented transfer to `nextIndex`. Only valid for
+   * `prepared.needsSegmentation`. Releases the current session and builds the
+   * next segment's session in place (no page navigation).
+   */
+  const switchSegment = useCallback(
+    async (nextIndex: number) => {
+      const p = state.prepared
+      if (!p?.needsSegmentation || state.initializing || state.compressPhase != null) return
+      const clamped = Math.max(0, Math.min(p.segmentCount - 1, nextIndex))
+      if (clamped === state.activeSegmentIndex) return
+      const worker = workerRef.current
+      const item = state.items.length === 1 ? state.items[0] : null
+      if (!worker || item?.kind !== "file") {
+        setState((s) => ({ ...s, error: "无法读取原文件，请重新选择" }))
+        return
+      }
+      // A segment switch is its own worker request. Giving every request a
+      // fresh epoch prevents a slow result for an earlier rapid click from
+      // resolving the promise that belongs to the latest requested segment.
+      epoch.current += 1
+      const requestEpoch = epoch.current
+      cancelSegmentRequest("已由新的分段请求替代")
+      issuedEpoch.current = requestEpoch
+      setState((s) => ({ ...s, initializing: true, compressPhase: "reading", error: null }))
+      try {
+        const segment = await new Promise<PreparedSegment>((resolve, reject) => {
+          segmentRequestRef.current = { resolve, reject }
+          worker.postMessage({
+            type: "prepare-segment",
+            jobId: requestEpoch,
+            file: item.file,
+            segmentIndex: clamped,
+            segmentCount: p.segmentCount,
+            rootSessionId: {
+              lo: p.rootSessionId.lo.toString(),
+              hi: p.rootSessionId.hi.toString(),
+            },
+          })
+        })
+        if (!mountedRef.current || epoch.current !== requestEpoch) return
+        await ensureWasm()
+        const nextPrepared = { ...p, segments: [segment] }
+        const session = buildSegmentSession(nextPrepared, segment, state.config)
+        releaseOwnedSession()
+        ownedSessionRef.current = session
+        setState((s) => ({
+          ...s,
+          prepared: nextPrepared,
+          session,
+          activeSegmentIndex: clamped,
+          initializing: false,
+          compressPhase: null,
+          error: null,
+        }))
+      } catch (e: unknown) {
+        if (!mountedRef.current || epoch.current !== requestEpoch) return
+        console.error("Segment session creation failed:", e)
+        setState((s) => ({
+          ...s,
+          initializing: false,
+          compressPhase: null,
+          error: `切换分段失败: ${e instanceof Error ? e.message : String(e)}`
+        }))
+      }
+    },
+    [
+      state.prepared,
+      state.activeSegmentIndex,
+      state.config,
+      state.items,
+      state.initializing,
+      state.compressPhase,
+      releaseOwnedSession,
+      cancelSegmentRequest,
+    ]
+  )
 
   const updateConfig = useCallback(
     (patch: Partial<TransferConfig>) =>
@@ -516,8 +735,13 @@ export default function App() {
           <ParamsPage
             items={state.items}
             displayName={state.prepared.displayName}
-            originalSize={state.prepared.originalSize}
-            compressedSize={state.prepared.compressed.length}
+            originalSize={state.prepared.rootOriginalSize}
+            compressedSize={
+              state.prepared.needsSegmentation
+                ? (state.prepared.segments[0]?.compressed.length ?? 0)
+                : state.prepared.compressed.length
+            }
+            segmentCount={state.prepared.segmentCount}
             isBundle={state.items.length > 1}
             isText={state.prepared.isText}
             config={state.config}
@@ -531,13 +755,22 @@ export default function App() {
             session={state.session}
             config={state.config}
             sessionId={state.prepared.sessionId}
-            totalBytes={state.prepared.compressed.length}
+            totalBytes={
+              state.prepared.needsSegmentation
+                ? (state.prepared.segments.find(
+                    (segment) => segment.segmentIndex === state.activeSegmentIndex
+                  )?.compressed.length ?? 0)
+                : state.prepared.compressed.length
+            }
+            segmentCount={state.prepared.segmentCount}
+            segmentIndex={state.activeSegmentIndex}
+            onSegmentChange={switchSegment}
           />
         )}
         {state.page === "stats" && state.session && state.prepared && (
           <StatsPage
             session={state.session}
-            fileSize={state.prepared.originalSize}
+            fileSize={state.prepared.rootOriginalSize}
           />
         )}
       </main>

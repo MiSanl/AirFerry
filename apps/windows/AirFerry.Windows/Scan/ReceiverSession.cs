@@ -210,6 +210,64 @@ public sealed class ReceiverSession : IDisposable
         lock (_gate) return _initialized && NativeBridge.ReceiverCrc32Known(_handle) == 1;
     }
 
+    // ── descriptor-v4 segment metadata (large-transfer child objects) ───────
+
+    /// <summary>1 if the confirmed descriptor was a v4 large-transfer child object.</summary>
+    public bool IsSegmented()
+    {
+        lock (_gate) return _initialized && NativeBridge.ReceiverIsSegmented(_handle) == 1;
+    }
+
+    /// <summary>Zero-based index of this segment within the root transfer (0 if not segmented).</summary>
+    public uint SegmentIndex()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverSegmentIndex(_handle) : 0u;
+    }
+
+    /// <summary>Total segment count of the root transfer (1 if not segmented).</summary>
+    public uint SegmentCount()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverSegmentCount(_handle) : 1u;
+    }
+
+    /// <summary>Root (whole-file) original size in bytes (0 if not segmented).</summary>
+    public ulong RootOriginalSize()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverRootOriginalSize(_handle) : 0UL;
+    }
+
+    /// <summary>Original (uncompressed) offset of this segment in the root file (0 if not segmented).</summary>
+    public ulong OriginalOffset()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverOriginalOffset(_handle) : 0UL;
+    }
+
+    /// <summary>Root session id low 64 bits (whole transfer id), or 0 if not segmented.</summary>
+    public ulong RootSessionIdLo()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverRootSessionIdLo(_handle) : 0UL;
+    }
+
+    /// <summary>Root session id high 64 bits, or 0 if not segmented.</summary>
+    public ulong RootSessionIdHi()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverRootSessionIdHi(_handle) : 0UL;
+    }
+
+    /// <summary>32-byte SHA-256 of this segment's uncompressed bytes, or empty if not segmented.</summary>
+    public byte[] RawSha256()
+    {
+        lock (_gate)
+        {
+            if (!_initialized) return Array.Empty<byte>();
+            var len = NativeBridge.ReceiverRawSha256(_handle, null, 0);
+            if (len == 0) return Array.Empty<byte>();
+            var buf = new byte[len];
+            NativeBridge.ReceiverRawSha256(_handle, buf, len);
+            return buf;
+        }
+    }
+
     /// <summary>
     /// Recover the assembled file bytes, trimming RaptorQ zero-padding back to
     /// the descriptor's original size (mirrors Android's

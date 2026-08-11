@@ -1,9 +1,10 @@
 //! Resume / checkpoint state.
 //!
 //! The receiver can serialize its progress so that, after an app restart, it
-//! can recognise the same session id (from incoming frames) and reload the
-//! per-block received-symbol sets. RaptorQ state itself is rebuilt by feeding
-//! the saved symbols back into a fresh decoder via
+//! can recognise the same session id (from incoming frames). RaptorQ state
+//! itself is rebuilt only by feeding saved symbol payloads into a fresh decoder;
+//! an ESI without its payload is not replayable and must not suppress a future
+//! retransmission. See
 //! [`crate::ReceiverSession::save_state`] / [`crate::ReceiverSession::restore`].
 //!
 //! Format: serde JSON (feature-gated). When the `serde` feature is off, the
@@ -19,7 +20,9 @@ use std::vec::Vec;
 pub struct ResumeState {
     pub session_id: SessionIdRaw,
     pub meta: ObjectMeta,
-    /// Per-block set of received ESIs.
+    /// Per-block set of ESIs with replayable payloads. Older checkpoints may
+    /// contain additional entries; restore treats those as advisory and ignores
+    /// any ESI that has no matching item in `symbols`.
     pub received: Vec<HashSet<u32>>,
     /// Stored symbol bytes, keyed by flat index = sbn*K_max + esi (simple).
     pub symbols: Vec<(u32, u32, Vec<u8>)>,

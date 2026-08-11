@@ -99,6 +99,62 @@ public static class ContentStore
         }
     }
 
+    /// <summary>
+    /// Archive an existing file (e.g. a fully-assembled large-transfer) into the
+    /// content-addressed store by streaming its hash and atomically copying it
+    /// into the blob tree — no full-file in-memory copy. The task-owned source
+    /// is deleted only after the history index is durably published.
+    /// </summary>
+    public static PutResult PutFile(
+        string displayName,
+        string filePath,
+        string crcHex = "unknown",
+        bool crcUnknown = true,
+        string kind = "file",
+        string? bundleId = null,
+        string? bundleTitle = null)
+    {
+        lock (Gate)
+        {
+            var all = LoadIndex();
+            Directory.CreateDirectory(RootDir);
+            string hash = Sha256HexFile(filePath);
+            string path = BlobPath(hash);
+            bool deduped = FileMatchesHash(path, hash, new FileInfo(filePath).Length);
+            if (!deduped)
+            {
+                CopyFileAtomic(filePath, path);
+            }
+            var entry = new Entry(
+                Id: Guid.NewGuid().ToString("N"),
+                Name: FileNameUtil.Sanitize(displayName),
+                Hash: hash,
+                Size: new FileInfo(path).Length,
+                CrcHex: crcHex,
+                CrcUnknown: crcUnknown,
+                Kind: kind,
+                CreatedAt: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                BundleId: bundleId,
+                BundleTitle: bundleTitle);
+            all.Add(entry);
+            SaveIndex(all);
+            if (!string.Equals(Path.GetFullPath(filePath), Path.GetFullPath(path),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                try { File.Delete(filePath); } catch { /* task cleanup retries */ }
+            }
+            return new PutResult(entry, path, deduped);
+        }
+    }
+
+    /// <summary>Streaming SHA-256 of a file (no full-file in-memory buffer).</summary>
+    private static string Sha256HexFile(string path)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return Convert.ToHexString(sha.ComputeHash(fs)).ToLowerInvariant();
+    }
+
     public static IReadOnlyList<Entry> ListEntries()
     {
         lock (Gate) return LoadIndex();
@@ -130,6 +186,8 @@ public static class ContentStore
             SaveIndex([]);
             string blobs = Path.Combine(RootDir, "blobs");
             if (Directory.Exists(blobs)) Directory.Delete(blobs, recursive: true);
+            string segments = Path.Combine(RootDir, "seg");
+            if (Directory.Exists(segments)) Directory.Delete(segments, recursive: true);
         }
     }
 
@@ -255,6 +313,29 @@ public static class ContentStore
                 stream.Flush(flushToDisk: true);
             }
             File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    private static void CopyFileAtomic(string source, string target)
+    {
+        string? dir = Path.GetDirectoryName(target);
+        if (dir is null) throw new IOException("Blob path has no directory");
+        Directory.CreateDirectory(dir);
+        string temp = Path.Combine(dir, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
+                       FileShare.None, 64 * 1024, FileOptions.WriteThrough))
+            {
+                input.CopyTo(output);
+                output.Flush(flushToDisk: true);
+            }
+            File.Move(temp, target, overwrite: true);
         }
         finally
         {

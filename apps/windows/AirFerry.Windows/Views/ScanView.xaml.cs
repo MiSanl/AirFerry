@@ -27,10 +27,10 @@ public partial class ScanView : Page
     private int _activationEpoch;
     private volatile bool _pageActive;
 
-    public ScanView(int deviceIndex)
+    public ScanView(int deviceIndex, string? resumeRootId = null)
     {
         InitializeComponent();
-        _vm = new ScanViewModel();
+        _vm = new ScanViewModel(resumeRootId);
         _vm.TransferCompleted += OnTransferCompleted;
         _vm.PreviewFrameReady += OnPreviewFrameReady;
 

@@ -1,6 +1,7 @@
 //! Sender-side session orchestration.
 
 use crate::descriptor::FileMeta;
+use crate::segment::SegmentMeta;
 use crate::time::now_ms;
 use crate::{progress::Stats, Error, Result};
 use qr_protocol::{chunker, frame::SessionIdRaw, Frame, SessionId};
@@ -60,6 +61,8 @@ pub struct SenderSession {
     encoder: Encoder,
     meta: ObjectMeta,
     file_meta: FileMeta,
+    /// Descriptor-v4 metadata for a large-transfer child object.
+    segment_meta: Option<SegmentMeta>,
     /// Total source symbols K across all blocks.
     total_k: u32,
     /// Source-symbol emission order (round-robin across blocks), emitted once.
@@ -93,6 +96,43 @@ impl SenderSession {
         config: SenderConfig,
         file_meta: FileMeta,
     ) -> Result<Self> {
+        Self::new_inner(compressed_payload, session_id, config, file_meta, None)
+    }
+
+    /// Create one independently encoded descriptor-v4 large-transfer segment.
+    pub fn new_segment(
+        compressed_payload: &[u8],
+        child_session_id: SessionId,
+        config: SenderConfig,
+        file_meta: FileMeta,
+        segment_meta: SegmentMeta,
+    ) -> Result<Self> {
+        if file_meta.compressed_size != compressed_payload.len() as u64
+            || !file_meta.compressed_size_known
+        {
+            return Err(Error::InvalidSegment(
+                "segment compressed size does not match payload",
+            ));
+        }
+        segment_meta
+            .validate(child_session_id.0, &file_meta)
+            .map_err(Error::InvalidSegment)?;
+        Self::new_inner(
+            compressed_payload,
+            child_session_id,
+            config,
+            file_meta,
+            Some(segment_meta),
+        )
+    }
+
+    fn new_inner(
+        compressed_payload: &[u8],
+        session_id: SessionId,
+        config: SenderConfig,
+        file_meta: FileMeta,
+        segment_meta: Option<SegmentMeta>,
+    ) -> Result<Self> {
         config.validate()?;
         let padded = chunker::pad_to_symbols(compressed_payload, config.codec);
         let encoder = Encoder::new(&padded, config.codec)?;
@@ -101,7 +141,11 @@ impl SenderSession {
         // can actually be emitted. Small symbols or unusually many source
         // blocks may be valid RaptorQ configurations while being too small for
         // the current v3 descriptor.
-        crate::descriptor::build_payload(&meta, &file_meta)?;
+        if let Some(segment) = &segment_meta {
+            crate::descriptor::build_segment_payload(&meta, &file_meta, segment)?;
+        } else {
+            crate::descriptor::build_payload(&meta, &file_meta)?;
+        }
         let total_k: u32 = meta.blocks.iter().map(|b| b.num_source_symbols).sum();
 
         let source_plan = build_source_plan(&meta);
@@ -112,6 +156,7 @@ impl SenderSession {
             encoder,
             meta,
             file_meta,
+            segment_meta,
             total_k,
             source_plan,
             source_cursor: 0,
@@ -144,6 +189,10 @@ impl SenderSession {
     /// File metadata (filename, original size, CRC32).
     pub fn file_meta(&self) -> &FileMeta {
         &self.file_meta
+    }
+
+    pub fn segment_meta(&self) -> Option<&SegmentMeta> {
+        self.segment_meta.as_ref()
     }
 
     pub fn session_id(&self) -> SessionIdRaw {
@@ -188,13 +237,24 @@ impl SenderSession {
         let interval = self.descriptor_interval.max(1) as u64;
         if self.frame_index == 0 || (self.frame_index > 0 && self.frame_index % interval == 0) {
             self.frame_index = self.frame_index.wrapping_add(1);
-            let frame = crate::descriptor::build_frame(
-                &self.meta,
-                &self.file_meta,
-                self.session_id,
-                self.frame_index,
-                now_ms_val,
-            )?;
+            let frame = if let Some(segment) = &self.segment_meta {
+                crate::descriptor::build_segment_frame(
+                    &self.meta,
+                    &self.file_meta,
+                    segment,
+                    self.session_id,
+                    self.frame_index,
+                    now_ms_val,
+                )?
+            } else {
+                crate::descriptor::build_frame(
+                    &self.meta,
+                    &self.file_meta,
+                    self.session_id,
+                    self.frame_index,
+                    now_ms_val,
+                )?
+            };
             self.stats.record_sent(frame.payload.len() as u64);
             return Ok(frame);
         }

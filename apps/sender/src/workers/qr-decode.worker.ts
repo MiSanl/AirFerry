@@ -48,10 +48,14 @@ let fastMod: {
 /** Try to load the self-compiled ZXing-C++ WASM (fast backend). */
 async function loadFastBackend(): Promise<boolean> {
   try {
-    const mod = await import("../fastzxing/airferry_zxing.js")
+    // The fast backend is an optional generated artifact. Keep the specifier
+    // runtime-dynamic so builds without that artifact can still ship the
+    // offline zxing-wasm fallback instead of failing module resolution.
+    const modulePath = "../fastzxing/airferry_zxing.js"
+    const mod = await import(/* @vite-ignore */ modulePath)
     const inst = await (mod.default as () => Promise<unknown>)()
     const m = inst as typeof fastMod
-    if (m._airferry_wasm_abi_version() !== 1) return false
+    if (!m || m._airferry_wasm_abi_version() !== 1) return false
     fastMod = m
     fastOk = true
     return true
@@ -118,7 +122,7 @@ function cropRgba(
   y: number,
   w: number,
   h: number
-): Uint8ClampedArray {
+): Uint8ClampedArray<ArrayBuffer> {
   const out = new Uint8ClampedArray(w * h * 4)
   for (let row = 0; row < h; row++) {
     const srcStart = ((y + row) * srcW + x) * 4
@@ -198,7 +202,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
       // Wrap the transferred RGBA buffer as an ImageData. `Uint8ClampedArray`
       // shares storage with Uint8Array when constructed over its buffer.
       const imageData = new ImageData(
-        new Uint8ClampedArray(rg.buffer, rg.byteOffset, rg.byteLength),
+        new Uint8ClampedArray(rg),
         width,
         height
       )

@@ -28,10 +28,10 @@
 ## 特性
 
 - ✅ 高可靠性、高容错率（支持高丢帧 / 乱序 / 重复帧 / 部分损坏）
-- ✅ 支持大文件传输
+- ✅ 支持大文件分段传输（固定 8 MiB、按需准备、可直达指定段）
 - ✅ 持续新鲜喷泉码：源符号发一遍后持续补充不重复修复符号，进度近似线性；到 RFC 24 位 ESI 上限时明确停止
 - ✅ 接收端并行解码池：多线程 ZXing + 串行原生摄入，吃满高帧率采集
-- ✅ 断点恢复（接收端状态持久化，同会话 ID 续传）
+- ✅ 大文件断点恢复（历史页显示缺失段；已校验完成段跨重启保留）
 - ✅ 连续二维码视频流（15 / 20 / 30 / 45 / 60 / 90 / 120 fps 或无限制，默认 60）
 - ✅ Air-Gap 场景，零网络依赖
 - ✅ 单向信道，无需回传确认
@@ -42,24 +42,25 @@
 - ✅ 4 码并行模式（同帧 tile 4 个不同符号，吞吐 ~4×，默认开启）
 - ✅ 速度预设（稳定 / 高速 / 极限 / 激进 / 极速 / 极限 2400B，默认激进 1400B@60fps）
 - ✅ 多浏览器支持（Chrome / Edge / Firefox，MV2 + MV3）
-- ✅ 多接收端：Android App 与 Windows 应用共用 ZXing-C++ 解码核心和 ROI 策略；Windows 支持摄像头 + USB/HDMI/SDI 采集卡
+- ✅ 多接收端：网页、Android App 与 Windows 应用复用同一 Rust 协议核心；Windows 支持摄像头 + USB/HDMI/SDI 采集卡
 
 ## 下载安装
 
-最新版本发布在 [GitHub Release v1.1.4](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.1.4)。
+最新版本发布在 [GitHub Release v1.1.6](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.1.6)。
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-sender-chrome-mv3-v1.1.4.crx` | Chrome / Edge 浏览器扩展，MV3（现代版），已签名，拖入即可安装 |
-| `airferry-sender-chrome-mv3-v1.1.4.zip` | 同上解压加载版（`.crx` 被拦截时用「加载已解压的扩展程序」） |
-| `airferry-sender-chrome-mv2-v1.1.4.crx` | Chrome / Edge MV2，旧版浏览器兼容 |
-| `airferry-sender-chrome-mv2-v1.1.4.zip` | 同上解压加载版 |
-| `airferry-sender-firefox-mv3-v1.1.4.xpi` | Firefox 扩展，MV3（Firefox 116+） |
-| `airferry-sender-firefox-mv2-v1.1.4.xpi` | Firefox 扩展，MV2（Firefox 91+） |
-| `airferry-sender-web-v1.1.4.zip` | 网页发送端静态站点，部署到任意静态托管 |
-| `airferry-sender-web-standalone-v1.1.4.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
-| `airferry-receiver-android-arm64-v1.1.4.apk` | **Android 扫码端**：arm64-v8a，Android 10+，对准屏幕二维码即可接收 |
-| `airferry-receiver-windows-x64-v1.1.4.zip` | **Windows 扫码端**：x64，Windows 10+，支持摄像头 + USB/HDMI/SDI 采集卡 |
+| `airferry-sender-chrome-mv3-v1.1.6.crx` | Chrome / Edge 浏览器扩展，MV3（现代版），已签名，拖入即可安装 |
+| `airferry-sender-chrome-mv3-v1.1.6.zip` | 同上解压加载版（`.crx` 被拦截时用「加载已解压的扩展程序」） |
+| `airferry-sender-chrome-mv2-v1.1.6.crx` | Chrome / Edge MV2，旧版浏览器兼容 |
+| `airferry-sender-chrome-mv2-v1.1.6.zip` | 同上解压加载版 |
+| `airferry-sender-firefox-mv3-v1.1.6.xpi` | Firefox 扩展，MV3（Firefox 116+） |
+| `airferry-sender-firefox-mv2-v1.1.6.xpi` | Firefox 91+ 的 MV2 兼容版 |
+| `airferry-sender-web-v1.1.6.zip` | 网页发送端静态站点，部署到任意静态托管 |
+| `airferry-sender-web-standalone-v1.1.6.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
+| `airferry-receiver-web-v1.1.6.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头 |
+| `airferry-receiver-android-arm64-v1.1.6.apk` | **Android 扫码端**：arm64-v8a，Android 10+，对准屏幕二维码即可接收 |
+| `airferry-receiver-windows-x64-v1.1.6.zip` | **Windows 扫码端**：x64，Windows 10+，支持摄像头 + USB/HDMI/SDI 采集卡 |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
 
@@ -69,7 +70,7 @@
 
 ### Windows 接收端
 
-解压 `airferry-receiver-windows-x64-v1.1.4.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
+解压 `airferry-receiver-windows-x64-v1.1.6.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注），进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 

@@ -2,7 +2,7 @@
 
 ## 概述
 
-AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览器扩展或网页）将文件/文字编码为二维码视频流在屏幕上连续播放；接收端（Android App / Windows 桌面）用摄像头或采集卡实时扫描并恢复内容。编解码共享同一套 Rust 核心库，分别编译为 WebAssembly、Android JNI `.so`、Windows C ABI DLL，确保数学一致。
+AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览器扩展或网页）将文件/文字编码为二维码视频流在屏幕上连续播放；接收端（网页 / Android App / Windows 桌面）用摄像头或采集卡实时扫描并恢复内容。编解码共享同一套 Rust 核心库，分别编译为 WebAssembly、Android JNI `.so`、Windows C ABI DLL，确保数学一致。
 
 ## 架构图
 
@@ -22,8 +22,8 @@ AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览�
                                        │ (单向光学信道, Air-Gap)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│            接收端 (Android App · Windows WPF)                     │
-│ Kotlin + CameraX / C# + OpenCvSharp，共用 ZXing-C++ 全帧/ROI 核心 │
+│       接收端 (Web · Android App · Windows WPF)                    │
+│ Web Worker / Kotlin+CameraX / C#+OpenCvSharp + ZXing 解码         │
 │                                                                  │
 │  视频流 → [并行解码池] → [串行 Rust 摄入]                          │
 │  帧解析 → RaptorQ 恢复 → 解压 → ETTEXTv1 / ETBUNDL1 / 文件       │
@@ -40,7 +40,7 @@ core/
 │   └── Decoder        接收任意顺序符号、容错恢复
 ├── qr-protocol/       帧格式 + 分块 + 压缩 + CRC + QR 矩阵
 │   ├── frame          60B Header + T 字节 Payload + 4B Footer
-│   ├── compress       Zstd (Lv22) + XZ 解压分发（接收侧级别）
+│   ├── compress       Zstd + XZ 解压分发与输出上限
 │   ├── session        确定性会话 ID（FNV-1a 128-bit）
 │   └── qr_render      fast_qr crate → 模块矩阵（按帧长选最小版本）
 ├── transfer-engine/   编排 + 状态机 + 进度 + 断点 + FFI
@@ -75,6 +75,7 @@ core/
   ├─ 恰好 1 条文字、0 文件 → ETTEXTv1（processText）
   ├─ 否则文字物化为命名 .txt + 文件 → ≥2 则 ETBUNDL1
   ├─ 三算法选优压缩 (Raw / Zstd Lv1 / Xz Lv9)，70% early-exit
+  ├─ 单文件 >32 MiB → 8 MiB 原始段按需压缩；可直接跳到指定段
   ├─ 零填充到 symbol_size 整数倍
   ├─ RaptorQ 编码（RFC 6330 自动分源块）
   └─ 源符号一遍 → 持续新鲜修复符号；每 16 帧插描述符（首帧即描述符）
@@ -93,6 +94,7 @@ core/
   ├─ Windows 同一采集句柄节流 BGR24 快照 → WPF 预览（UI 不读设备）
   ├─ 串行 ingest（锁）：帧校验 → 去重 → RaptorQ
   └─ assemble + 解压后分流：
+       ⓪ descriptor-v4 → 逐段 CRC/SHA 校验 + 磁盘/IndexedDB 账本
        ① ETTEXTv1 → ReceiveText（复制/分享/存盘）
        ② ETBUNDL1 → 拆包；文本类扩展名可点进 ReceiveText
        ③ 单文件 + TextLike 扩展名 + 严格 UTF-8 → ReceiveText
@@ -109,7 +111,7 @@ core/
 | 帧乱序 | 符号按 (sbn, esi) 索引 |
 | 帧重复 | per-block ESI 集合去重 |
 | 帧损坏 | 双层 CRC32 丢弃 |
-| 接收端重启 | 确定性 session_id + 状态持久化 |
+| 大文件接收端重启 | 已验证完成段持久化；当前未完成的 8 MiB 段重扫 |
 | 晚加入 | 描述符帧定期广播 OTI |
 | 恶意/越界描述符 | `ObjectMeta::validate` |
 | 越界符号坐标 | 拒绝 ESI ≥ 2²⁴ 或载荷长度 ≠ symbol_size |

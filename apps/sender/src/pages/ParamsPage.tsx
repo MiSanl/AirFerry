@@ -15,6 +15,8 @@ interface Props {
   isBundle: boolean
   /** Pure ETTEXTv1 text transfer (receiver copy/share UI). */
   isText: boolean
+  /** Total segment count for a segmented large transfer (1 when non-segmented). */
+  segmentCount?: number
   config: TransferConfig
   onChange: (patch: Partial<TransferConfig>) => void
   onStart: () => void
@@ -55,12 +57,15 @@ export function ParamsPage({
   compressedSize,
   isBundle,
   isText,
+  segmentCount = 1,
   config,
   onChange,
   onStart,
   initializing
 }: Props) {
-  const ratio = originalSize > 0 ? compressedSize / originalSize : 1
+  const isSegmented = segmentCount > 1
+  const ratioBase = isSegmented ? Math.min(originalSize, 8 * 1024 * 1024) : originalSize
+  const ratio = ratioBase > 0 ? compressedSize / ratioBase : 1
 
   // Pre-transfer ETA estimate (before encoder init).
   // Total frames ≈ source symbols × (1 + redundancy) + descriptor overhead.
@@ -107,15 +112,21 @@ export function ParamsPage({
             <td>{formatBytes(originalSize)}</td>
           </tr>
           <tr>
-            <td>压缩后</td>
+            <td>{isSegmented ? "首段压缩后" : "压缩后"}</td>
             <td>{formatBytes(compressedSize)} ({(ratio * 100).toFixed(0)}%)</td>
           </tr>
+          {isSegmented && (
+            <tr>
+              <td>分段</td>
+              <td>{segmentCount} 段 × 8 MiB（每段独立传输，接收端自动合并）</td>
+            </tr>
+          )}
           <tr>
-            <td>预计帧数</td>
+            <td>{isSegmented ? "每段预计帧数" : "预计帧数"}</td>
             <td>{totalFrames.toLocaleString()}</td>
           </tr>
           <tr>
-            <td>预计传输时间</td>
+            <td>{isSegmented ? "每段预计时间" : "预计传输时间"}</td>
             <td>
               <strong>{formatDuration(estimatedSeconds)}</strong>
               <span className="muted"> ({config.fps > 0 ? config.fps + "fps" : "跟随屏幕刷新"}, {config.redundancyPct}% 冗余)</span>

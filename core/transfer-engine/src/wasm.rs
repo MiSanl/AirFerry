@@ -82,6 +82,81 @@ impl SenderSessionWasm {
         })
     }
 
+    /// Create one descriptor-v4 large-transfer segment session.
+    ///
+    /// A logical file is split into N fixed `SEGMENT_RAW_BYTES` (8 MiB) raw
+    /// segments, each independently compressed and RaptorQ-encoded. This
+    /// constructor wraps one such segment as its own session whose child
+    /// `session_id` is deterministically derived from `(root_session_id,
+    /// segment_index)` — so the outer 60-byte frame format is unchanged and a
+    /// receiver demultiplexes segments purely by that distinct session id.
+    ///
+    /// `raw_sha256` is the SHA-256 of the segment's *uncompressed* raw bytes
+    /// (32 bytes); `original_size` is that raw segment's length (≤ 8 MiB; the
+    /// final segment may be shorter). `root_session_id_lo/hi`,
+    /// `segment_index`, `segment_count`, `original_offset`,
+    /// `root_original_size` describe the segment's canonical range within the
+    /// root file.
+    /// Static factory: `SenderSessionWasm.new_segment(...)`. Exposed as an
+    /// associated function (not a constructor) because `SenderSessionWasm`
+    /// already has a primary `new` constructor.
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_segment(
+        compressed_payload: &[u8],
+        root_session_id_lo: u64,
+        root_session_id_hi: u64,
+        segment_index: u32,
+        segment_count: u32,
+        original_offset: u64,
+        root_original_size: u64,
+        raw_sha256: &[u8],
+        redundancy_pct: u8,
+        symbol_size: u32,
+        filename: &str,
+        original_size: u64,
+        crc32: u32,
+        compression: u8,
+    ) -> Result<SenderSessionWasm, JsValue> {
+        _start();
+        let root = ((root_session_id_hi as u128) << 64) | root_session_id_lo as u128;
+        let child = SessionId::derive_segment(root, segment_index);
+        let codec = Config::new(symbol_size).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        let cfg = SenderConfig {
+            codec,
+            redundancy_pct,
+        };
+        let file_meta = crate::descriptor::FileMeta {
+            filename: filename.to_string(),
+            original_size,
+            crc32,
+            compression,
+            compressed_size: compressed_payload.len() as u64,
+            compressed_size_known: true,
+            crc32_known: true,
+        };
+        if raw_sha256.len() != 32 {
+            return Err(JsValue::from_str("raw_sha256 must be exactly 32 bytes"));
+        }
+        let mut sha = [0u8; 32];
+        sha.copy_from_slice(&raw_sha256[..32]);
+        let segment_meta = crate::segment::SegmentMeta {
+            root_session_id: root,
+            segment_index,
+            segment_count,
+            original_offset,
+            root_original_size,
+            raw_sha256: sha,
+        };
+        let inner =
+            SenderSession::new_segment(compressed_payload, child, cfg, file_meta, segment_meta)
+                .map_err(err_to_js)?;
+        Ok(SenderSessionWasm {
+            inner,
+            qr_scratch: vec![0; QR_SCRATCH_BYTES],
+        })
+    }
+
     /// Produce the next frame's raw bytes (header + payload + footer).
     pub fn next_frame(&mut self) -> Result<Vec<u8>, JsValue> {
         let frame = self.inner.next_frame().map_err(err_to_js)?;
@@ -301,6 +376,27 @@ impl SenderSessionWasm {
         self.inner.num_blocks() as u32
     }
 
+    /// Zero-based index of the current large-transfer segment, or 0 for a
+    /// non-segmented session.
+    pub fn segment_index(&self) -> u32 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.segment_index)
+            .unwrap_or(0)
+    }
+    /// Total number of segments in the root large-transfer, or 1 for a
+    /// non-segmented session.
+    pub fn segment_count(&self) -> u32 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.segment_count)
+            .unwrap_or(1)
+    }
+    /// Whether this session is a descriptor-v4 large-transfer child object.
+    pub fn is_segmented(&self) -> bool {
+        self.inner.segment_meta().is_some()
+    }
+
     /// Live stats as JSON: { bytes, frames, elapsed_ms, fps, throughput_bps }.
     pub fn stats_json(&self) -> String {
         let s = self.inner.stats();
@@ -441,7 +537,11 @@ impl ReceiverSessionWasm {
         let frame = match qr_protocol::Frame::from_bytes(frame_bytes) {
             Ok(f) => f,
             Err(e) => {
-                android_log_wasm(&format!("frame rejected (len={}): {:?}", frame_bytes.len(), e));
+                android_log_wasm(&format!(
+                    "frame rejected (len={}): {:?}",
+                    frame_bytes.len(),
+                    e
+                ));
                 return ingest_status::INGEST_ERROR;
             }
         };
@@ -540,6 +640,64 @@ impl ReceiverSessionWasm {
         self.inner.is_meta_confirmed()
     }
 
+    // ─── descriptor-v4 segment metadata (large-transfer child objects) ─────
+
+    /// 1 if the confirmed descriptor was a v4 large-transfer child object.
+    pub fn is_segmented(&self) -> bool {
+        self.inner.segment_meta().is_some()
+    }
+    /// Zero-based index of this segment within the root transfer, or 0 if not
+    /// segmented.
+    pub fn segment_index(&self) -> u32 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.segment_index)
+            .unwrap_or(0)
+    }
+    /// Total segment count of the root transfer, or 1 if not segmented.
+    pub fn segment_count(&self) -> u32 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.segment_count)
+            .unwrap_or(1)
+    }
+    /// Root (whole-file) original size in bytes, or 0 if not segmented.
+    pub fn root_original_size(&self) -> u64 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.root_original_size)
+            .unwrap_or(0)
+    }
+    /// Original (uncompressed) offset of this segment in the root file, or 0.
+    pub fn original_offset(&self) -> u64 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.original_offset)
+            .unwrap_or(0)
+    }
+    /// Root session id low 64 bits (whole transfer id), or 0 if not segmented.
+    pub fn root_session_id_lo(&self) -> u64 {
+        self.inner
+            .segment_meta()
+            .map(|s| s.root_session_id as u64)
+            .unwrap_or(0)
+    }
+    /// Root session id high 64 bits, or 0 if not segmented.
+    pub fn root_session_id_hi(&self) -> u64 {
+        self.inner
+            .segment_meta()
+            .map(|s| (s.root_session_id >> 64) as u64)
+            .unwrap_or(0)
+    }
+    /// SHA-256 of this segment's uncompressed bytes, or an empty vector for a
+    /// legacy non-segmented descriptor.
+    pub fn raw_sha256(&self) -> Vec<u8> {
+        self.inner
+            .segment_meta()
+            .map(|s| s.raw_sha256.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Reassemble the RaptorQ object bytes exactly as transmitted (trimmed to
     /// `compressed_size` when known), **without** applying decompression.
     ///
@@ -566,4 +724,3 @@ impl ReceiverSessionWasm {
         raw
     }
 }
-

@@ -26,6 +26,10 @@ import {
   Recovered,
   ParseError,
 } from "@/receive/parse"
+import {
+  storeVerifiedSegment,
+  type StoredSegmentTask,
+} from "@/receive/taskStore"
 
 /** ingest packed-status bit layout (mirror ingest_status.rs). */
 const STATUS_COMPLETE = 0x1n
@@ -40,6 +44,9 @@ interface MetaInfo {
   crc32: number
   crc32Known: boolean
   metaConfirmed: boolean
+  segmented: boolean
+  /** Canonical 128-bit root id (hex), present for descriptor-v4 segments. */
+  rootId?: string
 }
 
 /** Live session progress snapshot (mirrors progress_json fields). */
@@ -91,6 +98,13 @@ function dropSession(): void {
 }
 
 function readMeta(s: ReceiverSessionWasm): MetaInfo {
+  const segmented = s.is_segmented()
+  const rootId = segmented
+    ? `${s.root_session_id_hi().toString(16).padStart(16, "0")}${s
+        .root_session_id_lo()
+        .toString(16)
+        .padStart(16, "0")}`
+    : undefined
   return {
     fileName: s.file_name(),
     originalSize: Number(s.original_size()),
@@ -100,6 +114,8 @@ function readMeta(s: ReceiverSessionWasm): MetaInfo {
     crc32: s.crc32() >>> 0,
     crc32Known: s.crc32_known(),
     metaConfirmed: s.meta_confirmed(),
+    segmented,
+    rootId,
   }
 }
 
@@ -274,6 +290,103 @@ async function assembleAndRecover(jobId: number): Promise<{
   return { verify, recovered }
 }
 
+/**
+ * Handle a completed descriptor-v4 segment: verify it, then atomically publish
+ * the bytes + receipt ledger to IndexedDB. No root-sized Uint8Array is created;
+ * the UI streams completed tasks to a user-selected file when supported.
+ *
+ * Returns `null` while the transfer is still awaiting more segments.
+ */
+async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask | null> {
+  if (!session || !session.is_segmented()) return null
+  const seg = {
+    rootLo: session.root_session_id_lo(),
+    rootHi: session.root_session_id_hi(),
+    index: session.segment_index(),
+    count: session.segment_count(),
+    offset: Number(session.original_offset()),
+    rootOriginalSize: Number(session.root_original_size()),
+  }
+  const raw = session.assemble_raw()
+  if (raw.length === 0) {
+    throw new Error("分段恢复尚未完成或组装失败")
+  }
+  const meta = readMeta(session)
+  const verify = await decompressAndVerify(
+    raw,
+    meta.compression,
+    meta.originalSize,
+    meta.crc32,
+    meta.crc32Known
+  )
+  if (verify.bytes.length === 0) {
+    throw new Error("分段解压结果为空")
+  }
+  if (verify.crcKnown && !verify.crcOk) {
+    throw new Error(`分段 ${seg.index + 1}/${seg.count} CRC32 校验失败，已拒绝写入`)
+  }
+
+  // Descriptor v4 requires a SHA-256 over the uncompressed segment bytes.
+  const expectedSha = session.raw_sha256()
+  if (expectedSha.length !== 32) {
+    throw new Error("分段描述符缺少有效的 SHA-256")
+  }
+  const actualSha = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      verify.bytes.slice().buffer as ArrayBuffer
+    )
+  )
+  if (!actualSha.every((v, i) => v === expectedSha[i])) {
+    throw new Error(`分段 ${seg.index + 1}/${seg.count} SHA-256 校验失败，已拒绝写入`)
+  }
+
+  const expectedCount = Math.ceil(seg.rootOriginalSize / (8 * 1024 * 1024))
+  const expectedOffset = seg.index * 8 * 1024 * 1024
+  const expectedLength = Math.min(
+    8 * 1024 * 1024,
+    seg.rootOriginalSize - expectedOffset
+  )
+  if (
+    !Number.isSafeInteger(seg.rootOriginalSize) ||
+    seg.rootOriginalSize <= 0 ||
+    !Number.isInteger(seg.count) ||
+    seg.count <= 0 ||
+    seg.count > 131_072 ||
+    expectedCount !== seg.count ||
+    !Number.isInteger(seg.index) ||
+    seg.index < 0 ||
+    seg.index >= seg.count ||
+    !Number.isSafeInteger(seg.offset) ||
+    seg.offset !== expectedOffset ||
+    meta.originalSize !== expectedLength ||
+    verify.bytes.length !== expectedLength
+  ) {
+    throw new Error("分段描述符的段数、偏移或长度不一致")
+  }
+
+  const sha256Hex = Array.from(actualSha, (b) => b.toString(16).padStart(2, "0")).join("")
+  const { task } = await storeVerifiedSegment({
+    rootLo: seg.rootLo,
+    rootHi: seg.rootHi,
+    fileName: meta.fileName,
+    rootOriginalSize: seg.rootOriginalSize,
+    segmentCount: seg.count,
+    index: seg.index,
+    sha256Hex,
+    bytes: verify.bytes,
+  })
+  post({
+    type: "segment",
+    index: seg.index,
+    count: task.segmentCount,
+    received: task.received.length,
+    jobId,
+  })
+  dropSession()
+  return task.state === "complete" ? task : null
+}
+
 async function onMessage(e: MessageEvent): Promise<void> {
   const data = e.data
   if (!data || typeof data !== "object") return
@@ -334,7 +447,23 @@ async function onMessage(e: MessageEvent): Promise<void> {
 
   // ── assemble + recover ──
   if (data.type === "assemble") {
+    if (!session) return
+    const segmented = session.is_segmented()
     try {
+      if (segmented) {
+        // Large transfer: store this completed segment and, once all segments
+        // are in, merge and deliver the full root file.
+        const task = await handleSegmentComplete(activeJobId)
+        if (task) {
+          post({
+            type: "stored-result",
+            task,
+            jobId: activeJobId,
+          })
+        }
+        // else: awaiting more segments — main keeps scanning (status "segment").
+        return
+      }
       const { verify, recovered } = await assembleAndRecover(activeJobId)
       post({
         type: "result",
@@ -345,20 +474,31 @@ async function onMessage(e: MessageEvent): Promise<void> {
       })
     } catch (err) {
       post({
-        type: "error",
+        type: segmented ? "segment-error" : "error",
         message:
           err instanceof ParseError || err instanceof Error
             ? err.message
             : String(err),
         jobId: activeJobId,
       })
+      if (segmented) dropSession()
     }
     return
   }
 }
 
+// Serialize the async handler itself. `assemble` awaits decompression and hash
+// verification; without this queue, a later frame/reset message can mutate or
+// free the WASM session while that work is still in flight.
+let messageQueue = Promise.resolve()
 self.addEventListener("message", (e) => {
-  void onMessage(e).catch((err) => {
-    post({ type: "error", message: `receive worker 内部错误: ${String(err)}`, jobId: activeJobId })
-  })
+  messageQueue = messageQueue
+    .then(() => onMessage(e))
+    .catch((err) => {
+      post({
+        type: "error",
+        message: `receive worker 内部错误: ${String(err)}`,
+        jobId: activeJobId,
+      })
+    })
 })

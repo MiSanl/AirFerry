@@ -39,6 +39,10 @@ pub struct ReceiverSession {
     descriptor_seen: bool,
     /// File metadata learned from the descriptor frame (filename, size, CRC32).
     file_meta: crate::descriptor::FileMeta,
+    /// Descriptor-v4 large-transfer segment metadata, present only when the
+    /// confirmed descriptor was a v4 segmented child object. None for legacy
+    /// v1/v2/v3 descriptors.
+    segment_meta: Option<crate::segment::SegmentMeta>,
     received: Vec<HashSet<u32>>,
     /// Per-block count of distinct *source* symbols received (esi < K_block),
     /// maintained incrementally so [`refresh_decoded_counts`] is O(1)/frame
@@ -111,6 +115,7 @@ impl ReceiverSession {
             meta_confirmed,
             descriptor_seen: false,
             file_meta: crate::descriptor::FileMeta::default(),
+            segment_meta: None,
             received,
             source_recv,
             symbol_cache: HashMap::new(),
@@ -158,6 +163,12 @@ impl ReceiverSession {
         &self.file_meta
     }
 
+    /// Descriptor-v4 segment metadata, if the confirmed descriptor was a
+    /// large-transfer child object. None for legacy descriptors.
+    pub fn segment_meta(&self) -> Option<&crate::segment::SegmentMeta> {
+        self.segment_meta.as_ref()
+    }
+
     /// True once the authoritative OTI has been received via a descriptor frame.
     /// Before this, data frames are only buffered (not decoded).
     pub fn is_meta_confirmed(&self) -> bool {
@@ -192,12 +203,29 @@ impl ReceiverSession {
                 // controllable); invalid OTI/block params make raptorq panic
                 // (divide-by-zero / assert / slice OOB) or allocate gigabytes,
                 // and `panic = "abort"` would crash the whole receiver.
+                let total_symbols = info
+                    .meta
+                    .blocks
+                    .iter()
+                    .try_fold(0u32, |sum, block| sum.checked_add(block.num_source_symbols));
+                let frame_geometry_invalid = frame.header.symbol_size != info.meta.symbol_size
+                    || frame.header.total_blocks != info.meta.blocks.len() as u32
+                    || total_symbols != Some(frame.header.total_symbols);
+                let segment_invalid = info.segment.as_ref().is_some_and(|segment| {
+                    segment
+                        .validate(frame.header.session_id, &info.file_meta)
+                        .is_err()
+                });
                 let file_meta_invalid =
                     !qr_protocol::compress::is_known_compression_tag(info.file_meta.compression)
                         || info.file_meta.original_size > MAX_ORIGINAL_BYTES
                         || (info.file_meta.compressed_size_known
                             && info.file_meta.compressed_size > info.meta.transfer_length);
-                if info.meta.validate().is_err() || file_meta_invalid {
+                if info.meta.validate().is_err()
+                    || frame_geometry_invalid
+                    || file_meta_invalid
+                    || segment_invalid
+                {
                     self.progress.frames_corrupt += 1;
                     return Ok(self.is_complete());
                 }
@@ -206,7 +234,10 @@ impl ReceiverSession {
                 // one, then ignore mismatching repeats instead of resetting a
                 // live decoder or changing the filename/checksum at completion.
                 if self.descriptor_seen {
-                    if self.meta.as_ref() != Some(&info.meta) || self.file_meta != info.file_meta {
+                    if self.meta.as_ref() != Some(&info.meta)
+                        || self.file_meta != info.file_meta
+                        || self.segment_meta != info.segment
+                    {
                         self.progress.frames_corrupt += 1;
                     }
                     return Ok(self.is_complete());
@@ -227,6 +258,7 @@ impl ReceiverSession {
                 // doesn't grow unboundedly for the rest of the transfer.
                 self.symbol_cache.clear();
                 self.file_meta = info.file_meta;
+                self.segment_meta = info.segment;
             } else {
                 // Descriptor flag set but payload is not a parseable descriptor
                 // (truncated extension, bad magic inside payload, etc.). Count as
@@ -459,8 +491,7 @@ impl ReceiverSession {
             // The cap is MAX_ORIGINAL_BYTES (not MAX_OBJECT_BYTES) so a highly
             // compressible object can legitimately expand well beyond the wire
             // (transfer_length) ceiling yet still be recovered.
-            let max_decompressed_bytes =
-                usize::try_from(MAX_ORIGINAL_BYTES).unwrap_or(usize::MAX);
+            let max_decompressed_bytes = usize::try_from(MAX_ORIGINAL_BYTES).unwrap_or(usize::MAX);
             let cap = if self.file_meta.original_size > 0 {
                 let expected = usize::try_from(self.file_meta.original_size).map_err(|_| {
                     Error::Compress("descriptor original_size does not fit this platform".into())
@@ -521,10 +552,13 @@ impl ReceiverSession {
     /// Serialize checkpoint state for resume after a restart.
     ///
     /// Returns `None` until authoritative [`ObjectMeta`] is known (descriptor
-    /// confirmed). Persisted symbols are taken from the replay cache and from
-    /// in-flight storage only — symbols already fed to the decoder are not
-    /// re-exported as bytes, so a mid-transfer snapshot after long progress may
-    /// require the sender to retransmit repair symbols (fountain code).
+    /// confirmed). Persisted symbols are taken from replayable storage only.
+    /// Symbols already fed to the decoder are not re-exported as bytes, so a
+    /// mid-transfer snapshot after descriptor confirmation normally resumes the
+    /// current object from zero and relies on the sender's fresh repair stream.
+    /// The `received` sets deliberately contain only ESIs with replayable
+    /// payloads; otherwise restored frames would be rejected as duplicates
+    /// without ever reaching the fresh decoder.
     pub fn save_state(&self) -> Option<crate::ResumeState> {
         let meta = self.meta.as_ref()?.clone();
         let symbols: Vec<(u32, u32, Vec<u8>)> = self
@@ -532,10 +566,16 @@ impl ReceiverSession {
             .iter()
             .map(|((sbn, esi), data)| (*sbn, *esi, data.clone()))
             .collect();
+        let mut received = vec![HashSet::new(); meta.blocks.len()];
+        for (sbn, esi, _) in &symbols {
+            if let Some(set) = received.get_mut(*sbn as usize) {
+                set.insert(*esi);
+            }
+        }
         Some(crate::ResumeState {
             session_id: self.session_id,
             meta,
-            received: self.received.clone(),
+            received,
             symbols,
         })
     }
@@ -543,8 +583,9 @@ impl ReceiverSession {
     /// Restore a receiver from a [`crate::ResumeState`] snapshot.
     ///
     /// Rebuilds the decoder from stored metadata and replays any persisted symbol
-    /// payloads. Received ESI sets from the snapshot are merged as symbols are
-    /// replayed.
+    /// payloads. Historical checkpoints may contain received-ESI claims without
+    /// the corresponding payload; those claims are intentionally ignored so a
+    /// retransmitted frame can still enter the fresh decoder.
     pub fn restore(state: crate::ResumeState) -> Result<Self> {
         state.validate().map_err(Error::InvalidResume)?;
         let mut rx = Self::new_confirmed(state.session_id, state.meta)?;
@@ -566,16 +607,6 @@ impl ReceiverSession {
                     // an individual upstream rejection must not discard the
                     // rest of an otherwise usable checkpoint.
                     let _ = dec.add_symbol(&symbol);
-                }
-            }
-        }
-        // Merge stored received sets (ESIs we knew about but may lack payloads).
-        for (i, set) in state.received.into_iter().enumerate() {
-            if i < rx.received.len() {
-                for esi in set {
-                    if esi < (1 << 24) {
-                        rx.received[i].insert(esi);
-                    }
                 }
             }
         }
@@ -923,6 +954,41 @@ mod tests {
         let _ = rx.ingest(dup).unwrap();
         assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
         assert!(rx.progress().frames_duplicate > dup_before);
+    }
+
+    #[test]
+    fn restore_ignores_received_esi_without_replayable_payload() {
+        let data = payload(20_000);
+        let sid = SessionId::derive("resume-honest", data.len() as u64, 0, &[]);
+        let mut sender = SenderSession::new(
+            &data,
+            sid,
+            SenderConfig::default(),
+            crate::descriptor::FileMeta::default(),
+        )
+        .unwrap();
+        let meta = sender.meta().clone();
+        let mut claimed = vec![HashSet::new(); meta.blocks.len()];
+        claimed[0].insert(0);
+        let state = crate::ResumeState {
+            session_id: sid.into(),
+            meta,
+            received: claimed,
+            symbols: Vec::new(),
+        };
+
+        let mut restored = ReceiverSession::restore(state).unwrap();
+        assert_eq!(restored.progress().received_symbols, 0);
+
+        let first_data = loop {
+            let frame = sender.next_frame().unwrap();
+            if frame.header.flags & qr_protocol::frame::FLAG_DESCRIPTOR == 0 {
+                break frame;
+            }
+        };
+        restored.ingest(first_data).unwrap();
+        assert_eq!(restored.progress().received_symbols, 1);
+        assert_eq!(restored.progress().frames_duplicate, 0);
     }
 
     /// A data frame whose ESI exceeds RFC 6330's 24-bit space (which would panic

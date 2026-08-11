@@ -324,6 +324,148 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCrc3
     session.file_meta().crc32_known as jint
 }
 
+// ===== descriptor-v4 segment metadata accessors =====
+// Kotlin reads these after a descriptor frame arrives to detect a large-transfer
+// child object and to drive the per-segment `.partial` writer. All mirror the
+// WASM `ReceiverSessionWasm` getters (wasm.rs) and read `session.segment_meta()`.
+
+/// 1 if the confirmed descriptor was a v4 large-transfer child object, else 0.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverIsSegmented(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session.segment_meta().is_some() as jint
+}
+
+/// Zero-based index of this segment within the root transfer (0 if not segmented).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverSegmentIndex(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| s.segment_index as jint)
+        .unwrap_or(0)
+}
+
+/// Total segment count of the root transfer (1 if not segmented).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverSegmentCount(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| s.segment_count as jint)
+        .unwrap_or(1)
+}
+
+/// Root (whole-file) original size in bytes (0 if not segmented).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRootOriginalSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| s.root_original_size as jlong)
+        .unwrap_or(0)
+}
+
+/// Original (uncompressed) offset of this segment in the root file (0 if not segmented).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverOriginalOffset(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| s.original_offset as jlong)
+        .unwrap_or(0)
+}
+
+/// Root session id low 64 bits (whole transfer id), or 0 if not segmented.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRootSessionIdLo(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| (s.root_session_id as u64) as jlong)
+        .unwrap_or(0)
+}
+
+/// Root session id high 64 bits, or 0 if not segmented.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRootSessionIdHi(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session
+        .segment_meta()
+        .map(|s| (s.root_session_id >> 64) as jlong)
+        .unwrap_or(0)
+}
+
+/// SHA-256 (raw 32 bytes) of this segment's uncompressed bytes, or empty if not
+/// segmented.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverRawSha256(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jbyteArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    match session.segment_meta() {
+        Some(s) => match env.byte_array_from_slice(&s.raw_sha256) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Last [`ReceiverSession::assemble_result`] error message, or empty if none.
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLastAssembleError(

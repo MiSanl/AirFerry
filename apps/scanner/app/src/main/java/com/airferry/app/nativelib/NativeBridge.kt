@@ -75,4 +75,30 @@ object NativeBridge {
      * files as "unverified".
      */
     external fun receiverCrc32Known(handle: Long): Int
+
+    // ---- descriptor-v4 segment metadata (large-transfer child objects) ----
+
+    /** 1 if the confirmed descriptor was a v4 large-transfer child object. */
+    external fun receiverIsSegmented(handle: Long): Int
+
+    /** Zero-based index of this segment within the root transfer (0 if not segmented). */
+    external fun receiverSegmentIndex(handle: Long): Int
+
+    /** Total segment count of the root transfer (1 if not segmented). */
+    external fun receiverSegmentCount(handle: Long): Int
+
+    /** Root (whole-file) original size in bytes (0 if not segmented). */
+    external fun receiverRootOriginalSize(handle: Long): Long
+
+    /** Original (uncompressed) offset of this segment in the root file (0 if not segmented). */
+    external fun receiverOriginalOffset(handle: Long): Long
+
+    /** Root session id low 64 bits (whole transfer id), or 0 if not segmented. */
+    external fun receiverRootSessionIdLo(handle: Long): Long
+
+    /** Root session id high 64 bits, or 0 if not segmented. */
+    external fun receiverRootSessionIdHi(handle: Long): Long
+
+    /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes, or null if not segmented. */
+    external fun receiverRawSha256(handle: Long): ByteArray?
 }

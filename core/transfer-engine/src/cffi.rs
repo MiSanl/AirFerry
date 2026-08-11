@@ -305,6 +305,157 @@ pub unsafe extern "C" fn airferry_receiver_crc32_known(handle: *const ReceiverSe
     session.file_meta().crc32_known as i32
 }
 
+// ─── descriptor-v4 segment metadata getters ───────────────────────────────
+// A large transfer is split into independent child sessions (one per segment).
+// These getters let a host detect that the confirmed descriptor is a v4
+// segment and drive a disk-backed `.partial` writer. All mirror the JNI and
+// WASM bindings and read `session.segment_meta()`.
+
+/// Return 1 if the confirmed descriptor was a v4 large-transfer child object,
+/// else 0.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_is_segmented(handle: *const ReceiverSession) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.segment_meta().is_some() as i32
+}
+
+/// Zero-based index of this segment within the root transfer (0 if not segmented).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_segment_index(handle: *const ReceiverSession) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.segment_meta().map(|s| s.segment_index).unwrap_or(0)
+}
+
+/// Total segment count of the root transfer (1 if not segmented).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_segment_count(handle: *const ReceiverSession) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.segment_meta().map(|s| s.segment_count).unwrap_or(1)
+}
+
+/// Root (whole-file) original size in bytes (0 if not segmented).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_root_original_size(
+    handle: *const ReceiverSession,
+) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session
+        .segment_meta()
+        .map(|s| s.root_original_size)
+        .unwrap_or(0)
+}
+
+/// Original (uncompressed) offset of this segment in the root file (0 if not
+/// segmented).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_original_offset(handle: *const ReceiverSession) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session
+        .segment_meta()
+        .map(|s| s.original_offset)
+        .unwrap_or(0)
+}
+
+/// Root session id low 64 bits (whole transfer id), or 0 if not segmented.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_root_session_id_lo(
+    handle: *const ReceiverSession,
+) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session
+        .segment_meta()
+        .map(|s| s.root_session_id as u64)
+        .unwrap_or(0)
+}
+
+/// Root session id high 64 bits, or 0 if not segmented.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_root_session_id_hi(
+    handle: *const ReceiverSession,
+) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session
+        .segment_meta()
+        .map(|s| (s.root_session_id >> 64) as u64)
+        .unwrap_or(0)
+}
+
+/// Copy the 32-byte SHA-256 of this segment's uncompressed bytes into `out`.
+///
+/// Returns the number of bytes that *would* be written (32), mirroring the
+/// two-pass length protocol used by `airferry_receiver_file_name`. If `out` is
+/// null or `cap < 32`, nothing is written and 32 is returned. Returns 0 if the
+/// confirmed descriptor is not a v4 segment.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally
+/// serialized; `out[..cap]` must be writable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_raw_sha256(
+    handle: *const ReceiverSession,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    match session.segment_meta() {
+        None => 0,
+        Some(seg) => {
+            const N: usize = 32;
+            if out.is_null() || cap < N {
+                return N;
+            }
+            // SAFETY: caller guarantees `out[..cap]` writable and `cap >= N`.
+            unsafe { std::ptr::copy_nonoverlapping(seg.raw_sha256.as_ptr(), out, N) };
+            N
+        }
+    }
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 /// Write `s` as a NUL-terminated byte sequence into `out[..cap]`. If `out` is
@@ -364,7 +515,10 @@ mod tests {
         // the C ABI still references the same shared symbol (no local copy
         // silently drifted back in).
         assert_eq!(ingest_status::INGEST_ERROR, 0xFFFF_FFFFu64 << 32);
-        assert_eq!(ingest_status::pack(true, true, 0x1234, 0x5678), 0b11 | (0x1234u64 << 8) | (0x5678u64 << 32));
+        assert_eq!(
+            ingest_status::pack(true, true, 0x1234, 0x5678),
+            0b11 | (0x1234u64 << 8) | (0x5678u64 << 32)
+        );
     }
 
     #[test]

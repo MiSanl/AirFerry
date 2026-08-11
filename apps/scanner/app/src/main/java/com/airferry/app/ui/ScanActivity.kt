@@ -72,6 +72,11 @@ class ScanActivity : ComponentActivity() {
     /** Parallel QR decode pool (capture → queue → N workers → serialized ingest). */
     private var decodePool: QrDecodePool? = null
 
+    /** Disk-backed assembler for a descriptor-v4 large transfer (null = none in progress). */
+    private var segAssembler: com.airferry.app.scan.SegmentAssembler? = null
+    /** Optional task selected from history; unrelated roots are ignored. */
+    private var resumeRootId: String? = null
+
     /**
      * Sliding-window rate samples for the UI.
      * Prefer the last [RATE_WINDOW_MS] over whole-session averages so the user
@@ -132,6 +137,9 @@ class ScanActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        resumeRootId = intent.getStringExtra("RESUME_ROOT_ID")
+            ?.lowercase()
+            ?.takeIf { id -> id.length == 32 && id.all { it in '0'..'9' || it in 'a'..'f' } }
 
         // Keep the screen on for the whole scan session. Transfers can run for
         // many minutes; without this the system timeout dims/locks the screen,
@@ -149,7 +157,12 @@ class ScanActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "JNI self-test FAILED", e); false
         }
-        updateUi { it.copy(jniReady = jniOk, statusText = if (jniOk) "就绪 — 对准二维码…" else "JNI 加载失败") }
+        updateUi {
+            it.copy(
+                jniReady = jniOk,
+                statusText = if (!jniOk) "JNI 加载失败" else idleStatus(),
+            )
+        }
         if (!jniOk) {
             setContent { ErrorScreen("原生库加载失败，请重新安装应用。") }
             return
@@ -656,6 +669,7 @@ class ScanActivity : ComponentActivity() {
                     intent?.let { runOnUiThread { startActivity(it) } }
                 } catch (e: Exception) {
                     clearRecoveryStage()
+                    resetReceiverAfterRecoveryFailure()
                     runOnUiThread {
                         Toast.makeText(
                             this,
@@ -671,6 +685,7 @@ class ScanActivity : ComponentActivity() {
                     // user can reopen the file from the list.
                     android.util.Log.e("ScanActivity", "recoverAndStage OOM", e)
                     clearRecoveryStage()
+                    resetReceiverAfterRecoveryFailure()
                     runOnUiThread {
                         Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
                     }
@@ -694,7 +709,24 @@ class ScanActivity : ComponentActivity() {
                 runOnUiThread {
                     Toast.makeText(this, "恢复失败: $detail", Toast.LENGTH_LONG).show()
                 }
+                // A completed-but-unassemblable child must not leave the
+                // scanner permanently stopped. Keep durable earlier segments
+                // and accept a fresh scan immediately.
+                swapReceiverForNextSegment()
             }
+            return null
+        }
+        // Descriptor-v4 large transfer: store this segment into the disk-backed
+        // assembler. Returns an Intent only when every segment has arrived.
+        if (session.isSegmented()) {
+            return handleSegmentedTransfer(displayName, fileBytes)
+        }
+        if (resumeRootId != null) {
+            clearRecoveryStage()
+            runOnUiThread {
+                updateUi { it.copy(statusText = "已忽略其他传输，继续等待选中的恢复任务…") }
+            }
+            swapReceiverForNextSegment()
             return null
         }
         val originalSize = session.fileSize()
@@ -856,7 +888,212 @@ class ScanActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Store one recovered descriptor-v4 segment into the disk-backed assembler.
+     *
+     * Returns an Intent (navigates to the detail page) only once every segment
+     * of the root transfer has arrived and been merged; otherwise null (the
+     * receiver keeps scanning for the next segment).
+     */
+    private fun handleSegmentedTransfer(displayName: String, fileBytes: ByteArray): Intent? {
+        val index = session.segmentIndex()
+        val count = session.segmentCount()
+        val rootSize = session.rootOriginalSize()
+        val lo = session.rootSessionIdLo()
+        val hi = session.rootSessionIdHi()
+        val segSize = session.fileSize()
+        val originalOffset = session.originalOffset()
+        val expectedSha256 = requireNotNull(session.rawSha256()) {
+            "分段描述符缺少 SHA-256"
+        }
+
+        require(count in 1..com.airferry.app.scan.SegmentAssembler.MAX_SEGMENT_COUNT) {
+            "分段数量超出安全上限"
+        }
+        require(rootSize > 0 && originalOffset == index.toLong() *
+            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES) {
+            "分段偏移或根文件大小无效"
+        }
+        require(segSize in 1..com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES) {
+            "分段长度无效"
+        }
+        require(fileBytes.size.toLong() == segSize) {
+            "分段实际长度 ${fileBytes.size} 与描述符 $segSize 不一致"
+        }
+        require(expectedSha256.size == 32) { "分段描述符 SHA-256 长度无效" }
+        val expectedCount = (rootSize - 1) /
+            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES + 1
+        val expectedLength = minOf(
+            com.airferry.app.scan.SegmentAssembler.SEGMENT_RAW_BYTES,
+            rootSize - originalOffset,
+        )
+        require(index in 0 until count && count.toLong() == expectedCount && segSize == expectedLength) {
+            "分段数量或本段长度与根文件不一致"
+        }
+
+        val actualRootId = rootSessionIdHex(lo, hi)
+        val targetRootId = resumeRootId
+        if (targetRootId != null && actualRootId != targetRootId) {
+            clearRecoveryStage()
+            runOnUiThread {
+                Toast.makeText(this, "已忽略其他大文件任务", Toast.LENGTH_SHORT).show()
+                updateUi { it.copy(statusText = "继续等待选中任务的下一段…") }
+            }
+            swapReceiverForNextSegment()
+            return null
+        }
+
+        if (session.crc32Known()) {
+            val actualCrc = crc32OfBytes(fileBytes)
+            require(actualCrc == session.crc32()) {
+                "分段 ${index + 1}/$count CRC32 校验失败"
+            }
+        }
+
+        val root = com.airferry.app.scan.ContentStore.root(this)
+        // Reuse the active root so a long, sequential transfer does not reopen
+        // the ledger and re-hash every earlier 8 MiB segment for each child.
+        // Interleaved roots still open their own identity-bound assembler.
+        val active = segAssembler
+        val asm = if (active != null && active.matches(lo, hi, count, rootSize, displayName)) {
+            active
+        } else {
+            com.airferry.app.scan.SegmentAssembler.open(
+                root, lo, hi, count, rootSize, displayName
+            ).also { segAssembler = it }
+        }
+
+        // Crash recovery: all segments may already be durable while promotion
+        // into ContentStore was interrupted. Re-run the idempotent promotion.
+        if (asm.isComplete()) {
+            return archiveSegmentedTransfer(asm, displayName, rootSize)
+        }
+
+        // Out-of-order delivery: a segment may already be stored.
+        if (asm.hasSegment(index)) {
+            updateSegmentedProgress(asm)
+            clearRecoveryStage()
+            swapReceiverForNextSegment()
+            return null
+        }
+        try {
+            asm.storeSegment(index, fileBytes, expectedSha256)
+        } catch (e: Exception) {
+            runOnUiThread {
+                Toast.makeText(this, "分段写入失败: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+            clearRecoveryStage()
+            // Keep already-verified segments. A bad/current segment can simply
+            // be scanned again; deleting the entire task would make resume lie.
+            swapReceiverForNextSegment()
+            return null
+        }
+
+        if (!asm.isComplete()) {
+            updateSegmentedProgress(asm)
+            clearRecoveryStage()
+            // Keep scanning for the remaining segments.
+            swapReceiverForNextSegment()
+            return null
+        }
+
+        return archiveSegmentedTransfer(asm, displayName, rootSize)
+    }
+
+    private fun archiveSegmentedTransfer(
+        asm: com.airferry.app.scan.SegmentAssembler,
+        displayName: String,
+        rootSize: Long,
+    ): Intent? {
+        val finalFile = asm.finish()
+            ?: throw IllegalStateException("分段账本已完成，但临时文件缺失或损坏")
+        val put = com.airferry.app.scan.ContentStore.putFile(
+            this, displayName, finalFile,
+            crcHex = "unknown", crcUnknown = true, kind = "file",
+        )
+        // ContentStore index is now durable; the resumable task can be removed.
+        asm.commitArchived()
+        segAssembler = null
+        resumeRootId = null
+        clearRecoveryStage()
+        return Intent(this, ReceiveDetailActivity::class.java).apply {
+            putExtra("FILE_PATH", put.path.absolutePath)
+            putExtra("FILE_SIZE", rootSize)
+            putExtra("FILE_NAME", displayName)
+            putExtra("ENTRY_ID", put.entry.id)
+            putExtra("RESAVE", true)
+        }
+    }
+
+    /** Update the UI progress with how many segments have been stored. */
+    private fun updateSegmentedProgress(asm: com.airferry.app.scan.SegmentAssembler) {
+        val received = asm.receivedCount()
+        val totalSeg = asm.segmentCount()
+        runOnUiThread {
+            val s = "分段 $received/$totalSeg 已收，继续扫描下一段…"
+            Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+            updateUi { it.copy(statusText = s) }
+        }
+    }
+
+    /**
+     * Swap the receiver to a fresh session for the *next* descriptor-v4 segment.
+     *
+     * Called from `recoverAndStage` which runs *inside* the decode pool's ingest
+     * lock, so we must NOT re-acquire it (`resetSession()` would deadlock).
+     * `ingestStopped` is cleared so the capture loop keeps feeding frames.
+     */
+    private fun swapReceiverForNextSegment() {
+        session.destroy()
+        session = ReceiverSessionManager()
+        ingestStopped.set(false)
+        completedHandled = false
+        lastUiUpdate = 0
+        rateSamples.clear()
+        runOnUiThread {
+            updateUi {
+                it.copy(
+                    complete = false,
+                    progressPct = 0,
+                    receivedSymbols = 0,
+                    totalSymbols = 0,
+                    decodedBlocks = 0,
+                    totalBlocks = 0,
+                )
+            }
+        }
+    }
+
+    /** Recover from any post-decode failure without stranding the scanner in
+     * `completedHandled=true` / `ingestStopped=true`. */
+    private fun resetReceiverAfterRecoveryFailure() {
+        val swap = {
+            session.destroy()
+            session = ReceiverSessionManager()
+            ingestStopped.set(false)
+            completedHandled = false
+            lastUiUpdate = 0
+            rateSamples.clear()
+        }
+        try {
+            decodePool?.runExclusive(swap) ?: swap()
+        } catch (resetError: Exception) {
+            Log.e(TAG, "failed to reset receiver after recovery error", resetError)
+        }
+    }
+
+    private fun rootSessionIdHex(lo: Long, hi: Long): String {
+        val low = java.lang.Long.toUnsignedString(lo, 16).padStart(16, '0')
+        val high = java.lang.Long.toUnsignedString(hi, 16).padStart(16, '0')
+        return "$high$low"
+    }
+
+    private fun idleStatus(): String = resumeRootId?.let {
+        "继续恢复任务 ${it.take(8)}… — 对准对应分段二维码"
+    } ?: "就绪 — 对准二维码…"
+
     private fun resetSession() {
+        segAssembler = null
         // Swap the receiver under the pool's ingest lock so no worker is mid-ingest
         // while we destroy the old native handle.
         val swap = {
@@ -873,7 +1110,7 @@ class ScanActivity : ComponentActivity() {
         transferStartMs = 0L
         recoveryStage.value = null
         updateUi {
-            UiState(jniReady = true, statusText = "就绪 — 对准二维码…")
+            UiState(jniReady = true, statusText = idleStatus())
         }
     }
 
@@ -914,7 +1151,7 @@ class ScanActivity : ComponentActivity() {
             recentWireBps = 0L
             transferStartMs = 0L
             recoveryStage.value = null
-            updateUi { UiState(jniReady = true, statusText = "就绪 — 对准二维码…") }
+            updateUi { UiState(jniReady = true, statusText = idleStatus()) }
         }
     }
 

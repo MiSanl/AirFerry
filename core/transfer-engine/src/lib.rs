@@ -9,8 +9,10 @@
 //!   space is exhausted so a receiver can rejoin at any practical time.
 //! - [`ReceiverSession`] ingests decoded QR payloads as frames, feeds the
 //!   RaptorQ decoder, tracks per-block progress, and reassembles the file once
-//!   complete. Checkpoint via [`ReceiverSession::save_state`] /
-//!   [`ReceiverSession::restore`] and [`ResumeState`] (JSON when `serde` is on).
+//!   complete. Bounded checkpoint metadata is available via
+//!   [`ReceiverSession::save_state`] / [`ReceiverSession::restore`] and
+//!   [`ResumeState`] (JSON when `serde` is on); only retained symbol payloads
+//!   can be replayed into a fresh decoder.
 //!
 //! Compression is intentionally **outside** this engine: the caller compresses
 //! with Zstd (native/Android via `qr-protocol`, or JS-side on the browser) and
@@ -23,11 +25,13 @@
     forbid(unsafe_code)
 )]
 
+pub mod assembler;
 pub mod descriptor;
 pub mod ingest_status;
 pub mod progress;
 pub mod receiver;
 pub mod resume;
+pub mod segment;
 pub mod sender;
 pub mod time;
 
@@ -49,10 +53,12 @@ pub mod wasm;
 #[cfg(feature = "cffi")]
 pub mod cffi;
 
+pub use assembler::TransferAssembler;
 pub use descriptor::{DescriptorInfo, FileMeta};
 pub use progress::{Progress, Stats};
 pub use receiver::ReceiverSession;
 pub use resume::ResumeState;
+pub use segment::{SegmentMeta, MAX_SEGMENT_COUNT, SEGMENT_RAW_BYTES};
 pub use sender::{SenderConfig, SenderSession};
 
 // Re-export the wire-frame helpers so downstream code (tests, JNI host, the
@@ -90,6 +96,8 @@ pub enum Error {
     SymbolIdSpaceExhausted,
     #[error("invalid resume state: {0}")]
     InvalidResume(&'static str),
+    #[error("invalid large-transfer segment: {0}")]
+    InvalidSegment(&'static str),
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;

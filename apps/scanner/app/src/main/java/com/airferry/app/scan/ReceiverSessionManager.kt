@@ -240,6 +240,40 @@ class ReceiverSessionManager {
     fun crc32Known(): Boolean =
         if (initialized) NativeBridge.receiverCrc32Known(handle) == 1 else false
 
+    // ---- descriptor-v4 segment metadata (large-transfer child objects) ----
+
+    /** 1 if the confirmed descriptor was a v4 large-transfer child object. */
+    fun isSegmented(): Boolean =
+        if (initialized) NativeBridge.receiverIsSegmented(handle) == 1 else false
+
+    /** Zero-based index of this segment within the root transfer (0 if not segmented). */
+    fun segmentIndex(): Int =
+        if (initialized) NativeBridge.receiverSegmentIndex(handle) else 0
+
+    /** Total segment count of the root transfer (1 if not segmented). */
+    fun segmentCount(): Int =
+        if (initialized) NativeBridge.receiverSegmentCount(handle) else 1
+
+    /** Root (whole-file) original size in bytes (0 if not segmented). */
+    fun rootOriginalSize(): Long =
+        if (initialized) NativeBridge.receiverRootOriginalSize(handle) else 0L
+
+    /** Original (uncompressed) offset of this segment in the root file (0 if not segmented). */
+    fun originalOffset(): Long =
+        if (initialized) NativeBridge.receiverOriginalOffset(handle) else 0L
+
+    /** Root session id low 64 bits (whole transfer id), or 0 if not segmented. */
+    fun rootSessionIdLo(): Long =
+        if (initialized) NativeBridge.receiverRootSessionIdLo(handle) else 0L
+
+    /** Root session id high 64 bits, or 0 if not segmented. */
+    fun rootSessionIdHi(): Long =
+        if (initialized) NativeBridge.receiverRootSessionIdHi(handle) else 0L
+
+    /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes, or null. */
+    fun rawSha256(): ByteArray? =
+        if (initialized) NativeBridge.receiverRawSha256(handle) else null
+
     /** Recover the assembled file bytes, or null if not complete / on failure. */
     fun assemble(): ByteArray? {
         if (!initialized) return null

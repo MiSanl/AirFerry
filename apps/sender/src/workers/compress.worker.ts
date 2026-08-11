@@ -29,6 +29,9 @@
  *   { jobId: number, text: string, name?: string }
  *       — pure text item. Wrapped in ETTEXTv1; optional `name` becomes the
  *         descriptor filename (default "文字消息.txt", normalized to *.txt).
+ *   { type: "prepare-segment", jobId, file, segmentIndex,
+ *     rootSessionId, segmentCount }
+ *       — prepare exactly one later large-file segment on demand.
  *
  * `jobId` is the main-thread compress epoch. Stale jobs are ignored so list
  * edits / "back to select" do not apply late results (CPU may still finish the
@@ -55,6 +58,12 @@
 import { preparePayload, initZstdFromBytes } from "@/wasm/compress"
 import { crc32 } from "@/wasm/crc32"
 import { contentFingerprint, deriveSessionId } from "@/wasm/session"
+import {
+  deriveSegmentId,
+  segmentCountFor,
+  SEGMENT_RAW_BYTES,
+  sliceSegment
+} from "@/wasm/segment"
 import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
@@ -70,13 +79,48 @@ export interface CompressResult {
   phase: "done"
   /** Main-thread compress epoch that issued this job. */
   jobId: number
-  /** Compressed payload, transferred back (detached from this thread). */
+  /** True when the payload was split into descriptor-v4 segments. */
+  needsSegmentation: boolean
+  /**
+   * Single-object transfer (non-segmented). Present when
+   * `needsSegmentation` is false.
+   */
   compressed: ArrayBuffer
   algorithm: number
   originalSize: number
   compressedSize: number
   preCrc32: number
   sessionId: SessionIdDto
+  displayName: string
+  /**
+   * Large-transfer segment list. The initial `done` contains segment zero
+   * only; later segments arrive via `segment-done`, keeping memory bounded.
+   */
+  rootSessionId: SessionIdDto
+  segmentCount: number
+  rootOriginalSize: number
+  rootDisplayName: string
+  segments: SegmentSpec[]
+}
+
+/** One descriptor-v4 large-transfer segment produced by the worker. */
+export interface SegmentSpec {
+  /** Compressed payload for this segment (transferable). */
+  compressed: ArrayBuffer
+  algorithm: number
+  /** Raw (uncompressed) length of this segment (≤ 8 MiB). */
+  originalSize: number
+  compressedSize: number
+  /** CRC32 over this segment's raw bytes. */
+  preCrc32: number
+  segmentIndex: number
+  segmentCount: number
+  originalOffset: number
+  rootOriginalSize: number
+  rootSessionId: SessionIdDto
+  childSessionId: SessionIdDto
+  /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
+  rawSha256: ArrayBuffer
   displayName: string
 }
 
@@ -86,11 +130,20 @@ export type CompressPhase = "reading" | "bundling" | "zstd" | "xz" | "finalizing
 export type WorkerMessage =
   | { phase: CompressPhase; jobId?: number }
   | CompressResult
+  | { phase: "segment-done"; jobId: number; segment: SegmentSpec }
   | { phase: "error"; message: string; jobId?: number }
 
 type PendingJob =
   | { kind: "files"; jobId: number; files: File[] }
   | { kind: "text"; jobId: number; text: string; name?: string }
+  | {
+      kind: "segment"
+      jobId: number
+      file: File
+      segmentIndex: number
+      rootSessionId: SessionIdDto
+      segmentCount: number
+    }
 
 /** Latest pending request while the worker is still waiting for first init. */
 let pendingJob: PendingJob | null = null
@@ -111,6 +164,14 @@ self.onmessage = async (
     | { jobId?: number; files: File[] }
     | { jobId?: number; text: string; name?: string }
     | { type: "wasm-init"; zstd?: ArrayBuffer | null }
+    | {
+        type: "prepare-segment"
+        jobId: number
+        file: File
+        segmentIndex: number
+        rootSessionId: SessionIdDto
+        segmentCount: number
+      }
   >
 ) => {
   const data = e.data
@@ -137,6 +198,18 @@ self.onmessage = async (
     typeof (data as { jobId?: number }).jobId === "number"
       ? (data as { jobId: number }).jobId
       : 0
+
+  if ("type" in data && data.type === "prepare-segment") {
+    enqueueOrRun({
+      kind: "segment",
+      jobId,
+      file: data.file,
+      segmentIndex: data.segmentIndex,
+      rootSessionId: data.rootSessionId,
+      segmentCount: data.segmentCount,
+    })
+    return
+  }
 
   if ("text" in data && typeof (data as { text?: unknown }).text === "string") {
     const text = (data as { text: string; name?: string }).text
@@ -189,8 +262,10 @@ async function runJob(job: PendingJob): Promise<void> {
   try {
     if (job.kind === "files") {
       await processFiles(job.files, job.jobId)
-    } else {
+    } else if (job.kind === "text") {
       await processText(job.text, job.name, job.jobId)
+    } else {
+      await processRequestedSegment(job)
     }
   } finally {
     busy = false
@@ -235,11 +310,19 @@ async function processFiles(files: File[], jobId: number) {
       const namesJoined = files.map((f) => f.name).join("\u0001")
       sessionId = deriveSessionId(namesJoined, BigInt(raw.length), BigInt(mtimeMax), fp)
     } else {
-      raw = new Uint8Array(await files[0].arrayBuffer())
-      if (!isCurrent(jobId)) return
-      displayName = files[0].name
-      const fp = computeFingerprint(raw)
       const f = files[0]
+      // Large file (> 32 MiB raw): cannot fit a single RaptorQ object, so split
+      // it into 8 MiB raw segments and compress each independently. The whole
+      // file is never materialised in one buffer — each segment is streamed via
+      // File.slice.
+      if (f.size > MAX_TRANSFER_BYTES) {
+        await processSegmentedFile(f, jobId)
+        return
+      }
+      raw = new Uint8Array(await f.arrayBuffer())
+      if (!isCurrent(jobId)) return
+      displayName = f.name
+      const fp = computeFingerprint(raw)
       sessionId = deriveSessionId(f.name, BigInt(f.size), BigInt(f.lastModified), fp)
     }
 
@@ -279,6 +362,187 @@ async function processText(text: string, name: string | undefined, jobId: number
     if (!isCurrent(jobId)) return
     post({ phase: "error", message: (err as Error)?.message || String(err), jobId })
   }
+}
+
+/**
+ * Large-transfer segmentation for a single file whose raw size exceeds the
+ * 32 MiB wire ceiling.
+ *
+ * The file is split into fixed `SEGMENT_RAW_BYTES` (8 MiB) raw segments; each
+ * segment is independently compressed (zstd/xz via `preparePayload`), CRC32'd,
+ * SHA-256'd, and wrapped in a descriptor-v4 `SegmentMeta`. Segment zero is
+ * returned initially; the main thread requests later segments on demand.
+ *
+ * Memory is bounded to ~2× one segment (slice + its compressed output), never
+ * the whole file.
+ */
+async function processSegmentedFile(file: File, jobId: number) {
+  if (!isCurrent(jobId)) return
+  post({ phase: "reading", jobId })
+  const count = segmentCountFor(file.size)
+  const rootOriginalSize = file.size
+  const displayName = file.name
+
+  // Root session id: derive from the whole-file identity so every child segment
+  // carries the same root (the receiver keys its assembler on it).
+  const fp = await contentFingerprintFile(file)
+  if (!isCurrent(jobId)) return
+  const rootSessionId = deriveSessionId(
+    file.name,
+    BigInt(file.size),
+    BigInt(file.lastModified),
+    fp
+  )
+
+  // Prepare only the first child. Later children are recompressed on demand,
+  // so neither the worker nor React retains a root-sized list of buffers.
+  const first = await prepareSegmentSpec(file, rootSessionId, 0, count, jobId)
+  if (!first || !isCurrent(jobId)) return
+
+  const result: CompressResult = {
+    phase: "done",
+    jobId,
+    needsSegmentation: true,
+    compressed: new ArrayBuffer(0),
+    algorithm: 0,
+    originalSize: 0,
+    compressedSize: 0,
+    preCrc32: 0,
+    sessionId: {
+      lo: rootSessionId.lo.toString(),
+      hi: rootSessionId.hi.toString(),
+    },
+    displayName,
+    rootSessionId: {
+      lo: rootSessionId.lo.toString(),
+      hi: rootSessionId.hi.toString(),
+    },
+    segmentCount: count,
+    rootOriginalSize,
+    rootDisplayName: displayName,
+    segments: [first],
+  }
+  ;(self as unknown as Worker).postMessage(result, [first.compressed])
+}
+
+async function processRequestedSegment(
+  job: Extract<PendingJob, { kind: "segment" }>
+): Promise<void> {
+  try {
+    if (segmentCountFor(job.file.size) !== job.segmentCount) {
+      throw new Error("文件大小已变化，分段数量不再一致")
+    }
+    const fp = await contentFingerprintFile(job.file)
+    const root = deriveSessionId(
+      job.file.name,
+      BigInt(job.file.size),
+      BigInt(job.file.lastModified),
+      fp
+    )
+    if (
+      root.lo.toString() !== job.rootSessionId.lo ||
+      root.hi.toString() !== job.rootSessionId.hi
+    ) {
+      throw new Error("所选文件已变化，无法继续原分段任务")
+    }
+    const segment = await prepareSegmentSpec(
+      job.file,
+      root,
+      job.segmentIndex,
+      job.segmentCount,
+      job.jobId
+    )
+    if (!segment || !isCurrent(job.jobId)) return
+    const message: WorkerMessage = {
+      phase: "segment-done",
+      jobId: job.jobId,
+      segment,
+    }
+    ;(self as unknown as Worker).postMessage(message, [segment.compressed])
+  } catch (err) {
+    if (!isCurrent(job.jobId)) return
+    post({
+      phase: "error",
+      message: err instanceof Error ? err.message : String(err),
+      jobId: job.jobId,
+    })
+  }
+}
+
+/** Prepare exactly one segment; peak memory is bounded to that segment. */
+async function prepareSegmentSpec(
+  file: File,
+  rootSessionId: { lo: bigint; hi: bigint },
+  segmentIndex: number,
+  segmentCount: number,
+  jobId: number
+): Promise<SegmentSpec | null> {
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= segmentCount) {
+    throw new Error(`segment ${segmentIndex} out of range`)
+  }
+  post({ phase: "reading", jobId })
+  const raw = await sliceSegment(file, segmentIndex)
+  if (!isCurrent(jobId)) return null
+  const childSessionId = deriveSegmentId(rootSessionId, segmentIndex)
+  const { payload: compressed, algorithm, compressedSize } = await preparePayload(
+    raw,
+    (phase) => {
+      if (isCurrent(jobId)) post({ phase, jobId })
+    }
+  )
+  if (!isCurrent(jobId)) return null
+  post({ phase: "finalizing", jobId })
+  const preCrc32 = crc32(raw)
+  const rawSha256 = await sha256Bytes(raw)
+  if (!isCurrent(jobId)) return null
+  const ownsBuffer =
+    compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
+  const outBuf = (ownsBuffer ? compressed.buffer : compressed.slice().buffer) as ArrayBuffer
+  return {
+    compressed: outBuf,
+    algorithm,
+    originalSize: raw.length,
+    compressedSize,
+    preCrc32,
+    segmentIndex,
+    segmentCount,
+    originalOffset: segmentIndex * SEGMENT_RAW_BYTES,
+    rootOriginalSize: file.size,
+    rootSessionId: {
+      lo: rootSessionId.lo.toString(),
+      hi: rootSessionId.hi.toString(),
+    },
+    childSessionId: {
+      lo: childSessionId.lo.toString(),
+      hi: childSessionId.hi.toString(),
+    },
+    rawSha256,
+    displayName: file.name,
+  }
+}
+
+/** SHA-256 (raw 32 bytes) of `bytes` via WebCrypto. */
+async function sha256Bytes(bytes: Uint8Array): Promise<ArrayBuffer> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    bytes.slice().buffer as ArrayBuffer
+  )
+  return digest
+}
+
+/**
+ * Content fingerprint for a file without materialising the whole file. The
+ * file size is already a separate input to `deriveSessionId`; the fingerprint
+ * itself must exactly mirror Rust's `content_fingerprint(head, tail)`.
+ */
+async function contentFingerprintFile(file: File): Promise<Uint8Array> {
+  const HEAD = 1024
+  const TAIL = 1024
+  const head = new Uint8Array(await file.slice(0, HEAD).arrayBuffer())
+  const tail = new Uint8Array(
+    await file.slice(Math.max(0, file.size - TAIL), file.size).arrayBuffer()
+  )
+  return contentFingerprint(head, tail)
 }
 
 /**
@@ -352,6 +616,7 @@ async function finalizeAndPost(
   const result: CompressResult = {
     phase: "done",
     jobId,
+    needsSegmentation: false,
     compressed: outBuf,
     algorithm,
     originalSize: raw.length,
@@ -362,6 +627,14 @@ async function finalizeAndPost(
       hi: sessionId.hi.toString(),
     },
     displayName,
+    rootSessionId: {
+      lo: sessionId.lo.toString(),
+      hi: sessionId.hi.toString(),
+    },
+    segmentCount: 1,
+    rootOriginalSize: raw.length,
+    rootDisplayName: displayName,
+    segments: [],
   }
   // Detach the ArrayBuffer via the transfer list.
   ;(self as unknown as Worker).postMessage(result, [outBuf])

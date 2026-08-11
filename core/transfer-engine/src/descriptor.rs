@@ -8,6 +8,7 @@
 //! The sender emits a descriptor frame every `N` data frames so that a
 //! receiver that joins mid-stream learns the object layout within seconds.
 
+use crate::segment::SegmentMeta;
 use crate::{Error, Result};
 use qr_protocol::{frame::FLAG_DESCRIPTOR, Frame};
 use raptorq_core::ObjectMeta;
@@ -70,11 +71,13 @@ impl Default for FileMeta {
 pub struct DescriptorInfo {
     pub meta: ObjectMeta,
     pub file_meta: FileMeta,
+    /// Present only for descriptor v4 large-transfer child objects.
+    pub segment: Option<SegmentMeta>,
 }
 
 /// Compact on-wire descriptor layout (big-endian):
 ///   u8  magic        = 0xD5
-///   u8  version      = 3
+///   u8  version      = 3 (legacy object) or 4 (large-transfer segment)
 ///   u16 num_blocks
 ///   u64 transfer_length
 ///   u32 symbol_size
@@ -88,30 +91,63 @@ pub struct DescriptorInfo {
 ///   --- v3 extension ---
 ///   u8  compression         (0=None, 1=Zstd, 2=Xz)
 ///   u64 compressed_size     (compressed payload bytes, before RaptorQ padding)
+///   --- v4 segmented extension ---
+///   u128 root_session_id
+///   u32  segment_index
+///   u32  segment_count
+///   u64  original_offset
+///   u64  root_original_size
+///   u8[32] raw_sha256        (uncompressed segment bytes)
 ///
 /// Total v1 part = 28 + 16*B. v2 extension = 1 + filename_len + 8 + 4.
 /// v3 extension = 1 + 8 = 9.
 /// Must fit in one symbol payload (default 1024 bytes).
 const DESC_MAGIC: u8 = 0xD5;
-const DESC_VERSION: u8 = 3;
+const DESC_VERSION: u8 = 4;
+const DESC_V3_VERSION: u8 = 3;
 const DESC_FIXED_OVERHEAD: usize = 28;
 /// Size of the v2 extension fields excluding the variable filename bytes:
 /// u8 filename_len + u64 original_size + u32 crc32 = 13.
 const DESC_V2_TAIL_FIXED: usize = 13;
 /// Size of the v3 extension fields: u8 compression + u64 compressed_size = 9.
 const DESC_V3_TAIL_FIXED: usize = 9;
+/// Size of the descriptor-v4 segment extension.
+const DESC_V4_TAIL_FIXED: usize = 16 + 4 + 4 + 8 + 8 + 32;
 
 /// Serialize object metadata + file metadata into a descriptor payload, padded
 /// with zeros to `symbol_size` bytes.
 pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>> {
+    build_payload_inner(meta, file_meta, None)
+}
+
+/// Serialize a descriptor-v4 large-transfer child object.
+pub fn build_segment_payload(
+    meta: &ObjectMeta,
+    file_meta: &FileMeta,
+    segment: &SegmentMeta,
+) -> Result<Vec<u8>> {
+    build_payload_inner(meta, file_meta, Some(segment))
+}
+
+fn build_payload_inner(
+    meta: &ObjectMeta,
+    file_meta: &FileMeta,
+    segment: Option<&SegmentMeta>,
+) -> Result<Vec<u8>> {
     let symbol_size = meta.symbol_size as usize;
 
     // Truncate filename if needed so the whole payload fits in one symbol, but
     // never split a multi-byte UTF-8 scalar: the receiver deliberately uses a
     // strict decoder and would reject an invalid descriptor.
     let blocks_len = meta.blocks.len() * 16;
-    let available_for_filename = symbol_size
-        .saturating_sub(DESC_FIXED_OVERHEAD + blocks_len + DESC_V2_TAIL_FIXED + DESC_V3_TAIL_FIXED);
+    let segment_tail = if segment.is_some() {
+        DESC_V4_TAIL_FIXED
+    } else {
+        0
+    };
+    let available_for_filename = symbol_size.saturating_sub(
+        DESC_FIXED_OVERHEAD + blocks_len + DESC_V2_TAIL_FIXED + DESC_V3_TAIL_FIXED + segment_tail,
+    );
     let filename_bytes = file_meta.filename.as_bytes();
     let mut filename_len = filename_bytes.len().min(available_for_filename).min(255);
     while !file_meta.filename.is_char_boundary(filename_len) {
@@ -122,7 +158,8 @@ pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>>
     // body = fixed overhead + blocks + (filename_len byte + filename) + v2 tail
     // (without its leading filename_len byte, already counted) + v3 tail.
     let body_len = DESC_FIXED_OVERHEAD + blocks_len + 1 + filename_len + DESC_V2_TAIL_FIXED - 1
-        + DESC_V3_TAIL_FIXED;
+        + DESC_V3_TAIL_FIXED
+        + segment_tail;
     if body_len > symbol_size {
         return Err(Error::Protocol(qr_protocol::Error::BufferTooShort {
             need: body_len,
@@ -132,7 +169,11 @@ pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>>
 
     let mut buf = vec![0u8; symbol_size];
     buf[0] = DESC_MAGIC;
-    buf[1] = DESC_VERSION;
+    buf[1] = if segment.is_some() {
+        DESC_VERSION
+    } else {
+        DESC_V3_VERSION
+    };
     buf[2..4].copy_from_slice(&(meta.blocks.len() as u16).to_be_bytes());
     buf[4..12].copy_from_slice(&meta.transfer_length.to_be_bytes());
     buf[12..16].copy_from_slice(&meta.symbol_size.to_be_bytes());
@@ -162,11 +203,26 @@ pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>>
     buf[o] = file_meta.compression;
     o += 1;
     buf[o..o + 8].copy_from_slice(&file_meta.compressed_size.to_be_bytes());
+    o += 8;
+
+    if let Some(segment) = segment {
+        buf[o..o + 16].copy_from_slice(&segment.root_session_id.to_be_bytes());
+        o += 16;
+        buf[o..o + 4].copy_from_slice(&segment.segment_index.to_be_bytes());
+        o += 4;
+        buf[o..o + 4].copy_from_slice(&segment.segment_count.to_be_bytes());
+        o += 4;
+        buf[o..o + 8].copy_from_slice(&segment.original_offset.to_be_bytes());
+        o += 8;
+        buf[o..o + 8].copy_from_slice(&segment.root_original_size.to_be_bytes());
+        o += 8;
+        buf[o..o + 32].copy_from_slice(&segment.raw_sha256);
+    }
 
     Ok(buf)
 }
 
-/// Parse a descriptor payload. Accepts v1, v2, and v3 descriptors.
+/// Parse a descriptor payload. Accepts v1, v2, v3, and segmented v4 descriptors.
 ///
 /// Extension parsing is gated by the explicit version byte. Descriptor symbols
 /// are zero-padded, so using payload length to infer a newer version would parse
@@ -237,13 +293,14 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
             let crc32 = u32::from_be_bytes(payload[o..o + 4].try_into().unwrap());
             o += 4;
 
-            if version >= DESC_VERSION {
+            if version >= DESC_V3_VERSION {
                 if payload.len() < o + DESC_V3_TAIL_FIXED {
                     return None;
                 }
                 let compression = payload[o];
                 o += 1;
                 let compressed_size = u64::from_be_bytes(payload[o..o + 8].try_into().unwrap());
+                o += 8;
                 FileMeta {
                     filename,
                     original_size,
@@ -273,7 +330,39 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
         }
     };
 
-    Some(DescriptorInfo { meta, file_meta })
+    let segment = if version == DESC_VERSION {
+        if payload.len() < o + DESC_V4_TAIL_FIXED {
+            return None;
+        }
+        let root_session_id = u128::from_be_bytes(payload[o..o + 16].try_into().ok()?);
+        o += 16;
+        let segment_index = u32::from_be_bytes(payload[o..o + 4].try_into().ok()?);
+        o += 4;
+        let segment_count = u32::from_be_bytes(payload[o..o + 4].try_into().ok()?);
+        o += 4;
+        let original_offset = u64::from_be_bytes(payload[o..o + 8].try_into().ok()?);
+        o += 8;
+        let root_original_size = u64::from_be_bytes(payload[o..o + 8].try_into().ok()?);
+        o += 8;
+        let mut raw_sha256 = [0u8; 32];
+        raw_sha256.copy_from_slice(&payload[o..o + 32]);
+        Some(SegmentMeta {
+            root_session_id,
+            segment_index,
+            segment_count,
+            original_offset,
+            root_original_size,
+            raw_sha256,
+        })
+    } else {
+        None
+    };
+
+    Some(DescriptorInfo {
+        meta,
+        file_meta,
+        segment,
+    })
 }
 
 /// Build a descriptor frame ready for transmission.
@@ -287,6 +376,33 @@ pub fn build_frame(
     let payload = build_payload(meta, file_meta)?;
     Ok(Frame::build(
         session_id,
+        FLAG_DESCRIPTOR,
+        0,
+        0,
+        meta.blocks.len() as u32,
+        meta.blocks.iter().map(|b| b.num_source_symbols).sum(),
+        meta.symbol_size,
+        frame_index,
+        timestamp_ms,
+        &payload,
+    ))
+}
+
+/// Build a descriptor-v4 frame for one large-transfer child object.
+pub fn build_segment_frame(
+    meta: &ObjectMeta,
+    file_meta: &FileMeta,
+    segment: &SegmentMeta,
+    child_session_id: u128,
+    frame_index: u64,
+    timestamp_ms: u64,
+) -> Result<Frame> {
+    segment
+        .validate(child_session_id, file_meta)
+        .map_err(Error::InvalidSegment)?;
+    let payload = build_segment_payload(meta, file_meta, segment)?;
+    Ok(Frame::build(
+        child_session_id,
         FLAG_DESCRIPTOR,
         0,
         0,
@@ -382,8 +498,10 @@ mod tests {
         let meta = sender.meta().clone();
         let file_meta = sender.file_meta().clone();
         let payload = build_payload(&meta, &file_meta).unwrap();
-        assert_eq!(payload[1], DESC_VERSION);
+        // A non-segmented object uses descriptor version 3.
+        assert_eq!(payload[1], DESC_V3_VERSION);
         let info = parse_payload(&payload).unwrap();
+        assert_eq!(info.segment, None);
         assert_eq!(
             info.file_meta.compression,
             qr_protocol::compress::COMPRESSION_ZSTD

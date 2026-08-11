@@ -488,6 +488,60 @@ code {
 .kv-file-list { list-style: none; margin: 6px 0 0; padding: 0; }
 .kv-file-list li { font-size: 12px; font-weight: 400; color: var(--color-text-secondary); padding: 1px 0; }
 
+/* ───────────── 大文件分段播放 ───────────── */
+
+.segment-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 0 18px;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.segment-info {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--color-text);
+  font-size: 15px;
+}
+.segment-current { white-space: nowrap; }
+.segment-info .muted { text-align: right; }
+.segment-nav {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+.segment-nav > .btn:last-child { justify-self: stretch; }
+.segment-jump {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.segment-jump input {
+  width: 76px;
+  min-width: 0;
+  padding: 9px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-card);
+  color: var(--color-text);
+  font: inherit;
+  text-align: center;
+}
+.segment-jump input:focus {
+  outline: 2px solid var(--color-primary-ring);
+  border-color: var(--color-primary);
+}
+.segment-jump .btn { padding-inline: 10px; }
+
 /* ───────────── 表单字段 ───────────── */
 
 .field { margin: 18px 0; }
@@ -870,6 +924,10 @@ code {
 /* ───────────── 响应式：手机 ≤600px ───────────── */
 
 @media (max-width: 600px) {
+  .segment-info { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .segment-info .muted { text-align: left; }
+  .segment-nav { grid-template-columns: 1fr 1fr; }
+  .segment-jump { grid-column: 1 / -1; grid-row: 1; justify-content: center; }
   :root { --space-page: 18px; }
 
   .app { max-width: 100%; padding: 18px 12px 32px; }

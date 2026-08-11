@@ -65,11 +65,15 @@
             <Button Style="{StaticResource OutlinedButton}"
                     Content="🔄 刷新设备列表"
                     Click="Refresh_Click" />
-            <TextBlock x:Name="SelectedInfo"
-                       VerticalAlignment="Center"
-                       Margin="16,0,0,0"
-                       Foreground="{StaticResource TextSecondary}"
-                       FontSize="13" />
+            <StackPanel Margin="16,0,0,0" VerticalAlignment="Center">
+                <TextBlock x:Name="SelectedInfo"
+                           Foreground="{StaticResource TextSecondary}"
+                           FontSize="13" />
+                <TextBlock x:Name="ResumeHint"
+                           Visibility="Collapsed"
+                           Foreground="{StaticResource Accent}"
+                           FontSize="12" Margin="0,3,0,0" />
+            </StackPanel>
         </StackPanel>
 
         <!-- Start scan button. -->

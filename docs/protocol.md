@@ -53,7 +53,11 @@ session_id = FNV1a_128(
 
 发送端在写入前验证 `file_count` 与每个 UTF-8 文件名均可无损表示为 u16；文件名超过 65535 字节会明确报错，不允许静默截断并造成容器错位。接收端有**两个独立上限**：**压缩对象（wire）上限** `raptorq_core::MAX_OBJECT_BYTES` = **32 MiB**（即 RaptorQ 实际传输的压缩后字节，`ObjectMeta::transfer_length`），以及**原始（解压后）内容上限** `raptorq_core::MAX_ORIGINAL_BYTES` = **256 MiB**（`descriptor::FileMeta::original_size`）。两个上限分别约束"传输量"与"还原内存"，因此高度可压缩的对象（wire 小、原始大）只要原始 ≤ 256 MiB 且压缩后 ≤ 32 MiB 即可完整接收。**发送端不再硬性阻止超限内容**：所选内容原始大小超过 256 MiB 时，会在「发送」前弹出确认提示，告知接收端有该硬性上限、超限传输无法被完整接收；用户确认后仍会正常编码发送（浏览器接收端同样受 `MAX_DECOMPRESSED_BYTES` = 256 MiB 约束）。单个 0 B 文件会在发送前明确拒绝（bundle 内的空条目仍可表示）。
 
-**发送端 wire 上限硬门**：由于接收端对超过 `MAX_OBJECT_BYTES`（32 MiB）的 wire 对象是**硬性拒绝**（无法还原，非警告），发送端在压缩 worker（`apps/sender/src/workers/compress.worker.ts` 的 `finalizeAndPost`）内**压缩完成后**检查实际 `compressed_size`：若超过 32 MiB，直接报错并终止，不再进入播放流程。这覆盖了 256 MiB 原始确认框**漏掉**的关键场景——原始大小介于 32 MiB 与 256 MiB 之间、但压缩后仍超 32 MiB（不可压内容、多文件 bundle 总量大等）：此前会无提示地开始一个接收端必然失败的传输（即「原始 > 32 MiB 时无提示、哪怕单个文件很小也会出问题」）。注意此检查发生在压缩后，无法在「发送」前预判（压缩率未知），故放在 worker 内、用户看到明确报错而非静默失败。
+**发送端 wire 上限硬门（单对象）**：由于接收端对超过 `MAX_OBJECT_BYTES`（32 MiB）的 wire 对象是**硬性拒绝**（无法还原，非警告），发送端在压缩 worker（`apps/sender/src/workers/compress.worker.ts`）内**压缩完成后**检查实际 `compressed_size`：若超过 32 MiB，直接报错并终止，不再进入播放流程。这覆盖了 256 MiB 原始确认框**漏掉**的关键场景——原始大小介于 32 MiB 与 256 MiB 之间、但压缩后仍超 32 MiB。
+
+**大文件分段（descriptor v4）**：单个文件原始大小超过 32 MiB 时，发送端按产品策略把文件切成多个 **8 MiB 原始段**，每段独立压缩、独立 RaptorQ 编码、独立发送（descriptor v4 + 独立 child session id）。这样即使整文件可压缩到 32 MiB 内，也能把发送端/接收端峰值内存和一次暂停的回退量限制在当前段。发送端 worker 首次只准备第 1 段，用户切换或直接输入段号时才重新读取、压缩目标段；主线程也只保留当前段。
+
+Android/Windows 把通过 CRC32 + SHA-256 的段按规范偏移写入任务私有 `.partial` 并原子更新位图；网页接收端在一个 IndexedDB 事务中提交段 Blob 与任务账本。历史 UI 显示已收/总段数和缺失段范围，“继续恢复”会锁定 root id、忽略其他传输。全部段到齐后，原生端流式发布到内容库，网页端优先通过 File System Access API 逐段校验并写入用户文件，不构造根文件大小的内存数组。多文件 bundle（ETBUNDL1）仍走单对象路径并受 32 MiB wire / 256 MiB 原始内容上限约束。
 
 ## 帧格式 (Frame Format)
 
@@ -113,7 +117,7 @@ session_id = FNV1a_128(
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
 | 0 | 1 | magic | `0xD5` |
-| 1 | 1 | version | `3`（当前；`2`/`1` 为旧版） |
+| 1 | 1 | version | `4`（分段对象；`3`/`2`/`1` 为旧版，非分段对象用 `3`） |
 | 2 | 2 | num_blocks | u16 BE |
 | 4 | 8 | transfer_length | u64 BE（RaptorQ 对象字节数，含填充） |
 | 12 | 4 | symbol_size | u32 BE |
@@ -142,7 +146,22 @@ session_id = FNV1a_128(
 
 剩余字节（从 `Q+9` 到符号末尾）为零填充。
 
-**v2 兼容说明**：真实 v2 发送端只写到 `crc32`，其后为补零区。由于载荷总是补齐到 `symbol_size`，仅凭"剩余 ≥ 9 字节"无法区分 v3 尾部与 v2 补零——全零的 9 字节尾部会被误读为 `compressed_size=0`，导致接收端把恢复结果截成空文件。解析器因此仅当 `version ≥ 3` **或**尾部非全零时才将其当作 v3 扩展；否则按 v2 处理（`compression=None`、`compressed_size == original_size`）。
+**v4 扩展（大文件分段对象；version == 4）**：紧跟 v3 扩展。version 4 描述符描述一个**大文件传输的分段子对象**——逻辑文件被切成多个 ≤ 8 MiB 的原始段，每段独立压缩、独立 RaptorQ 编码、独立发送（各自携带自己的 child session id），接收端用 descriptor-v4 元数据把各段按偏移拼回完整文件。`file_meta`（filename/original_size/crc32/compression/compressed_size）描述的是**当前这一段**，分段坐标放在 v4 段元数据里：
+
+| 偏移 | 长度 | 字段 | 说明 |
+|------|------|------|------|
+| R | 16 | root_session_id | u128 BE（根文件传输 ID，全局一致） |
+| R+16 | 4 | segment_index | u32 BE（本段在根中的序号，0 起） |
+| R+20 | 4 | segment_count | u32 BE（根文件总段数） |
+| R+24 | 8 | original_offset | u64 BE（本段在根文件中的字节偏移 = index × 8 MiB） |
+| R+32 | 8 | root_original_size | u64 BE（根文件解压后总字节数） |
+| R+40 | 32 | raw_sha256 | SHA-256（本段解压后原始字节） |
+
+`R = Q + 9`。v4 只接受 `version == 4`（不允许 v3/v2 解析器误读 v4 尾段）；`raw_sha256` 用于接收端逐段校验。固定常量 `SEGMENT_RAW_BYTES = 8 MiB`、`MAX_SEGMENT_COUNT = 131072` 见 `core/transfer-engine/src/segment.rs`。接收端不识别 v4 时（旧版 App）会把它当未知版本拒绝——因此大文件分段传输要求收发端都升级。
+
+child session id 的位级派生固定为 `FNV1a_128(ASCII("AirFerry.segment.v1") || root_session_id_BE128 || segment_index_BE32)`。接收端还会强制 `segment_count = ceil(root_original_size / 8 MiB)`、`original_offset = index × 8 MiB`，并要求末段长度精确覆盖根文件尾部；因此不存在洞、重叠或借伪造段数触发巨额分配的空间。
+
+**v2/v3 兼容说明**：真实 v2 发送端只写到 `crc32`，其后为补零区。由于载荷总是补齐到 `symbol_size`，仅凭"剩余 ≥ 9 字节"无法区分 v3 尾部与 v2 补零——全零的 9 字节尾部会被误读为 `compressed_size=0`，导致接收端把恢复结果截成空文件。解析器因此仅当 `version ≥ 3` **或**尾部非全零时才将其当作 v3 扩展；否则按 v2 处理（`compression=None`、`compressed_size == original_size`）。`version == 4` 时额外要求 72 字节 v4 尾段完整，否则拒绝。
 
 固定开销 28 字节 + 每块 16 字节 + v2 尾部 13 字节 + filename_len + v3 尾部 9 字节。默认 symbol_size 1024 下对数百块以内的文件轻松装入一个符号。
 
@@ -194,10 +213,6 @@ session_id = FNV1a_128(
 
 ## 断点恢复
 
-接收端将以下状态序列化到磁盘：
-- `session_id`
-- `ObjectMeta`（OTI + 每块 K）
-- 每块已接收的 ESI 集合
-- 已存储的符号字节
+核心 `ResumeState` 可保存 `session_id`、`ObjectMeta`、ESI 摘要和**实际保留的符号载荷**。新 Decoder 只能回放有载荷的符号；仅有 ESI、没有字节的数据绝不能算作已接收，否则重传会被误判为重复。恢复 JSON 输入/输出封顶 128 MiB，并在反序列化和 restore 前校验 OTI、块数、SBN/ESI、符号尺寸及本地预算。
 
-重启后加载状态，重新构建 Decoder 并回放已存储符号 → 无损续传。恢复文件是不可信输入：JSON 输入/输出封顶 128 MiB，反序列化后及程序内 restore 前都会重新校验 OTI、块数、SBN/ESI、符号尺寸以及本地符号数/字节预算，非法状态不会进入 RaptorQ。
+当前实现为控制内存，在 descriptor 确认、符号喂入 Decoder 后不长期保留所有符号字节，因此普通单对象的进程重启会从当前对象重新扫描，而不是承诺“符号级无损续传”。产品级大文件断点由 descriptor-v4 的**完成段账本**承担：Android/Windows/网页均跨重启保留已通过 CRC32 + SHA-256 的完整段，当前尚未完成的 8 MiB 段最多重扫一次。历史页可查看缺失段、继续指定根任务或删除记录。

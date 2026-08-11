@@ -32,7 +32,7 @@ export function ensureWasm(): Promise<void> {
       (globalThis as { __WASM_TRANSFER_ENGINE__?: string }).__WASM_TRANSFER_ENGINE__
     const pending = init(base64ToBuffer(standaloneB64)).then(() => undefined)
     let retryable: Promise<void>
-    retryable = pending.catch((error) => {
+    retryable = pending.catch((error: unknown) => {
       // A transient fetch/instantiation failure must not poison every later
       // retry for the lifetime of the page.
       if (initPromise === retryable) initPromise = null

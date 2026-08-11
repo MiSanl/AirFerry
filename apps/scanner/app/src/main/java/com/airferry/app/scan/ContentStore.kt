@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -123,6 +124,57 @@ object ContentStore {
         return PutResult(entry, blob, deduped)
     }
 
+    /**
+     * Archive an existing file (e.g. a fully-assembled large-transfer) into the
+     * content-addressed store by streaming its hash and atomically copying it
+     * into the blob tree — no full-file in-memory copy. The source is deleted
+     * only after the history index is durably published, so a crash/index error
+     * cannot destroy the only recoverable assembled copy.
+     */
+    @Synchronized
+    fun putFile(
+        ctx: Context,
+        displayName: String,
+        file: File,
+        crcHex: String = "unknown",
+        crcUnknown: Boolean = true,
+        kind: String = "file",
+        bundleId: String? = null,
+        bundleTitle: String? = null,
+    ): PutResult {
+        val all = loadIndex(ctx).toMutableList()
+        val hash = sha256Hex(file)
+        val blob = blobPath(ctx, hash)
+        val sourceLength = file.length()
+        val deduped = blob.exists() && blob.length() == sourceLength &&
+            try { sha256Hex(blob) == hash } catch (_: Exception) { false }
+        if (!deduped) {
+            blob.parentFile?.mkdirs()
+            copyFileAtomic(file, blob)
+            if (!blob.isFile || blob.length() != sourceLength) {
+                throw java.io.IOException("content blob length changed during publish")
+            }
+        }
+        val entry = Entry(
+            id = UUID.randomUUID().toString(),
+            name = FileNameUtil.sanitize(displayName).ifBlank { "received_file" },
+            hash = hash,
+            size = blob.length(),
+            crcHex = crcHex,
+            crcUnknown = crcUnknown,
+            kind = kind,
+            createdAt = System.currentTimeMillis(),
+            bundleId = bundleId,
+            bundleTitle = bundleTitle,
+        )
+        all.add(entry)
+        saveIndex(ctx, all)
+        // Index publication is the commit point. Only now is it safe to remove
+        // the task-owned assembled copy.
+        if (file.canonicalPath != blob.canonicalPath) file.delete()
+        return PutResult(entry, blob, deduped)
+    }
+
     @Synchronized
     fun listEntries(ctx: Context): List<Entry> = loadIndex(ctx)
 
@@ -167,6 +219,8 @@ object ContentStore {
         saveIndex(ctx, emptyList())
         val blobs = File(root(ctx), BLOBS)
         if (blobs.exists()) blobs.deleteRecursively()
+        val segments = File(root(ctx), "seg")
+        if (segments.exists()) segments.deleteRecursively()
     }
 
     /**
@@ -310,6 +364,36 @@ object ContentStore {
             out = null
         } finally {
             if (out != null) atomic.failWrite(out)
+        }
+    }
+
+    /** Stream-copy [source] to [target] through a same-directory atomic temp. */
+    private fun copyFileAtomic(source: File, target: File) {
+        target.parentFile?.mkdirs()
+        val temp = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}.tmp")
+        try {
+            FileOutputStream(temp).use { out ->
+                source.inputStream().use { it.copyTo(out) }
+                out.fd.sync()
+            }
+            try {
+                java.nio.file.Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                // Same-filesystem replacement remains a single move on Android
+                // filesystems even when the provider cannot promise ATOMIC_MOVE.
+                java.nio.file.Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        } finally {
+            if (temp.exists()) temp.delete()
         }
     }
 }

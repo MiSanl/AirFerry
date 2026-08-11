@@ -528,8 +528,7 @@ export function FileSelectPage({ items, onItemsChange, onSend }: Props) {
           ref={folderInputRef}
           type="file"
           multiple
-          webkitdirectory=""
-          directory=""
+          {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
           style={{ display: "none" }}
           onChange={(e) => {
             handleFiles(e.target.files)

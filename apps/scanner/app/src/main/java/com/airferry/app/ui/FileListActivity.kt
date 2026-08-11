@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
@@ -36,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import com.airferry.app.scan.ContentStore
 import com.airferry.app.scan.CreateNamedDocument
 import com.airferry.app.scan.FileTransfer
+import com.airferry.app.scan.SegmentAssembler
 import com.airferry.app.scan.TextLike
 import java.io.File
 
@@ -64,10 +66,13 @@ private sealed class Row {
         val createdAt: Long,
     ) : Row()
 
+    data class TaskRow(val task: SegmentAssembler.Task) : Row()
+
     val key: String
         get() = when (this) {
             is FileRow -> entry.id
             is BundleRow -> "b:$bundleId"
+            is TaskRow -> "t:${task.rootSessionIdHex}"
         }
 }
 
@@ -164,7 +169,7 @@ class FileListActivity : ComponentActivity() {
                     }
                 } else {
                     Text(
-                        "已接收文件",
+                        "接收历史",
                         color = TextPrimary, fontSize = 22.sp, fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f)
                     )
@@ -178,7 +183,7 @@ class FileListActivity : ComponentActivity() {
 
             if (rows.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("暂无接收文件", color = TextSecondary, fontSize = 16.sp, textAlign = TextAlign.Center)
+                    Text("暂无接收文件或待恢复任务", color = TextSecondary, fontSize = 16.sp, textAlign = TextAlign.Center)
                 }
             } else {
                 LazyColumn(
@@ -220,6 +225,18 @@ class FileListActivity : ComponentActivity() {
                                     else toggle(row)
                                 },
                                 onSingleDelete = { pendingDelete = listOf(row) },
+                            )
+                            is Row.TaskRow -> TaskCard(
+                                row = row,
+                                enabled = !inSelectionMode,
+                                onContinue = {
+                                    startActivity(
+                                        Intent(this@FileListActivity, ScanActivity::class.java).apply {
+                                            putExtra("RESUME_ROOT_ID", row.task.rootSessionIdHex)
+                                        }
+                                    )
+                                },
+                                onDelete = { pendingDelete = listOf(row) },
                             )
                         }
                     }
@@ -289,6 +306,11 @@ class FileListActivity : ComponentActivity() {
     }
 
     private fun loadRows(bundleFilter: String?): List<Row> {
+        val tasks = if (bundleFilter == null) {
+            SegmentAssembler.listTasks(ContentStore.root(this)).map { Row.TaskRow(it) }
+        } else {
+            emptyList()
+        }
         val all = try {
             ContentStore.listEntries(this)
         } catch (e: IllegalStateException) {
@@ -298,7 +320,7 @@ class FileListActivity : ComponentActivity() {
                     Toast.makeText(this, e.message ?: "接收历史索引损坏", Toast.LENGTH_LONG).show()
                 }
             }
-            return emptyList()
+            return tasks
         }
         if (bundleFilter != null) {
             return all.filter { it.bundleId == bundleFilter }
@@ -325,10 +347,11 @@ class FileListActivity : ComponentActivity() {
                 createdAt = members.maxOfOrNull { it.createdAt } ?: 0L,
             )
         }
-        return (fileRows + bundleRows).sortedByDescending {
+        return (tasks + fileRows + bundleRows).sortedByDescending {
             when (it) {
                 is Row.FileRow -> it.entry.createdAt
                 is Row.BundleRow -> it.createdAt
+                is Row.TaskRow -> it.task.updatedAt
             }
         }
     }
@@ -353,6 +376,11 @@ class FileListActivity : ComponentActivity() {
         when (row) {
             is Row.FileRow -> ContentStore.deleteEntry(this, row.entry.id)
             is Row.BundleRow -> ContentStore.deleteBundle(this, row.bundleId)
+            is Row.TaskRow -> SegmentAssembler.discard(
+                ContentStore.root(this),
+                row.task.rootSessionIdLo,
+                row.task.rootSessionIdHi,
+            )
         }
     }
 
@@ -406,6 +434,7 @@ class FileListActivity : ComponentActivity() {
                         if (f.exists()) out.add(f to m.name)
                     }
                 }
+                is Row.TaskRow -> Unit
             }
         }
         return out
@@ -619,7 +648,60 @@ class FileListActivity : ComponentActivity() {
         }
     }
 
-@Composable
+    @Composable
+    private fun TaskCard(
+        row: Row.TaskRow,
+        enabled: Boolean,
+        onContinue: () -> Unit,
+        onDelete: () -> Unit,
+    ) {
+        val task = row.task
+        val fraction = if (task.segmentCount > 0) {
+            task.receivedCount.toFloat() / task.segmentCount.toFloat()
+        } else 0f
+        val dateStr = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(task.updatedAt))
+        Card(
+            modifier = Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onContinue),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = CardBg),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, tint = Accent,
+                        modifier = Modifier.size(32.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(task.fileName, color = TextPrimary, fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium, maxLines = 1)
+                        Text(
+                            "待恢复 · ${task.receivedCount}/${task.segmentCount} 段 · " +
+                                "${ScanActivity.formatSize(task.rootOriginalSize)} · $dateStr",
+                            color = TextSecondary, fontSize = 12.sp,
+                        )
+                        Text(
+                            "缺少第 ${task.missingSegmentsText()} 段",
+                            color = Accent, fontSize = 12.sp,
+                        )
+                    }
+                    TextButton(onClick = onContinue, enabled = enabled) {
+                        Text("继续恢复", color = Accent)
+                    }
+                    IconButton(onClick = onDelete, enabled = enabled) {
+                        Icon(Icons.Default.Delete, contentDescription = "删除任务", tint = DeleteRed)
+                    }
+                }
+                LinearProgressIndicator(
+                    progress = { fraction.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    color = Accent,
+                    trackColor = Color(0xFF334155),
+                )
+            }
+        }
+    }
+
+    @Composable
     private fun BottomAction(icon: ImageVector, label: String, tint: Color, onClick: () -> Unit) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,

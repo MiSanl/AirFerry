@@ -18,6 +18,7 @@ raptorq-core.workspace = true
 qr-protocol.workspace = true
 raptorq = "2.0"
 crc32fast.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

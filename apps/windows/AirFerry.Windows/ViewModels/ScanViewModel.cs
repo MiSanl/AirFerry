@@ -54,6 +54,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int PreviewFps = 15;
     private const int RateWindowSeconds = 3;
     private const int RateMinMilliseconds = 500;
+    private string? _resumeRootId;
+    /// <summary>Disk-backed assembler for a descriptor-v4 large transfer (null = none).</summary>
+    private AirFerry.Windows.Bundle.SegmentAssembler? _segAssembler;
 
     private sealed record AssembledPayload(
         byte[] Bytes,
@@ -71,6 +74,15 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong FileSize,
         uint SymbolSize,
         int EstimatedTotalSymbols);
+
+    public ScanViewModel(string? resumeRootId = null)
+    {
+        if (resumeRootId is null) return;
+        string normalized = resumeRootId.Trim().ToLowerInvariant();
+        if (normalized.Length != 32 || normalized.Any(c => !Uri.IsHexDigit(c)))
+            throw new ArgumentException("待恢复任务 ID 无效", nameof(resumeRootId));
+        _resumeRootId = normalized;
+    }
 
     /// <summary>The device index chosen in the device-select page.</summary>
     [ObservableProperty]
@@ -190,7 +202,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             _producerThread.Start();
 
             IsScanning = true;
-            StatusText = "正在扫描…对准屏幕上的二维码";
+            StatusText = _resumeRootId is null
+                ? "正在扫描…对准屏幕上的二维码"
+                : $"正在继续任务 {_resumeRootId[..8]}…，其他文件会被忽略";
         }
         catch (Exception ex)
         {
@@ -501,11 +515,15 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
+            bool reset = ResetReceiverAfterRecoveryFailure(session, pool, epoch);
             if (epoch == Volatile.Read(ref _sessionEpoch))
             {
+                IsComplete = false;
                 IsRecovering = false;
                 RecoveryStageText = string.Empty;
-                StatusText = $"恢复失败: {ex.Message}";
+                StatusText = reset
+                    ? $"当前分段校验失败，可重新扫码: {ex.Message}"
+                    : $"恢复失败: {ex.Message}";
             }
             return;
         }
@@ -529,7 +547,20 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         RecoveryStageText = string.Empty;
         if (result is null)
         {
-            StatusText = "组装失败";
+            // A large-transfer segment was stored but the transfer is not yet
+            // complete — keep scanning for the remaining segments.
+            if (_segAssembler is not null)
+            {
+                IsComplete = false;
+                StatusText = _segAssembler.IsComplete()
+                    ? "正在合并分段…"
+                    : $"分段 {_segAssembler.ReceivedCount()}/{_segAssembler.SegmentCount()} 已收，继续扫描下一段…";
+                return;
+            }
+            IsComplete = false;
+            StatusText = _resumeRootId is null
+                ? "组装失败"
+                : $"等待任务 {_resumeRootId[..8]}… 的分段，其他文件已忽略";
             return;
         }
         StatusText = "接收完成";
@@ -539,6 +570,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private RecoveryResult? RecoverAndStageCore(ReceiverSession session, QrDecodePool pool)
     {
         pool.IngestStopped = true;
+
+        // descriptor-v4 large transfer: store this segment into the disk-backed
+        // assembler and return once every segment has arrived.
+        if (pool.RunExclusive(() => session.IsSegmented()))
+        {
+            return HandleSegmentedTransfer(session, pool);
+        }
+        if (_resumeRootId is not null)
+        {
+            SwapReceiverForNextSegment(session, pool);
+            return null;
+        }
 
         // Take one coherent native snapshot under the ingest lock. No metadata
         // getter is allowed to outlive or race disposal of the native handle.
@@ -556,6 +599,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         });
         if (payload is null)
         {
+            SwapReceiverForNextSegment(session, pool);
             return null;
         }
 
@@ -609,6 +653,195 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Store one recovered descriptor-v4 segment into the disk-backed assembler.
+    /// Returns a <see cref="RecoveryResult"/> only once every segment of the root
+    /// transfer has arrived and been merged; otherwise null (the receiver keeps
+    /// scanning for the next segment).
+    /// </summary>
+    private RecoveryResult? HandleSegmentedTransfer(ReceiverSession session, QrDecodePool pool)
+    {
+        // Take a coherent native snapshot under the ingest lock: metadata +
+        // assembled (uncompressed) bytes for this segment.
+        SegmentPayload? seg = pool.RunExclusive<SegmentPayload?>(() =>
+        {
+            byte[]? bytes = session.Assemble();
+            if (bytes is null || bytes.Length == 0) return null;
+            return new SegmentPayload(
+                bytes,
+                session.SegmentIndex(),
+                session.SegmentCount(),
+                session.RootOriginalSize(),
+                session.RootSessionIdLo(),
+                session.RootSessionIdHi(),
+                session.FileName(),
+                session.FileSize(),
+                session.OriginalOffset(),
+                session.RawSha256(),
+                session.Crc32(),
+                session.Crc32Known());
+        });
+        if (seg is null)
+        {
+            SwapReceiverForNextSegment(session, pool);
+            return null;
+        }
+
+        int index = (int)seg.SegmentIndex;
+        int count = (int)seg.SegmentCount;
+        ulong rootSize = seg.RootOriginalSize;
+        ulong lo = seg.RootLo;
+        ulong hi = seg.RootHi;
+        string rootId = $"{hi:x16}{lo:x16}";
+        string displayName = string.IsNullOrEmpty(seg.FileName) ? "received_file" : seg.FileName;
+
+        byte[] segBytes = seg.Bytes;
+        if (count is <= 0 or > AirFerry.Windows.Bundle.SegmentAssembler.MaxSegmentCount)
+            throw new InvalidDataException("分段数量超出安全上限");
+        if (rootSize == 0 || rootSize > (ulong)long.MaxValue)
+            throw new InvalidDataException("根文件大小无效");
+        if (index < 0 || index >= count ||
+            seg.OriginalOffset != checked((ulong)index *
+                (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes))
+            throw new InvalidDataException("分段索引或偏移无效");
+        ulong expectedCount = checked((rootSize - 1) /
+            (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes + 1);
+        if ((ulong)count != expectedCount)
+            throw new InvalidDataException("分段数量与根文件大小不一致");
+        ulong expectedLength = Math.Min(
+            (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes,
+            rootSize - seg.OriginalOffset);
+        if (seg.OriginalSize == 0 || seg.OriginalSize != expectedLength ||
+            seg.OriginalSize != (ulong)segBytes.LongLength)
+            throw new InvalidDataException("分段实际长度与描述符不一致");
+        if (seg.RawSha256.Length != 32)
+            throw new InvalidDataException("分段描述符缺少 SHA-256");
+        if (seg.CrcKnown && Crc32.Compute(segBytes) != seg.ExpectedCrc)
+            throw new InvalidDataException($"分段 {index + 1}/{count} CRC32 校验失败");
+        if (_resumeRootId is not null &&
+            !string.Equals(rootId, _resumeRootId, StringComparison.Ordinal))
+        {
+            SwapReceiverForNextSegment(session, pool);
+            return null;
+        }
+
+        // Reuse the active root so a long, sequential transfer does not reopen
+        // the ledger and re-hash every earlier 8 MiB segment for each child.
+        // Interleaved roots still open their own identity-bound assembler.
+        var asm = _segAssembler is not null
+                  && _segAssembler.Matches(lo, hi, count, (long)rootSize, displayName)
+            ? _segAssembler
+            : AirFerry.Windows.Bundle.SegmentAssembler.Open(
+                lo, hi, count, (long)rootSize, displayName);
+        _segAssembler = asm;
+
+        // Crash recovery: all segments may already be durable while history
+        // promotion was interrupted. Promotion is deliberately idempotent.
+        if (asm.IsComplete())
+            return ArchiveSegmentedTransfer(asm, displayName, rootSize);
+
+        if (asm.HasSegment(index))
+        {
+            UpdateSegmentedProgress(asm);
+            SwapReceiverForNextSegment(session, pool);
+            return null;
+        }
+        // A failure leaves all earlier verified segments untouched. The outer
+        // recovery boundary swaps in a fresh child receiver so this segment can
+        // be scanned again immediately.
+        asm.StoreSegment(index, segBytes, seg.RawSha256);
+
+        if (!asm.IsComplete())
+        {
+            UpdateSegmentedProgress(asm);
+            SwapReceiverForNextSegment(session, pool);
+            return null;
+        }
+
+        return ArchiveSegmentedTransfer(asm, displayName, rootSize);
+    }
+
+    private RecoveryResult ArchiveSegmentedTransfer(
+        AirFerry.Windows.Bundle.SegmentAssembler asm,
+        string displayName,
+        ulong rootSize)
+    {
+        string finalPath = asm.Finish()
+            ?? throw new InvalidDataException(
+                "分段账本已完成，但临时文件缺失或损坏");
+        var put = AirFerry.Windows.Bundle.ContentStore.PutFile(
+            displayName, finalPath,
+            crcHex: "unknown", crcUnknown: true, kind: "file");
+        asm.CommitArchived();
+        _segAssembler = null;
+        _resumeRootId = null;
+        return new RecoveryResult(
+            SingleFilePath: put.Path,
+            SingleFileSize: rootSize,
+            ExpectedCrc32: null,
+            Crc32Known: false,
+            ReceivedCrc32: null,
+            Bundle: null,
+            BundleDir: null,
+            DisplayName: displayName);
+    }
+
+    private sealed record SegmentPayload(
+        byte[] Bytes,
+        uint SegmentIndex,
+        uint SegmentCount,
+        ulong RootOriginalSize,
+        ulong RootLo,
+        ulong RootHi,
+        string FileName,
+        ulong OriginalSize,
+        ulong OriginalOffset,
+        byte[] RawSha256,
+        ulong ExpectedCrc,
+        bool CrcKnown);
+
+    private void UpdateSegmentedProgress(AirFerry.Windows.Bundle.SegmentAssembler asm)
+    {
+        StatusText = $"分段 {asm.ReceivedCount()}/{asm.SegmentCount()} 已收，继续扫描下一段…";
+    }
+
+    /// <summary>Swap to a fresh receiver for the next segment.</summary>
+    private void SwapReceiverForNextSegment(ReceiverSession session, QrDecodePool pool)
+    {
+        lock (_lifecycleGate)
+        {
+            if (!ReferenceEquals(session, _session) || !ReferenceEquals(pool, _pool))
+                return;
+            pool.RunExclusive(() =>
+            {
+                session.Destroy();
+                _session = new ReceiverSession();
+                Interlocked.Exchange(ref _recoveryStarted, 0);
+                pool.IngestStopped = false;
+            });
+        }
+    }
+
+    private bool ResetReceiverAfterRecoveryFailure(
+        ReceiverSession session, QrDecodePool pool, int epoch)
+    {
+        lock (_lifecycleGate)
+        {
+            if (epoch != Volatile.Read(ref _sessionEpoch) ||
+                !ReferenceEquals(session, _session) ||
+                !ReferenceEquals(pool, _pool))
+                return false;
+            pool.RunExclusive(() =>
+            {
+                session.Destroy();
+                _session = new ReceiverSession();
+                Interlocked.Exchange(ref _recoveryStarted, 0);
+                pool.IngestStopped = false;
+            });
+            return true;
+        }
     }
 
     private RecoveryResult StageSingleFile(byte[] bytes, string displayName,

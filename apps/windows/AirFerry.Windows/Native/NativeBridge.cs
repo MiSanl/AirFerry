@@ -157,4 +157,50 @@ internal static class NativeBridge
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_receiver_crc32_known")]
     public static extern int ReceiverCrc32Known(IntPtr handle);
+
+    // ── descriptor-v4 segment metadata (large-transfer child objects) ───────
+
+    /// <summary>1 if the confirmed descriptor was a v4 large-transfer child object.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_is_segmented")]
+    public static extern int ReceiverIsSegmented(IntPtr handle);
+
+    /// <summary>Zero-based index of this segment within the root transfer (0 if not segmented).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_segment_index")]
+    public static extern uint ReceiverSegmentIndex(IntPtr handle);
+
+    /// <summary>Total segment count of the root transfer (1 if not segmented).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_segment_count")]
+    public static extern uint ReceiverSegmentCount(IntPtr handle);
+
+    /// <summary>Root (whole-file) original size in bytes (0 if not segmented).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_root_original_size")]
+    public static extern ulong ReceiverRootOriginalSize(IntPtr handle);
+
+    /// <summary>Original (uncompressed) offset of this segment in the root file (0 if not segmented).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_original_offset")]
+    public static extern ulong ReceiverOriginalOffset(IntPtr handle);
+
+    /// <summary>Root session id low 64 bits (whole transfer id), or 0 if not segmented.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_root_session_id_lo")]
+    public static extern ulong ReceiverRootSessionIdLo(IntPtr handle);
+
+    /// <summary>Root session id high 64 bits, or 0 if not segmented.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_root_session_id_hi")]
+    public static extern ulong ReceiverRootSessionIdHi(IntPtr handle);
+
+    /// <summary>
+    /// Copy the 32-byte SHA-256 of this segment's uncompressed bytes into
+    /// <paramref name="outBuf"/> (two-pass length protocol: returns required
+    /// length, or 0 when not segmented).
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_raw_sha256")]
+    public static extern nuint ReceiverRawSha256(IntPtr handle, byte[]? outBuf, nuint cap);
 }

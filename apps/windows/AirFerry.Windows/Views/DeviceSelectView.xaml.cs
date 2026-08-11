@@ -14,10 +14,22 @@ namespace AirFerry.Windows.Views;
 public partial class DeviceSelectView : Page
 {
     private IReadOnlyList<DeviceInfo> _devices = Array.Empty<DeviceInfo>();
+    private readonly string? _resumeRootId;
 
-    public DeviceSelectView()
+    public DeviceSelectView() : this(null)
     {
+    }
+
+    public DeviceSelectView(string? resumeRootId)
+    {
+        _resumeRootId = resumeRootId;
         InitializeComponent();
+        if (_resumeRootId is not null)
+        {
+            ResumeHint.Text = $"继续任务 {_resumeRootId[..8]}…：扫码时会忽略其他文件";
+            ResumeHint.Visibility = Visibility.Visible;
+            StartButton.Content = "▶ 继续恢复";
+        }
         Loaded += (_, _) => RefreshDevices();
     }
 
@@ -64,7 +76,7 @@ public partial class DeviceSelectView : Page
             return;
         }
         DeviceInfo selected = _devices[DeviceList.SelectedIndex];
-        NavigationService?.Navigate(new ScanView(selected.Index));
+        NavigationService?.Navigate(new ScanView(selected.Index, _resumeRootId));
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)

@@ -38,6 +38,29 @@ impl SessionId {
         feed(fingerprint);
         SessionId(h)
     }
+
+    /// Derive the stable child session id for one independently encoded large-
+    /// transfer segment.
+    ///
+    /// The outer QR frame format deliberately stays at protocol version 1. A
+    /// segment is therefore demultiplexed by a distinct `session_id`, while its
+    /// descriptor carries the root transfer id and segment coordinates. Keep
+    /// the domain tag, root byte order, and index byte order frozen: browser,
+    /// Android, Windows, and Rust tests all mirror this exact derivation.
+    pub fn derive_segment(root: SessionIdRaw, segment_index: u32) -> Self {
+        let mut h: u128 = 0x6c62272e07bb01426b82175983ad0b58;
+        const PRIME: u128 = 0x0000000001000000000000000000013b;
+
+        for &b in b"AirFerry.segment.v1"
+            .iter()
+            .chain(root.to_be_bytes().iter())
+            .chain(segment_index.to_be_bytes().iter())
+        {
+            h ^= b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+        SessionId(h)
+    }
 }
 
 impl From<SessionId> for SessionIdRaw {
@@ -86,5 +109,14 @@ mod tests {
         assert_eq!(a, b);
         let c = content_fingerprint(&[1, 2, 4], &[9, 9]);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn segment_ids_are_deterministic_and_domain_separated() {
+        let root = 0x00112233445566778899aabbccddeeffu128;
+        let a = SessionId::derive_segment(root, 7);
+        assert_eq!(a, SessionId::derive_segment(root, 7));
+        assert_ne!(a, SessionId::derive_segment(root, 8));
+        assert_ne!(a.0, root);
     }
 }

@@ -18,6 +18,12 @@ import "@/assets/app.css"
 import "@/assets/receive.css"
 import iconUrl from "../../assets/icon128.png"
 import type { Recovered } from "@/receive/parse"
+import {
+  deleteStoredTask,
+  listStoredTasks,
+  readStoredSegment,
+  type StoredSegmentTask,
+} from "@/receive/taskStore"
 
 type Stage = "camera" | "scanning" | "recovering" | "done" | "error"
 
@@ -46,6 +52,10 @@ interface ProgressInfo {
   fileSize: number
   compressedSize: number
   compressedSizeKnown: boolean
+  /** Segments already recovered for a descriptor-v4 large transfer (0 when none). */
+  segmentReceived: number
+  /** Total segments of the current large transfer (0 when not segmented). */
+  segmentCount: number
   /** Derived status line (same semantics as Android). */
   statusText: string
 }
@@ -88,7 +98,132 @@ interface RateSample {
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+interface WritableFileLike {
+  write(data: Uint8Array): Promise<void>
+  close(): Promise<void>
+  abort?(): Promise<void>
+}
+
+interface SaveFileHandleLike {
+  createWritable(): Promise<WritableFileLike>
+}
+
+const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
+
+async function readVerifiedStoredSegment(
+  task: StoredSegmentTask,
+  index: number
+): Promise<Uint8Array> {
+  const bytes = await readStoredSegment(task.rootId, index)
+  const offset = index * SEGMENT_RAW_BYTES
+  const expectedLength = Math.min(
+    SEGMENT_RAW_BYTES,
+    task.rootOriginalSize - offset
+  )
+  if (expectedLength <= 0 || bytes.byteLength !== expectedLength) {
+    throw new Error(`已存分段 ${index + 1} 长度不一致，请重新恢复该段`)
+  }
+  const expectedHash = task.hashes[index]
+  if (!expectedHash || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+    throw new Error(`已存分段 ${index + 1} 缺少完整性记录`)
+  }
+  const exact = bytes.slice().buffer as ArrayBuffer
+  const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", exact))
+  const actualHex = Array.from(actual, (b) => b.toString(16).padStart(2, "0")).join("")
+  if (actualHex !== expectedHash) {
+    throw new Error(`已存分段 ${index + 1} 的 SHA-256 校验失败，请重新恢复该段`)
+  }
+  return bytes
+}
+
+/** Save a completed durable task without first constructing a merged buffer. */
+async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
+  const received = new Set(task.received)
+  if (
+    task.state !== "complete" ||
+    task.received.length !== task.segmentCount ||
+    received.size !== task.segmentCount ||
+    task.hashes.length !== task.segmentCount
+  ) {
+    throw new Error("任务尚未完整恢复")
+  }
+  const picker = (window as unknown as {
+    showSaveFilePicker?: (options: {
+      suggestedName: string
+    }) => Promise<SaveFileHandleLike>
+  }).showSaveFilePicker
+
+  if (picker) {
+    const handle = await picker({
+      suggestedName: task.fileName || "received_file",
+    })
+    const writable = await handle.createWritable()
+    try {
+      let written = 0
+      for (let i = 0; i < task.segmentCount; i++) {
+        if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
+        const bytes = await readVerifiedStoredSegment(task, i)
+        await writable.write(bytes)
+        written += bytes.byteLength
+      }
+      if (written !== task.rootOriginalSize) {
+        throw new Error(`已写入大小 ${written} 与原文件 ${task.rootOriginalSize} 不一致`)
+      }
+      await writable.close()
+    } catch (e) {
+      await writable.abort?.().catch(() => undefined)
+      throw e
+    }
+    return
+  }
+
+  // Compatibility fallback for browsers without File System Access. It still
+  // avoids a second merged Uint8Array, although Blob parts remain in memory
+  // until the download starts.
+  const parts: BlobPart[] = []
+  let total = 0
+  for (let i = 0; i < task.segmentCount; i++) {
+    if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
+    const bytes = await readVerifiedStoredSegment(task, i)
+    total += bytes.byteLength
+    parts.push(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
+  }
+  if (total !== task.rootOriginalSize) {
+    throw new Error(`已恢复大小 ${total} 与原文件 ${task.rootOriginalSize} 不一致`)
+  }
+  const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }))
+  const anchor = document.createElement("a")
+  anchor.href = url
+  anchor.download = task.fileName || "received_file"
+  anchor.click()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+/** Compact one-based missing ranges, e.g. "2、5–7、11". */
+function missingSegmentSummary(task: StoredSegmentTask, maxRanges = 4): string {
+  const have = new Set(task.received)
+  const ranges: string[] = []
+  let omitted = false
+  for (let i = 0; i < task.segmentCount;) {
+    if (have.has(i)) {
+      i += 1
+      continue
+    }
+    const start = i
+    while (i + 1 < task.segmentCount && !have.has(i + 1)) i += 1
+    const end = i
+    if (ranges.length < maxRanges) {
+      ranges.push(start === end ? String(start + 1) : `${start + 1}–${end + 1}`)
+    } else {
+      omitted = true
+    }
+    i += 1
+  }
+  return ranges.length === 0 ? "无" : `${ranges.join("、")}${omitted ? " 等" : ""}`
 }
 
 /** Format ms as a duration like "23 秒" / "1 分 05 秒" (matches Android). */
@@ -157,6 +292,8 @@ function initialProgress(): ProgressInfo {
     fileSize: 0,
     compressedSize: 0,
     compressedSizeKnown: false,
+    segmentReceived: 0,
+    segmentCount: 0,
     statusText: "等待二维码…",
   }
 }
@@ -249,6 +386,9 @@ export function ReceivePage(): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [progress, setProgress] = useState<ProgressInfo>(() => initialProgress())
   const [result, setResult] = useState<ResultInfo | null>(null)
+  const [storedResult, setStoredResult] = useState<StoredSegmentTask | null>(null)
+  const [tasks, setTasks] = useState<StoredSegmentTask[]>([])
+  const [taskError, setTaskError] = useState<string | null>(null)
   // End-to-end capture fps (how often captureLoop runs) — shown in the corner to
   // diagnose whether the 120 codes/s ceiling is camera fps (30) vs decode speed.
   const [captureFps, setCaptureFps] = useState<number>(0)
@@ -282,6 +422,29 @@ export function ReceivePage(): React.ReactElement {
   // mirroring Android's QrDecodePool.decodedCount().
   const decodedCodesRef = useRef<number>(0)
   const stageRef = useRef<Stage>("camera")
+  const assemblingRef = useRef<boolean>(false)
+  const resumeCaptureRef = useRef<() => void>(() => undefined)
+  /** Root selected through history; null means accept any new transfer. */
+  const targetRootRef = useRef<string | null>(null)
+  /** Suppress status from a just-rejected unrelated child until reset ack. */
+  const rejectingSessionRef = useRef<boolean>(false)
+
+  const refreshTasks = useCallback(async () => {
+    try {
+      setTasks(await listStoredTasks())
+      setTaskError(null)
+    } catch (e) {
+      setTaskError(`无法读取恢复历史：${e instanceof Error ? e.message : String(e)}`)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshTasks()
+    void navigator.storage?.persist?.().catch(() => false)
+    const onFocus = () => void refreshTasks()
+    window.addEventListener("focus", onFocus)
+    return () => window.removeEventListener("focus", onFocus)
+  }, [refreshTasks])
 
   // keep stageRef in sync so the rAF loop can read the latest stage.
   useEffect(() => {
@@ -326,33 +489,51 @@ export function ReceivePage(): React.ReactElement {
   }, [teardown])
 
   /** Start the camera stream and attach it to the video element. */
-  const startCamera = useCallback(async (): Promise<void> => {
+  const startCamera = useCallback(async (): Promise<boolean> => {
     setStage("camera")
+    stageRef.current = "camera"
     setError(null)
+    for (const track of streamRef.current?.getTracks() ?? []) track.stop()
+    streamRef.current = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment",
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          // `max:60` pins an upper bound so a 60-capable camera actually delivers
-          // 60fps (ideal alone is a soft hint devices often ignore → 30fps →
-          // Web stuck at 120 codes/s while Android's CameraX pins 60).
-          frameRate: { ideal: 60, max: 60 },
+      const attempts: MediaStreamConstraints[] = [
+        {
+          video: {
+            facingMode: "environment",
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 60, max: 60 },
+          },
+          audio: false,
         },
-        audio: false,
-      })
+        { video: { facingMode: "environment" }, audio: false },
+        { video: true, audio: false },
+      ]
+      let stream: MediaStream | null = null
+      let lastError: unknown = null
+      for (const constraints of attempts) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints)
+          break
+        } catch (e) {
+          lastError = e
+        }
+      }
+      if (!stream) throw lastError ?? new Error("没有可用摄像头")
       streamRef.current = stream
       const video = videoRef.current
       if (video) {
         video.srcObject = stream
         await video.play()
       }
+      return true
     } catch (e) {
       setError(
         `无法访问摄像头：${e instanceof Error ? e.message : String(e)}。请确认已授予摄像头权限，并使用 HTTPS 或 localhost。`
       )
+      stageRef.current = "error"
       setStage("error")
+      return false
     }
   }, [])
 
@@ -457,7 +638,7 @@ export function ReceivePage(): React.ReactElement {
   }, [])
 
   /** Initialize both workers and wire up their message handlers. */
-  const initWorkers = useCallback(async (): Promise<void> => {
+  const initWorkers = useCallback(async (): Promise<boolean> => {
     // Re-init (e.g. "再接收一次") must terminate the previous pool + receive
     // worker, or every retry leaks N qr workers (zxing WASM) + a receive worker.
     for (const w of qrWorkersRef.current) w.terminate()
@@ -539,7 +720,8 @@ export function ReceivePage(): React.ReactElement {
         `Worker 初始化失败：${e instanceof Error ? e.message : String(e)}。刷新重试。`
       )
       setStage("error")
-      return
+      stageRef.current = "error"
+      return false
     }
     dbg(`[init] receive worker + ${qrWorkers.length} qr workers READY ✓`)
 
@@ -581,8 +763,11 @@ export function ReceivePage(): React.ReactElement {
       if (!d) return
       if (d.jobId !== undefined && d.jobId !== jobIdRef.current) return // stale
       if (d.type === "status") {
-        if (d.complete) {
+        if (rejectingSessionRef.current) return
+        if (d.complete && !assemblingRef.current) {
+          assemblingRef.current = true
           dbg("[recv] COMPLETE → assemble")
+          stageRef.current = "recovering"
           setStage((s) => (s === "scanning" ? "recovering" : s))
           recv.postMessage({ type: "assemble", jobId: jobIdRef.current })
         }
@@ -593,7 +778,23 @@ export function ReceivePage(): React.ReactElement {
           originalSize?: number
           compressedSize?: number
           compressedSizeKnown?: boolean
+          segmented?: boolean
+          rootId?: string
         } | null
+        const targetRoot = targetRootRef.current
+        if (targetRoot && (!m?.segmented || m.rootId !== targetRoot)) {
+          rejectingSessionRef.current = true
+          assemblingRef.current = false
+          recv.postMessage({ type: "reset", jobId: jobIdRef.current })
+          setProgress((p) => ({
+            ...initialProgress(),
+            segmentReceived: p.segmentReceived,
+            segmentCount: p.segmentCount,
+            statusText: "已忽略其他传输，继续等待选中任务的下一段…",
+          }))
+          dbg(`[recv] ignored root ${m?.rootId ?? "non-segmented"}; target=${targetRoot}`)
+          return
+        }
         setProgress((p) => ({
           ...p,
           fileName: m?.fileName ?? p.fileName,
@@ -601,24 +802,93 @@ export function ReceivePage(): React.ReactElement {
           compressedSize: m?.compressedSize ?? p.compressedSize,
           compressedSizeKnown: m?.compressedSizeKnown ?? p.compressedSizeKnown,
         }))
+      } else if (d.type === "reset-ack" && rejectingSessionRef.current) {
+        rejectingSessionRef.current = false
+        assemblingRef.current = false
+        stageRef.current = "scanning"
+        setStage("scanning")
       } else if (d.type === "warn") {
         dbg(`[recv] warn: ${d.message}`)
+      } else if (d.type === "segment") {
+        // A descriptor-v4 segment was verified and durably committed. Resume
+        // capture for the next child session; the worker intentionally drops
+        // the completed decoder so root-sized bytes never accumulate in RAM.
+        setProgress((p) => ({
+          ...p,
+          complete: false,
+          receivedSymbols: 0,
+          totalSymbols: 0,
+          decodedSymbols: 0,
+          decodedBlocks: 0,
+          totalBlocks: 0,
+          decodedFraction: 0,
+          metaConfirmed: false,
+          progressPct: 0,
+          statusText: `已恢复 ${d.received}/${d.count} 段，等待下一段…`,
+          segmentReceived: d.received,
+          segmentCount: d.count,
+        }))
+        assemblingRef.current = false
+        stageRef.current = "scanning"
+        setStage("scanning")
+        resumeCaptureRef.current()
+        void refreshTasks()
+        dbg(`[recv] segment ${d.index + 1}/${d.count} complete; awaiting rest`)
+      } else if (d.type === "stored-result") {
+        const task = d.task as StoredSegmentTask
+        targetRootRef.current = null
+        dbg(`[recv] segmented task complete: ${task.rootId}`)
+        setResult(null)
+        setStoredResult(task)
+        assemblingRef.current = false
+        stageRef.current = "done"
+        setStage("done")
+        teardown()
+        void refreshTasks()
+      } else if (d.type === "segment-error") {
+        // A bad/current segment is retryable. Earlier verified segments remain
+        // durable, and the worker has already swapped to a fresh child session.
+        assemblingRef.current = false
+        setProgress((p) => ({
+          ...p,
+          complete: false,
+          receivedSymbols: 0,
+          totalSymbols: 0,
+          decodedSymbols: 0,
+          decodedBlocks: 0,
+          totalBlocks: 0,
+          decodedFraction: 0,
+          metaConfirmed: false,
+          progressPct: 0,
+          statusText: `当前分段校验失败，可直接重新扫码：${d.message}`,
+        }))
+        stageRef.current = "scanning"
+        setStage("scanning")
+        resumeCaptureRef.current()
       } else if (d.type === "result") {
+        targetRootRef.current = null
         dbg(`[recv] RESULT: ${d.recovered?.kind} crcOk=${d.crcOk}`)
         setResult({
           recovered: d.recovered,
           crcOk: d.crcOk,
           crcKnown: d.crcKnown,
         })
+        setStoredResult(null)
+        assemblingRef.current = false
+        stageRef.current = "done"
         setStage("done")
         teardown()
       } else if (d.type === "error") {
         dbg(`[recv] error: ${d.message}`)
         setError(d.message)
+        assemblingRef.current = false
+        stageRef.current = "error"
         setStage("error")
+        teardown()
       }
     })
-  }, [teardown, dbg, applyStatus])
+    return true
+  }, [teardown, dbg, applyStatus, refreshTasks])
 
   /** The per-frame capture + decode loop (driven by requestVideoFrameCallback). */
   const captureLoop = useCallback(() => {
@@ -748,9 +1018,11 @@ export function ReceivePage(): React.ReactElement {
       rafRef.current = requestAnimationFrame(captureLoop)
     }
   }, [captureLoop])
+  resumeCaptureRef.current = scheduleNextFrame
 
   /** Start scanning: init workers, begin capture loop. */
   const startScanning = useCallback(async () => {
+    stageRef.current = "scanning"
     setStage("scanning")
     setError(null)
     scanningActiveRef.current = true
@@ -761,22 +1033,65 @@ export function ReceivePage(): React.ReactElement {
     transferStartMsRef.current = 0
     firstFrameLoggedRef.current = false
     setProgress(initialProgress())
-    await initWorkers()
+    assemblingRef.current = false
+    rejectingSessionRef.current = false
+    const initialized = await initWorkers()
+    if (!initialized) {
+      scanningActiveRef.current = false
+      return false
+    }
     // Begin the capture loop on the next frame.
     scheduleNextFrame()
+    return true
   }, [initWorkers, scheduleNextFrame])
 
   /** Reset to scan again (new session). */
   const reset = useCallback(() => {
-    scanningActiveRef.current = false
+    teardown()
+    assemblingRef.current = false
+    rejectingSessionRef.current = false
+    targetRootRef.current = null
     jobIdRef.current += 1
     recvWorkerRef.current?.postMessage({ type: "reset", jobId: jobIdRef.current })
     rateSamplesRef.current = []
     transferStartMsRef.current = 0
     setResult(null)
+    setStoredResult(null)
     setError(null)
+    stageRef.current = "camera"
     setStage("camera")
-  }, [])
+  }, [teardown])
+
+  const continueStoredTask = useCallback(async (task: StoredSegmentTask) => {
+    targetRootRef.current = task.rootId
+    if (await startCamera()) {
+      const started = await startScanning()
+      if (started) {
+        setProgress((p) => ({
+          ...p,
+          segmentReceived: task.received.length,
+          segmentCount: task.segmentCount,
+          statusText: `继续恢复「${task.fileName}」，已有 ${task.received.length}/${task.segmentCount} 段…`,
+        }))
+      }
+    }
+  }, [startCamera, startScanning])
+
+  const removeStoredTask = useCallback(async (task: StoredSegmentTask) => {
+    if (!window.confirm(`删除「${task.fileName}」的恢复记录和已收分段？`)) return
+    try {
+      await deleteStoredTask(task.rootId)
+      if (targetRootRef.current === task.rootId) targetRootRef.current = null
+      if (storedResult?.rootId === task.rootId) {
+        setStoredResult(null)
+        stageRef.current = "camera"
+        setStage("camera")
+      }
+      await refreshTasks()
+    } catch (e) {
+      setTaskError(`删除恢复任务失败：${e instanceof Error ? e.message : String(e)}`)
+    }
+  }, [refreshTasks, storedResult])
 
   return (
     <div className="app receive-page">
@@ -812,8 +1127,8 @@ export function ReceivePage(): React.ReactElement {
             <div className="receive-actions">
               <button
                 onClick={async () => {
-                  await startCamera()
-                  await startScanning()
+                  targetRootRef.current = null
+                  if (await startCamera()) await startScanning()
                 }}
                 className="btn btn-primary"
               >
@@ -830,6 +1145,10 @@ export function ReceivePage(): React.ReactElement {
             <ResultView result={result} onReset={reset} />
           )}
 
+          {stage === "done" && storedResult && (
+            <StoredResultView task={storedResult} onReset={reset} />
+          )}
+
           {stage === "error" && (
             <div className="error-area">
               <p className="error-msg">❌ {error}</p>
@@ -839,12 +1158,154 @@ export function ReceivePage(): React.ReactElement {
             </div>
           )}
         </div>
+
+        <TaskHistory
+          tasks={tasks}
+          error={taskError}
+          busy={stage === "scanning" || stage === "recovering"}
+          onContinue={continueStoredTask}
+          onDownload={saveStoredTask}
+          onDelete={removeStoredTask}
+        />
       </main>
 
       <footer className="app-footer">
         <span className="app-footer-hint">AirFerry · 无网文件传输</span>
       </footer>
     </div>
+  )
+}
+
+function StoredResultView({
+  task,
+  onReset,
+}: {
+  task: StoredSegmentTask
+  onReset: () => void
+}): React.ReactElement {
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const save = async () => {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveStoredTask(task)
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="result-area">
+      <h2>✅ 全部分段已安全恢复</h2>
+      <p className="crc-status">✔️ 每段 CRC/SHA-256 均已校验，并已保存到本机恢复历史</p>
+      <div className="file-result">
+        <p>📄 {task.fileName}（{formatSize(task.rootOriginalSize)}）</p>
+        <button onClick={() => void save()} disabled={saving} className="btn btn-primary">
+          {saving ? "正在写入…" : "保存文件"}
+        </button>
+      </div>
+      {saveError && <p className="error-msg">保存失败：{saveError}</p>}
+      <button onClick={onReset} className="btn btn-primary">
+        再接收一次
+      </button>
+    </div>
+  )
+}
+
+function TaskHistory({
+  tasks,
+  error,
+  busy,
+  onContinue,
+  onDownload,
+  onDelete,
+}: {
+  tasks: StoredSegmentTask[]
+  error: string | null
+  busy: boolean
+  onContinue: (task: StoredSegmentTask) => Promise<void>
+  onDownload: (task: StoredSegmentTask) => Promise<void>
+  onDelete: (task: StoredSegmentTask) => Promise<void>
+}): React.ReactElement | null {
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [workingRoot, setWorkingRoot] = useState<string | null>(null)
+  if (tasks.length === 0 && !error) return null
+
+  const run = async (task: StoredSegmentTask, action: () => Promise<void>) => {
+    setWorkingRoot(task.rootId)
+    setActionError(null)
+    try {
+      await action()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setWorkingRoot(null)
+    }
+  }
+
+  return (
+    <section className="task-history" aria-label="恢复历史">
+      <div className="task-history-title">
+        <h2>恢复历史</h2>
+        <span>{tasks.length} 个任务</span>
+      </div>
+      {(error || actionError) && <p className="error-msg">{error || actionError}</p>}
+      <div className="task-list">
+        {tasks.map((task) => {
+          const received = task.received.length
+          const pct = task.segmentCount > 0 ? (received / task.segmentCount) * 100 : 0
+          const complete = task.state === "complete"
+          const working = workingRoot === task.rootId
+          return (
+            <article className="task-card" key={task.rootId}>
+              <div className="task-card-head">
+                <div>
+                  <div className="task-name">{task.fileName}</div>
+                  <div className="task-meta">
+                    {complete ? "已完成" : "待恢复"} · {received}/{task.segmentCount} 段 · {formatSize(task.rootOriginalSize)}
+                  </div>
+                  {!complete && (
+                    <div className="task-missing">缺少第 {missingSegmentSummary(task)} 段</div>
+                  )}
+                </div>
+                <time>{new Date(task.updatedAt).toLocaleString()}</time>
+              </div>
+              <div className="task-progress" aria-label={`已恢复 ${received}/${task.segmentCount} 段`}>
+                <span style={{ width: `${Math.min(100, pct)}%` }} />
+              </div>
+              <div className="task-actions">
+                {complete ? (
+                  <button
+                    className="btn btn-primary"
+                    disabled={working}
+                    onClick={() => void run(task, () => onDownload(task))}
+                  >
+                    {working ? "处理中…" : "保存文件"}
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-primary"
+                    disabled={busy || working}
+                    onClick={() => void run(task, () => onContinue(task))}
+                  >
+                    继续恢复
+                  </button>
+                )}
+                <button
+                  className="btn"
+                  disabled={working}
+                  onClick={() => void run(task, () => onDelete(task))}
+                >
+                  删除记录
+                </button>
+              </div>
+            </article>
+          )
+        })}
+      </div>
+    </section>
   )
 }
 
@@ -896,6 +1357,17 @@ function ScanProgress({
         ) : (
           <div className="progress-file-name progress-file-name-placeholder">
             等待识别二维码…
+          </div>
+        )}
+        {progress.segmentCount > 1 && (
+          <div className="progress-row progress-row-segment">
+            <span className="progress-label">分段</span>
+            <span className="progress-value">
+              {progress.segmentReceived} / {progress.segmentCount} 段
+              {progress.segmentReceived < progress.segmentCount
+                ? "（已收，继续扫描下一段）"
+                : "（全部已收，合并中…）"}
+            </span>
           </div>
         )}
         <div className="progress-row">
@@ -1026,7 +1498,9 @@ function FileView({
   data: Uint8Array
 }): React.ReactElement {
   const onDownload = () => {
-    const blob = new Blob([data], { type: "application/octet-stream" })
+    const blob = new Blob([data.slice().buffer as ArrayBuffer], {
+      type: "application/octet-stream",
+    })
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
@@ -1055,7 +1529,9 @@ function BundleView({
   const onDownloadAll = () => {
     // Download each sequentially (no zip dependency in M2).
     for (const e of entries) {
-      const blob = new Blob([e.data], { type: "application/octet-stream" })
+      const blob = new Blob([e.data.slice().buffer as ArrayBuffer], {
+        type: "application/octet-stream",
+      })
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
@@ -1070,7 +1546,9 @@ function BundleView({
       <ul className="bundle-list">
         {entries.map((e, i) => {
           const onDownload = () => {
-            const blob = new Blob([e.data], { type: "application/octet-stream" })
+            const blob = new Blob([e.data.slice().buffer as ArrayBuffer], {
+              type: "application/octet-stream",
+            })
             const url = URL.createObjectURL(blob)
             const a = document.createElement("a")
             a.href = url
