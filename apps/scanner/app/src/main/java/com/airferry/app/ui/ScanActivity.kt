@@ -108,6 +108,13 @@ class ScanActivity : ComponentActivity() {
         val framesDropped: Long = 0,
         val fileName: String = "",
         val fileSize: Long = 0,
+        /** Real compressed payload size (descriptor `compressed_size`); for
+         *  segmented transfers this is the whole compressed-stream size. */
+        val compressedSize: Long = 0,
+        /** Zero-based current segment index when the transfer is segmented (0 otherwise). */
+        val segmentIndex: Int = 0,
+        /** Total segment count when the transfer is segmented (1 otherwise). */
+        val segmentCount: Int = 1,
         val complete: Boolean = false,
         val jniReady: Boolean = false,
         /** Elapsed transfer time in ms (0 = not started yet). */
@@ -229,19 +236,23 @@ class ScanActivity : ComponentActivity() {
                                     modifier = Modifier.padding(bottom = 4.dp)
                                 )
                             }
-                            // 大小行（原大小~压缩后大小）
-                            val wireTotal = state.totalSymbols.toLong() * state.symbolSize.coerceAtLeast(1)
+                            // 大小行（原大小~压缩后大小）。压缩后大小来自描述符
+                            // （分段时为整条压缩流大小），不是线上含冗余的符号字节。
                             val showOrig = state.fileSize > 0
-                            val showWire = wireTotal > 0 && state.symbolSize > 0
-                            if (showOrig || showWire) {
+                            val showCompressed = state.compressedSize > 0
+                            if (showOrig || showCompressed) {
                                 val sizeStr = buildString {
                                     if (showOrig) {
                                         append(formatSize(state.fileSize))
-                                        if (showWire) append("~压缩后 ")
+                                        if (showCompressed) append("~压缩后 ")
                                     }
-                                    if (showWire) append(formatSize(wireTotal))
+                                    if (showCompressed) append(formatSize(state.compressedSize))
                                 }
                                 InfoRow("大小", sizeStr)
+                            }
+                            // 分段传输：明确当前收的是第几段。
+                            if (state.segmentCount > 1) {
+                                InfoRow("分段", "${state.segmentIndex + 1} / ${state.segmentCount}")
                             }
                             InfoRow("已识别符号", "${state.receivedSymbols} / ${state.totalSymbols}")
                             InfoRow("解码速率", "${state.decodePerSec} 符号/秒")
@@ -497,7 +508,13 @@ class ScanActivity : ComponentActivity() {
     private data class FrameSnapshot(
         val progress: ReceiverSessionManager.Progress,
         val fileName: String,
-        val fileSize: Long
+        val fileSize: Long,
+        /** Real compressed size (whole compressed stream for segmented). */
+        val compressedSize: Long,
+        /** Zero-based current segment index (0 when not segmented). */
+        val segmentIndex: Int,
+        /** Total segment count (1 when not segmented). */
+        val segmentCount: Int
     )
 
     /** Ingest-thread entry (serialized by the pool): heavy work here, post a snapshot. */
@@ -524,8 +541,20 @@ class ScanActivity : ComponentActivity() {
         // Read file metadata from session (JNI) — keep on this background thread.
         val fn = if (session.isInitialized) session.fileName() else ""
         val fs = if (session.isInitialized) session.fileSize() else 0L
+        // Real compressed size. For a segmented transfer each child session only
+        // reports THIS segment's compressed length; the user-facing "压缩后" is
+        // the whole compressed stream (root_original_size). For a single-object
+        // transfer compressed_size is exactly the payload size.
+        val segmented = session.isInitialized && session.isSegmented()
+        val cs = if (session.isInitialized) {
+            if (segmented) session.rootOriginalSize() else session.compressedSize()
+        } else {
+            0L
+        }
+        val segIdx = if (segmented) session.segmentIndex() else 0
+        val segCount = if (segmented) session.segmentCount() else 1
 
-        val snapshot = FrameSnapshot(progress, fn, fs)
+        val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount)
         if (status.complete) {
             // Block any further ingest before the completion path (assemble +
             // file I/O + Activity start) runs on the main thread.
@@ -638,6 +667,9 @@ class ScanActivity : ComponentActivity() {
                 framesDropped = droppedTotal,
                 fileName = s.fileName,
                 fileSize = s.fileSize,
+                compressedSize = s.compressedSize,
+                segmentIndex = s.segmentIndex,
+                segmentCount = s.segmentCount,
                 statusText = statusMsg,
                 complete = progress.complete,
                 transferElapsedMs = elapsedMs,
