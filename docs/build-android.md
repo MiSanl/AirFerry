@@ -179,7 +179,7 @@ apps/scanner/
 │   │   ├── TextLike.kt           # 文本类扩展名启发式 + 严格 UTF-8
 │   │   └── FileNameUtil.kt       # 接收文件命名（去重 / 目录）
 │   └── ui/
-│       ├── ScanActivity.kt       # 扫描页（ImageAnalysis 1920×1080；FLAG_KEEP_SCREEN_ON 防长传息屏；压缩后大小用描述符真实值、分段时显示第 N 段/共 M 段）
+│       ├── ScanActivity.kt       # 扫描页（ImageAnalysis 1920×1080；FLAG_KEEP_SCREEN_ON 防长传息屏；压缩后大小用描述符真实值、分段时显示第 N 段/共 M 段、重扫已完成段立即识别跳过不重传整段）
 │       ├── ReceiveDetailActivity.kt  # 结果页同样 FLAG_KEEP_SCREEN_ON（防止恢复瞬间系统超时接管而变暗）
 │       ├── ReceiveTextActivity.kt    # 文字/文本类复制页（同上常亮）
 │       ├── ReceiveBundleActivity.kt  # 多文件；.txt 等可点开复制（同上常亮）

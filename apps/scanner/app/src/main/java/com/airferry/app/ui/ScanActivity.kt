@@ -554,6 +554,27 @@ class ScanActivity : ComponentActivity() {
         val segIdx = if (segmented) session.segmentIndex() else 0
         val segCount = if (segmented) session.segmentCount() else 1
 
+        // Duplicate-segment fast path: once the descriptor is confirmed we know
+        // this segment's real index. If it is already stored in the active
+        // SegmentAssembler, there is no point receiving the whole (~32 MiB)
+        // segment again — skip straight to the next one.
+        if (progress.metaConfirmed && segmented && !status.complete) {
+            val asm = segAssembler
+            if (asm != null &&
+                asm.rootSessionIdLo() == session.rootSessionIdLo() &&
+                asm.rootSessionIdHi() == session.rootSessionIdHi() &&
+                asm.hasSegment(segIdx)
+            ) {
+                val dupText = "第 ${segIdx + 1}/$segCount 段已接收过，自动跳过"
+                runOnUiThread {
+                    Toast.makeText(this, dupText, Toast.LENGTH_SHORT).show()
+                    updateUi { it.copy(statusText = dupText) }
+                }
+                swapReceiverForNextSegment()
+                return
+            }
+        }
+
         val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount)
         if (status.complete) {
             // Block any further ingest before the completion path (assemble +
