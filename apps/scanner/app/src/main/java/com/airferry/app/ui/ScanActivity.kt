@@ -551,10 +551,7 @@ class ScanActivity : ComponentActivity() {
                 "hasSeg=${if (inMem) asm!!.hasSegment(idx) else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)} => dup=$dup")
             if (dup) {
                 val dupText = "第 ${idx + 1}/$cnt 段已接收过，自动跳过"
-                runOnUiThread {
-                    Toast.makeText(this, dupText, Toast.LENGTH_SHORT).show()
-                    updateUi { it.copy(statusText = dupText) }
-                }
+                runOnUiThread { updateUi { it.copy(statusText = dupText) } }
                 swapReceiverForNextSegment()
                 return
             }
