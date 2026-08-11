@@ -46,7 +46,7 @@ interface MetaInfo {
   crc32Known: boolean
   metaConfirmed: boolean
   segmented: boolean
-  /** Canonical 128-bit root id (hex), present for descriptor-v4 segments. */
+  /** Canonical 128-bit root id (hex), present for descriptor-v5 segments. */
   rootId?: string
 }
 
@@ -300,13 +300,22 @@ function maybePostMeta(jobId: number): void {
     const rootLo = session.root_session_id_lo()
     const rootHi = session.root_session_id_hi()
     const index = session.segment_index()
+    // Capture the job id at spawn time; this IIFE awaits IndexedDB and so runs
+    // outside the serialized messageQueue. While it awaits, the user may reset
+    // / switch transfers (bumping activeJobId and bootstrapping a brand-new
+    // session). Re-check activeJobId before dropSession() so a stale duplicate
+    // detection for transfer A cannot free the now-live session for transfer B
+    // (the `segment-duplicate` message above is already guarded by jobId on the
+    // UI side, but dropSession() is unconditional without this check).
+    const spawnJobId = jobId
     void (async () => {
       try {
         if (await hasStoredSegment(rootLo, rootHi, index)) {
+          if (spawnJobId !== activeJobId) return
           post({
             type: "segment-duplicate",
             index,
-            jobId,
+            jobId: spawnJobId,
           })
           dropSession()
         }
@@ -340,7 +349,7 @@ async function assembleAndRecover(jobId: number): Promise<{
 }
 
 /**
- * Handle a completed descriptor-v4 segment: verify it, then atomically publish
+ * Handle a completed descriptor-v5 segment: verify it, then atomically publish
  * the bytes + receipt ledger to IndexedDB. No root-sized Uint8Array is created;
  * the UI streams completed tasks to a user-selected file when supported.
  *
@@ -369,7 +378,7 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
     throw new Error("分段恢复尚未完成或组装失败")
   }
 
-  // Descriptor v4 requires a SHA-256 over this segment's **compressed** bytes.
+  // Descriptor v5 requires a SHA-256 over this segment's **compressed** bytes.
   const expectedSha = session.raw_sha256()
   const expectedRootSha = session.root_sha256()
   if (expectedSha.length !== 32 || expectedRootSha.length !== 32) {

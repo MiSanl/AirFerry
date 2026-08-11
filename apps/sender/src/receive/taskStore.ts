@@ -1,4 +1,4 @@
-/** Durable browser-side ledger for descriptor-v4 segmented receives. */
+/** Durable browser-side ledger for descriptor-v5 segmented receives. */
 
 const DB_NAME = "airferry-receive-v1"
 const DB_VERSION = 3
@@ -262,12 +262,42 @@ export async function storeVerifiedSegment(
 }
 
 /**
- * Whether a specific segment of a root transfer is already stored.
+ * SHA-256 (lowercase hex) of an ArrayBuffer. Uses the Web Crypto API, which is
+ * available in the web receiver's secure context (HTTPS / localhost). Returns
+ * `null` if crypto is unavailable — the caller treats that as "not verified" so
+ * it falls through to the normal store path's self-healing instead of trusting
+ * a possibly-corrupt record.
+ */
+async function sha256Hex(bytes: ArrayBuffer): Promise<string | null> {
+  try {
+    if (!globalThis.crypto?.subtle) return null
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes)
+    return Array.from(new Uint8Array(digest), (b) =>
+      b.toString(16).padStart(2, "0")
+    ).join("")
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether a specific segment of a root transfer is already stored AND its Blob
+ * is actually present and intact (byte-length and SHA-256 match the ledger).
  *
- * Used for **early duplicate detection**: the moment a descriptor-v4 segment's
+ * Used for **early duplicate detection**: the moment a descriptor-v5 segment's
  * meta is confirmed, the receiver checks here — if the segment was already
  * received, the UI is told immediately (instead of scanning the whole segment
  * again and only de-duplicating after it fully plays out).
+ *
+ * This checks BOTH the ledger bitmap (task.received) AND the actual segment
+ * Blob in the SEGMENTS store, including a full SHA-256 over the stored bytes
+ * compared against the per-segment hash the ledger committed. A browser/storage
+ * crash can leave a checked ledger entry whose Blob is missing, truncated, or
+ * corrupted in place; a length-only check can be fooled by same-length corrupt
+ * bytes. Only returning true when the segment re-hashes correctly guarantees
+ * the caller may safely skip it. Any mismatch (or a ledger without a per-segment
+ * hash, i.e. a legacy record) makes the caller rescan, which then hits the
+ * store path's heal-on-duplicate logic and repairs the record.
  */
 export async function hasStoredSegment(
   rootLo: bigint,
@@ -277,13 +307,46 @@ export async function hasStoredSegment(
   const rootId = rootIdHex(rootLo, rootHi)
   const db = await openDb()
   try {
-    const tx = db.transaction(TASKS, "readonly")
+    const tx = db.transaction([TASKS, SEGMENTS], "readonly")
     const done = transactionDone(tx)
     const task = (await request(
       tx.objectStore(TASKS).get(rootId)
     )) as StoredSegmentTask | undefined
+    if (!task || !task.received.includes(index)) {
+      await done
+      return false
+    }
+    // Ledger claims the segment was received — verify the Blob is actually
+    // present, matches the canonical segment length, AND hashes to the SHA-256
+    // recorded in the ledger when that segment was first stored. A length-only
+    // check can be fooled by same-length-but-corrupt bytes (a crash mid-write,
+    // or IndexedDB backing-store corruption); the stored segment's SHA must
+    // match what the ledger committed. If the ledger has no hash for this
+    // index (legacy record), or the SHA/bytes are missing, return false so the
+    // caller rescans and the store path's heal-on-duplicate repairs the record.
+    const expectedLength = Math.min(
+      SEGMENT_RAW_BYTES,
+      task.compressedSize - index * SEGMENT_RAW_BYTES
+    )
+    const stored = (await request(
+      tx.objectStore(SEGMENTS).get([rootId, index])
+    )) as SegmentRecord | undefined
+    if (!stored || stored.bytes.byteLength !== expectedLength) {
+      await done
+      return false
+    }
+    const expectedSha = task.hashes[index]
+    if (!expectedSha || !/^[0-9a-f]{64}$/.test(expectedSha)) {
+      await done
+      return false
+    }
+    const actualSha = await sha256Hex(stored.bytes)
+    if (actualSha === null || actualSha !== expectedSha) {
+      await done
+      return false
+    }
     await done
-    return !!task && task.received.includes(index)
+    return true
   } finally {
     db.close()
   }

@@ -48,11 +48,15 @@ let fastMod: {
 /** Try to load the self-compiled ZXing-C++ WASM (fast backend). */
 async function loadFastBackend(): Promise<boolean> {
   try {
-    // The fast backend is an optional generated artifact. Keep the specifier
-    // runtime-dynamic so builds without that artifact can still ship the
-    // offline zxing-wasm fallback instead of failing module resolution.
-    const modulePath = "../fastzxing/airferry_zxing.js"
-    const mod = await import(/* @vite-ignore */ modulePath)
+    // The fast backend is an optional generated artifact (build-fastzxing.sh,
+    // git-ignored). In the web receiver build it is copied to the site root
+    // (public/) by prepare-wasm.cjs; at runtime this worker lives at
+    // assets/<hash>.js, so "../airferry_zxing.js" resolves to the site root —
+    // the same mechanism zxing-wasm's locateFile uses for zxing_reader.wasm.
+    // Keep @vite-ignore so Vite doesn't try to bundle it (it's a public runtime
+    // asset); builds without the artifact still ship the zxing-wasm fallback.
+    const moduleUrl = new URL("../airferry_zxing.js", self.location.href).href
+    const mod = await import(/* @vite-ignore */ moduleUrl)
     const inst = await (mod.default as () => Promise<unknown>)()
     const m = inst as typeof fastMod
     if (!m || m._airferry_wasm_abi_version() !== 1) return false
@@ -74,34 +78,42 @@ function decodeFastY(
   const payloads: Uint8Array[] = []
   if (!fastMod) return payloads
   const srcPtr = fastMod._malloc(yPlane.length)
-  fastMod.HEAPU8.set(yPlane, srcPtr)
   const lenPtr = fastMod._malloc(8)
-  fastMod.HEAPU32[lenPtr >> 2] = 0
-  fastMod.HEAPU32[(lenPtr >> 2) + 1] = 0
-  const outPtr = fastMod._airferry_wasm_decode_multi_y(
-    srcPtr,
-    yPlane.length,
-    w,
-    h,
-    rowStride,
-    lenPtr
-  )
-  const outLen = fastMod.HEAPU32[lenPtr >> 2]
-  if (outPtr !== 0 && outLen > 0) {
-    const packed = fastMod.HEAPU8.subarray(outPtr, outPtr + outLen)
-    const count = packed[0] | (packed[1] << 8) | (packed[2] << 16) | (packed[3] << 24)
-    let off = 4
-    for (let i = 0; i < count; i++) {
-      const len =
-        packed[off] | (packed[off + 1] << 8) | (packed[off + 2] << 16) | (packed[off + 3] << 24)
-      off += 4
-      if (len >= 64) payloads.push(packed.slice(off, off + len))
-      off += len + 16 // payload + 4×s32 bbox
+  // Wrap the decode + parse in try/finally so the two input allocations are
+  // released even if _airferry_wasm_decode_multi_y traps (a WASM trap on a
+  // malformed/corrupt luminance plane is rare but possible). The WASM heap only
+  // grows, never shrinks, so leaking w*h+8 bytes per trap would accumulate
+  // unbounded over a long scan session.
+  try {
+    fastMod.HEAPU8.set(yPlane, srcPtr)
+    fastMod.HEAPU32[lenPtr >> 2] = 0
+    fastMod.HEAPU32[(lenPtr >> 2) + 1] = 0
+    const outPtr = fastMod._airferry_wasm_decode_multi_y(
+      srcPtr,
+      yPlane.length,
+      w,
+      h,
+      rowStride,
+      lenPtr
+    )
+    const outLen = fastMod.HEAPU32[lenPtr >> 2]
+    if (outPtr !== 0 && outLen > 0) {
+      const packed = fastMod.HEAPU8.subarray(outPtr, outPtr + outLen)
+      const count = packed[0] | (packed[1] << 8) | (packed[2] << 16) | (packed[3] << 24)
+      let off = 4
+      for (let i = 0; i < count; i++) {
+        const len =
+          packed[off] | (packed[off + 1] << 8) | (packed[off + 2] << 16) | (packed[off + 3] << 24)
+        off += 4
+        if (len >= 64) payloads.push(packed.slice(off, off + len))
+        off += len + 16 // payload + 4×s32 bbox
+      }
+      fastMod._airferry_wasm_free(outPtr)
     }
-    fastMod._airferry_wasm_free(outPtr)
+  } finally {
+    fastMod._free(srcPtr)
+    fastMod._free(lenPtr)
   }
-  fastMod._free(srcPtr)
-  fastMod._free(lenPtr)
   return payloads
 }
 

@@ -210,9 +210,9 @@ public sealed class ReceiverSession : IDisposable
         lock (_gate) return _initialized && NativeBridge.ReceiverCrc32Known(_handle) == 1;
     }
 
-    // ── descriptor-v4 segment metadata (large-transfer child objects) ───────
+    // ── descriptor-v5 segment metadata (large-transfer child objects) ───────
 
-    /// <summary>1 if the confirmed descriptor was a v4 large-transfer child object.</summary>
+    /// <summary>1 if the confirmed descriptor was a v5 large-transfer child object.</summary>
     public bool IsSegmented()
     {
         lock (_gate) return _initialized && NativeBridge.ReceiverIsSegmented(_handle) == 1;

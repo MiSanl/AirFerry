@@ -63,6 +63,19 @@ jobs:
         working-directory: apps/sender
         run: npm ci --ignore-scripts && npm run wasm
 
+      # FAST ZXing-C++ → WASM fast path for the web receiver's QR decode worker.
+      # Produces apps/sender/src/fastzxing/airferry_zxing.{js,wasm} (git-ignored);
+      # prepare-wasm.cjs (web prebuild) copies them into public/. Pinned to the
+      # same Emscripten version as core/zxing-decoder/link-wasm.sh. ZXing-C++ is
+      # fetched at the pinned immutable commit (first run needs network).
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.64
+
+      - name: Build FAST ZXing-C++ WASM
+        run: ./scripts/build-fastzxing.sh
+
       - name: Build web sender (dist/)
         working-directory: apps/web
         run: npm ci && npm run build

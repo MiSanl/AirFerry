@@ -13,7 +13,7 @@
  *
  * The descriptor (`FileMeta`) currently carries filename / original_size /
  * crc32 / compression / compressed_size — no mime/kind field. Adding one would
- * mean a v4 descriptor extension + four-way sync (Rust core, JS, Android,
+ * mean a v5 descriptor extension + four-way sync (Rust core, JS, Android,
  * Windows) and risks the v2/v3 disambiguation regression that was already
  * fixed once. A payload magic puts the text/file distinction in the byte layer
  * alongside the existing bundle logic, keeps the descriptor unchanged, and is

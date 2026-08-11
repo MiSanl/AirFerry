@@ -4,7 +4,7 @@
  * A logical transfer (single file, multi-file bundle, or text) is compressed
  * **once** into a single compressed stream, then that stream is split into
  * fixed `SEGMENT_RAW_BYTES` (~32 MiB) segments. Each segment is independently
- * RaptorQ-encoded as a descriptor-v4 child session (child session id =
+ * RaptorQ-encoded as a descriptor-v5 child session (child session id =
  * `deriveSegment(root, index)`). The receiver recovers each segment's
  * **compressed** bytes, concatenates them in order, and decompresses exactly
  * once to rebuild the original payload.
@@ -127,7 +127,7 @@ export function sliceSegment(compressed: Uint8Array, segmentIndex: number): Uint
 }
 
 /**
- * Build the descriptor-v4 metadata for a single segment of a compressed root
+ * Build the descriptor-v5 metadata for a single segment of a compressed root
  * stream. `segmentCompressed` is this segment's compressed bytes (used for the
  * descriptor's `raw_sha256`). `rootOriginalSize` is the **whole decompressed**
  * original size and `rootCompressedSize` the whole compressed stream size.
@@ -155,7 +155,7 @@ export async function buildSegmentMeta(
 }
 
 /**
- * Descriptor-v4 segment metadata in the form consumed by
+ * Descriptor-v5 segment metadata in the form consumed by
  * `SenderSessionWasm.new_segment` (lo/hi split for the wasm-bindgen u64 args).
  */
 export interface SegmentMetaWasm {

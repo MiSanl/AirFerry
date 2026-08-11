@@ -61,7 +61,7 @@ export function QrStream({
 
   // A rAF callback is scheduled inside the effect's `loop` closure which binds
   // the `session` captured at render time. When the parent swaps the session
-  // (e.g. a descriptor-v4 segment switch calls `releaseOwnedSession()` which
+  // (e.g. a descriptor-v5 segment switch calls `releaseOwnedSession()` which
   // frees the old `SenderSessionWasm`), a still-queued rAF tick can run against
   // the *freed* session and wasm-bindgen then throws "null pointer passed to
   // rust" (use-after-free). `activeSessionRef` always holds the newest prop so
@@ -196,6 +196,16 @@ export function QrStream({
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
     }
   }, [render, fps])
+
+  // Drop the module-level ImageData cache on unmount. The cache is keyed by
+  // drawSize and each entry is drawSize²×4 bytes; it is bounded within a single
+  // session (a handful of sizes) but would accumulate across tab/session reloads
+  // with varying DPR or segment versions without this eviction.
+  useEffect(() => {
+    return () => {
+      imgDataCache.clear()
+    }
+  }, [])
 
   const toggleFullscreen = useCallback(() => {
     setFullscreen((f) => !f)

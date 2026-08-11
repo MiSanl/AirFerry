@@ -240,9 +240,9 @@ class ReceiverSessionManager {
     fun crc32Known(): Boolean =
         if (initialized) NativeBridge.receiverCrc32Known(handle) == 1 else false
 
-    // ---- descriptor-v4 segment metadata (large-transfer child objects) ----
+    // ---- descriptor-v5 segment metadata (large-transfer child objects) ----
 
-    /** 1 if the confirmed descriptor was a v4 large-transfer child object. */
+    /** 1 if the confirmed descriptor was a v5 large-transfer child object. */
     fun isSegmented(): Boolean =
         if (initialized) NativeBridge.receiverIsSegmented(handle) == 1 else false
 
@@ -289,7 +289,7 @@ class ReceiverSessionManager {
     fun lastAssembleError(): String =
         if (initialized) NativeBridge.receiverLastAssembleError(handle) else ""
 
-    // ---- compressed-stream segment access (descriptor-v4) ----
+    // ---- compressed-stream segment access (descriptor-v5) ----
 
     /**
      * Reassemble this segment's **compressed** bytes (no decompression).

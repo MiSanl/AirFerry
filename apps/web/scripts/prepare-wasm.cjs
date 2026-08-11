@@ -109,4 +109,37 @@ if (fs.existsSync(zxingSrc)) {
   console.warn("[prepare-wasm] zxing-wasm not installed — receiver QR decode will be unavailable")
 }
 
+// (4) Copy the self-compiled FAST ZXing-C++ backend (airferry_zxing.js + .wasm)
+// into public/ for the QR decode worker's fast path. Produced by
+// scripts/build-fastzxing.sh (Emscripten; git-ignored). The worker loads it via
+// `new URL("../airferry_zxing.js", self.location.href)` — same public-root
+// mechanism as zxing_reader.wasm. Warn (not fail) if absent: the worker falls
+// back to the zxing-wasm compat backend, so local builds without Emscripten and
+// sender-only builds still work; only the production receiver (built via CI with
+// build-fastzxing.sh) gets the ~2× fast path.
+const fastzxingDir = path.join(senderRoot, "src", "fastzxing")
+const fastFiles = ["airferry_zxing.js", "airferry_zxing.wasm"]
+let fastCopied = false
+for (const f of fastFiles) {
+  const src = path.join(fastzxingDir, f)
+  const dst = path.join(publicDir, f)
+  if (fs.existsSync(src)) {
+    const need =
+      !fs.existsSync(dst) ||
+      fs.statSync(dst).size !== fs.statSync(src).size ||
+      fs.statSync(dst).mtimeMs < fs.statSync(src).mtimeMs
+    if (need) {
+      fs.copyFileSync(src, dst)
+      fastCopied = true
+    }
+  } else {
+    console.warn(
+      `[prepare-wasm] ${f} not found — FAST ZXing backend unavailable, receiver will use zxing-wasm compat path. Run scripts/build-fastzxing.sh to enable.`
+    )
+  }
+}
+if (fastCopied) {
+  console.log("[prepare-wasm] copied airferry_zxing.js/.wasm → public/")
+}
+
 console.log("[prepare-wasm] ready")

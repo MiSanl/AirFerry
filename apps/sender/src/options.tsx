@@ -111,7 +111,7 @@ async function initializeCompressWorker(worker: Worker): Promise<void> {
 
 export type { Page, PendingItem, TransferConfig }
 
-/** One descriptor-v4 segment of the compressed root stream. */
+/** One descriptor-v5 segment of the compressed root stream. */
 interface PreparedSegment {
   /** This segment's slice of the compressed stream (fed to new_segment). */
   compressed: Uint8Array
@@ -170,7 +170,7 @@ interface PreparedPayload {
   sessionId: { lo: bigint; hi: bigint }
   /** True when staged as a pure ETTEXTv1 text transfer (receiver copy UI). */
   isText: boolean
-  /** True when this transfer was split into descriptor-v4 segments. */
+  /** True when this transfer was split into descriptor-v5 segments. */
   needsSegmentation: boolean
   /** Root session id of the segmented transfer (== sessionId when segmented). */
   rootSessionId: { lo: bigint; hi: bigint }
@@ -222,7 +222,7 @@ function freeSenderSession(session: SenderSessionWasm | null | undefined): void 
 }
 
 /**
- * Build a descriptor-v4 segment sender session for `segment` of the segmented
+ * Build a descriptor-v5 segment sender session for `segment` of the segmented
  * transfer `p`. Mirrors `SenderSessionWasm.new_segment(...)` in Rust.
  */
 function buildSegmentSession(

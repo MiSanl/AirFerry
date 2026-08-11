@@ -66,7 +66,7 @@ import {
   segmentOffset,
   sliceSegment
 } from "@/wasm/segment"
-import { buildBundle } from "@/wasm/bundle"
+import { buildBundle, MAX_ORIGINAL_BYTES } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
 
@@ -81,7 +81,7 @@ export interface CompressResult {
   phase: "done"
   /** Main-thread compress epoch that issued this job. */
   jobId: number
-  /** True when the payload was split into descriptor-v4 segments. */
+  /** True when the payload was split into descriptor-v5 segments. */
   needsSegmentation: boolean
   /**
    * Single-object transfer (non-segmented). Present when
@@ -107,7 +107,7 @@ export interface CompressResult {
   segments: SegmentSpec[]
 }
 
-/** One descriptor-v4 segment of the compressed root stream. */
+/** One descriptor-v5 segment of the compressed root stream. */
 export interface SegmentSpec {
   /** This segment's slice of the compressed stream (transferable). */
   compressed: ArrayBuffer
@@ -347,10 +347,15 @@ async function processText(text: string, name: string | undefined, jobId: number
 async function sha256Bytes(bytes: Uint8Array): Promise<ArrayBuffer> {
   const ownsWholeBuffer =
     bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
-  const source = ownsWholeBuffer
+  // Hash the backing buffer directly. A `Uint8Array` is typed
+  // `Uint8Array<ArrayBufferLike>` (it can wrap a SharedArrayBuffer), which the
+  // Web Crypto `BufferSource` overload rejects, so we pin the backing store to a
+  // concrete `ArrayBuffer`. For a subarray view, slice() first so we only hash
+  // this segment's own bytes (slice() always yields a fresh ArrayBuffer).
+  const buf: ArrayBuffer = ownsWholeBuffer
     ? (bytes.buffer as ArrayBuffer)
     : (bytes.slice().buffer as ArrayBuffer)
-  return crypto.subtle.digest("SHA-256", source)
+  return crypto.subtle.digest("SHA-256", buf)
 }
 
 /** Own a transferable ArrayBuffer for `compressed` (detach-safe). */
@@ -410,7 +415,19 @@ async function finalizeAndPost(
   if (!isCurrent(jobId)) return
 
   const rootCompressedSize = compressedSize
-  if (segmentCountFor(rootCompressedSize) <= 1) {
+  // Gate also on the ORIGINAL size, not just the compressed-stream size. The
+  // receiver rejects a *non-segmented* object whose `original_size` exceeds
+  // MAX_ORIGINAL_BYTES (256 MiB) — see `file_meta_invalid` in receiver.rs.
+  // A highly compressible file (e.g. 300 MiB → 20 MiB) would otherwise pass the
+  // compressed-size gate and ship as a single descriptor-v3 object that the
+  // receiver then refuses outright. When the original exceeds the single-object
+  // ceiling, force the descriptor-v5 segmented path even if the compressed
+  // stream fits one segment — v5 carries the whole-file `root_original_size`
+  // which the receiver accepts unbounded for segmented transfers (the host
+  // streams decompression to disk). The "one segment" case is still valid: the
+  // v5 tail just wraps a single slice of the compressed stream.
+  const originalExceedsSingleObject = originalSize > MAX_ORIGINAL_BYTES
+  if (segmentCountFor(rootCompressedSize) <= 1 && !originalExceedsSingleObject) {
     // Single-object transfer.
     const outBuf = ownBuffer(compressed)
     const result: CompressResult = {

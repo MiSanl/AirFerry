@@ -129,7 +129,7 @@ child_session_id = FNV1a_128(
 
 剩余零填充。固定开销 28 + 每块 16 + v2 尾 13 + filename_len + v3 尾 9，默认 1024 symbol 下数百块内轻松装入。
 
-**v4 扩展**仅用于压缩流分段子对象，紧跟 v3 尾部（`R = Q + 9`）。`file_meta`：`compressed_size` 是当前段压缩字节数；`original_size`、`crc32`、`compression` 是整份解压后原文的属性（跨段一致）：
+**v5 扩展**仅用于压缩流分段子对象（compress-then-segment 模型），紧跟 v3 尾部（`R = Q + 9`）。`file_meta`：`compressed_size` 是当前段压缩字节数；`original_size`、`crc32`、`compression` 是整份解压后原文的属性（跨段一致）。**v5 取代旧 v4**：v4（8 MiB 原文段 + 逐段压缩，撤回的早期 v1.2.0 预发布构建使用）语义不兼容，接收端 fail-closed 拒绝 version==4：
 
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
@@ -284,7 +284,7 @@ offset  size   field
 | 帧校验 | `Frame::from_bytes` | magic/version/双层 CRC |
 | 预描述符缓存封顶 | `receiver.rs` `pre_meta_cache_max()`（随 `pending_symbol_size` 动态缩放，下限 `PRE_META_SYMBOL_CACHE_MAX`=12000，预算 `MAX_OBJECT_BYTES`≈32 MiB） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM；动态缩放避免大文件在描述符到达前"已识别符号"钉死在 12000 |
 | 描述符冻结 | `receiver.rs` `descriptor_seen` | 首个通过全部校验的 descriptor 确立 OTI、文件元数据与压缩算法；同 session 后续描述符只可完全一致，禁止中途替换解码参数 |
-| v4 分段坐标 | `segment.rs` `SegmentMeta::validate` | 校验 child id、段数上限与压缩流大小一致性、规范偏移、压缩长度 ≤ 规范切片；宿主落盘前再校验段 SHA-256，收齐后统一解压并校验长度 + CRC32 + 根 SHA-256 |
+| v5 分段坐标 | `segment.rs` `SegmentMeta::validate` | 校验 child id、段数上限与压缩流大小一致性、规范偏移、压缩长度 ≤ 规范切片；宿主落盘前再校验段 SHA-256，收齐后统一解压并校验长度 + CRC32 + 根 SHA-256 |
 | WASM symbol_size | `wasm.rs` `Config::new(symbol_size)` | 仅接受 64..=65528 的 8 字节倍数，禁止按字段构造绕过 |
 
 > 接收端扫描的是**任意屏幕**的二维码，描述符/帧元数据均**不可信**。CRC32 仅保完整性、不认证——上述参数校验才是真正防线。
@@ -402,7 +402,7 @@ offset  size   field
 | `FLAG_DESCRIPTOR` | `0x01` | `frame.rs:22` |
 | 描述符 magic | `0xD5` | `descriptor.rs:95` |
 | 描述符版本 | 普通对象 `3` / 分段对象 `4` | `descriptor.rs` `DESC_V3_VERSION` / `DESC_VERSION` |
-| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 104（v4） | `descriptor.rs` |
+| 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 104（v5） | `descriptor.rs` |
 | SEGMENT_RAW_BYTES / MAX_SEGMENT_COUNT | `MAX_OBJECT_BYTES − MAX_SYMBOL_SIZE` ≈ 31.9 MiB / 131072 | `transfer-engine/src/segment.rs` |
 | 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:27-29` |
 | Zstd level（浏览器） | `1` | `compress.ts:56` |

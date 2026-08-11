@@ -10,6 +10,7 @@ use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use jni::objects::{JByteArray, JClass, JString};
+use raptorq_core::MAX_ORIGINAL_BYTES;
 use jni::sys::{jboolean, jint, jlong, jsize};
 use jni::JNIEnv;
 use qr_protocol::frame::SessionIdRaw;
@@ -244,7 +245,7 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverAsse
 /// Reassemble the RaptorQ object bytes **exactly as transmitted** (trimmed to
 /// `compressed_size` when known), **without** applying decompression.
 ///
-/// For descriptor-v4 segmented transfers the compressed-stream model stores each
+/// For descriptor-v5 segmented transfers the compressed-stream model stores each
 /// segment's **compressed** bytes and concatenates + decompresses once at the
 /// end, so Kotlin calls this instead of `receiverAssembleBytes` (which
 /// decompresses per segment). Returns an empty byte[] if decoding is incomplete.
@@ -364,7 +365,14 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_decompressBy
         return null_byte_array(&mut env);
     }
     let max_out = if max_output > 0 {
-        max_output as usize
+        // Clamp the host-supplied cap to MAX_ORIGINAL_BYTES so a careless or
+        // hostile caller (e.g. forwarding a descriptor's whole-file size, which
+        // is unbounded for segmented transfers) cannot disable
+        // decompress_with_limit's bomb bound by passing usize::MAX-equivalent.
+        // `max_output` is `jlong` (i64); we've checked `> 0` so the cast to u64
+        // is safe, and only then can we `min` against the u64 ceiling.
+        let cap = (max_output as u64).min(MAX_ORIGINAL_BYTES);
+        cap as usize
     } else {
         0
     };
@@ -474,12 +482,12 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCrc3
     session.file_meta().crc32_known as jint
 }
 
-// ===== descriptor-v4 segment metadata accessors =====
+// ===== descriptor-v5 segment metadata accessors =====
 // Kotlin reads these after a descriptor frame arrives to detect a large-transfer
 // child object and to drive the per-segment `.partial` writer. All mirror the
 // WASM `ReceiverSessionWasm` getters (wasm.rs) and read `session.segment_meta()`.
 
-/// 1 if the confirmed descriptor was a v4 large-transfer child object, else 0.
+/// 1 if the confirmed descriptor was a v5 large-transfer child object, else 0.
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverIsSegmented(
     _env: JNIEnv,
@@ -703,7 +711,21 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_decompressSt
         }
     };
 
-    let max_out = if max_output > 0 { max_output as u64 } else { 0 };
+    // Streamed decompression writes to disk in bounded RAM, so unlike the
+    // in-memory `decompressBytes` path it is NOT capped at MAX_ORIGINAL_BYTES
+    // (256 MiB). For a descriptor-v5 segmented transfer `decompressedSize` is
+    // the whole-file original size, which legitimately exceeds 256 MiB. The
+    // host (SegmentAssembler) has already validated it as a positive Long and
+    // checked the disk has room for the compressed stream; using that exact
+    // value as the streaming cap still defends against a decompression bomb
+    // (the stream is rejected as soon as it would exceed the declared output).
+    // The downstream size + CRC + SHA checks enforce correctness regardless.
+    let max_out = if max_output > 0 {
+        // `max_output` is a positive jlong (i64), so the cast to u64 is safe.
+        max_output as u64
+    } else {
+        0
+    };
     let outcome = match qr_protocol::compress::decompress_stream_to_file(
         &input,
         &output,

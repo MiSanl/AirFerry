@@ -54,7 +54,7 @@ interface ProgressInfo {
   fileSize: number
   compressedSize: number
   compressedSizeKnown: boolean
-  /** Segments already recovered for a descriptor-v4 large transfer (0 when none). */
+  /** Segments already recovered for a descriptor-v5 large transfer (0 when none). */
   segmentReceived: number
   /** Total segments of the current large transfer (0 when not segmented). */
   segmentCount: number
@@ -725,35 +725,102 @@ export function ReceivePage(): React.ReactElement {
       recv.addEventListener("message", h)
     })
     // QR decode worker pool: N independent zxing workers → parallel frame decode.
-    const qrWorkers: Worker[] = []
+    //
+    // Each slot is created & wired by `spawnQrWorker(i)`. On a worker-level
+    // "error" event (abnormal termination: uncaught exception, OOM in
+    // zxing-wasm, module-load failure) the dead worker is **replaced** with a
+    // fresh one and re-initialized — merely clearing the busy flag would let
+    // captureLoop redispatch a frame to a dead worker that never replies,
+    // permanently wedging that slot; repeated crashes would then shrink the
+    // effective pool to 0 and capture stalls. Replacing keeps the pool at full
+    // size and degrades only the few frames lost around each crash.
+    const qrWorkers: Worker[] = new Array(QR_WORKER_POOL)
     const qrReadyAll: Promise<void>[] = []
+    const readyResolvers: (() => void)[] = new Array(QR_WORKER_POOL)
     for (let i = 0; i < QR_WORKER_POOL; i++) {
-      const qr = createQrWorker()
-      qrWorkers.push(qr)
-      qrBusyRef.current[i] = false
       qrReadyAll.push(
         new Promise<void>((resolve) => {
-          const h = (e: MessageEvent) => {
-            if (e.data?.type === "ready") {
-              qr.removeEventListener("message", h)
-              // All workers share the same backend (same airferry_zxing load);
-              // use the first worker's flag to decide Y-plane vs RGBA feeding.
-              if (i === 0) fastBackendRef.current = e.data?.fast === true
-              resolve()
-            }
-          }
-          qr.addEventListener("message", h)
+          readyResolvers[i] = resolve
         })
       )
-      // Per-worker error capture.
-      qr.addEventListener("error", (ev) =>
+    }
+
+    /**
+     * Create (or replace) the qr worker at slot `i`, wire ALL of its handlers,
+     * and send it `init`. Returns the new worker. `qrWorkersRef.current[i]` is
+     * updated so captureLoop dispatches to the live worker. When `trackReady`
+     * is set, this worker's "ready" resolves the init barrier (used only for
+     * the initial pool); replacement workers restore themselves asynchronously
+     * without blocking capture.
+     */
+    const spawnQrWorker = (i: number, trackReady: boolean): Worker => {
+      const qr = createQrWorker()
+      qrWorkers[i] = qr
+      qrWorkersRef.current[i] = qr
+      // Held busy until this worker reports ready, so captureLoop never
+      // dispatches a frame to a not-yet-initialized (replacement) worker.
+      qrBusyRef.current[i] = true
+
+      qr.addEventListener("message", (e: MessageEvent) => {
+        const d = e.data
+        if (!d) return
+        if (d.type === "ready") {
+          qrBusyRef.current[i] = false
+          // All workers share the same backend (same airferry_zxing load); use
+          // the first worker's flag to decide Y-plane vs RGBA feeding.
+          if (i === 0) fastBackendRef.current = d?.fast === true
+          if (trackReady) readyResolvers[i]()
+          dbg(`[qr#${i}] READY ✓ (fast=${d?.fast === true})`)
+          return
+        }
+        if (d.type === "decoded") {
+          qrBusyRef.current[i] = false
+          const n = Array.isArray(d.payloads) ? d.payloads.length : 0
+          if (n > 0) {
+            framesDecodedRef.current += 1
+            decodedCodesRef.current += n
+            // 采样日志：每 10 帧打一次，避免刷屏
+            if (framesDecodedRef.current % 10 === 1) {
+              dbg(`[qr#${i}] decoded #${framesDecodedRef.current}: ${n} payload(s)`)
+            }
+            recv.postMessage({
+              type: "frames",
+              frames: d.payloads,
+              jobId: jobIdRef.current,
+            })
+          }
+        } else if (d.type === "error") {
+          qrBusyRef.current[i] = false
+          dbg(`[qr#${i}] decode error: ${d.message}`)
+        }
+      })
+
+      // Per-worker fatal error: replace the dead worker so the slot keeps
+      // working. Guard against double-replacement (the same worker firing
+      // "error" more than once) by checking it is still the live one.
+      // `trackReady` stays true: if the crash happens before the initial init
+      // barrier completes, the replacement's "ready" must still resolve the
+      // barrier; if it happens at runtime, the resolver is already resolved and
+      // re-resolving is a harmless no-op.
+      qr.addEventListener("error", (ev) => {
         dbg(`[qr#${i}] WORKER ERROR: ${ev.message || ""} @${ev.filename}:${ev.lineno}`)
-      )
+        if (qrWorkersRef.current[i] !== qr) return
+        qr.terminate()
+        dbg(`[qr#${i}] replacing dead worker...`)
+        spawnQrWorker(i, trackReady)
+      })
       qr.addEventListener("messageerror", (ev) =>
         dbg(`[qr#${i}] MESSAGE ERROR: ${String(ev.data || "")}`)
       )
+      // Kick off this worker's initialization. Sending here (rather than in the
+      // caller) guarantees both the initial pool and error-path replacements
+      // always get their init — forgetting it leaves the slot busy forever and
+      // the init barrier times out.
+      qr.postMessage({ type: "init" })
+      return qr
     }
-    qrWorkersRef.current = qrWorkers
+
+    for (let i = 0; i < QR_WORKER_POOL; i++) spawnQrWorker(i, true)
     const qrReady = Promise.all(qrReadyAll)
 
     // 捕获 worker 级错误（脚本解析失败 / 未捕获异常 / message 反序列化失败）
@@ -766,7 +833,7 @@ export function ReceivePage(): React.ReactElement {
 
     jobIdRef.current += 1
     recv.postMessage({ type: "init", jobId: jobIdRef.current })
-    for (const qr of qrWorkers) qr.postMessage({ type: "init" })
+    // (Each qr worker's `init` was already sent by `spawnQrWorker`.)
     dbg(`[init] init sent to receive worker + ${qrWorkers.length} qr workers; waiting for ready...`)
 
     // 分开 await + 超时，定位是哪个 worker 卡住
@@ -790,38 +857,8 @@ export function ReceivePage(): React.ReactElement {
       return false
     }
     dbg(`[init] receive worker + ${qrWorkers.length} qr workers READY ✓`)
-
-    // Wire EACH qr worker → receive worker (decoded payloads → ingest). Each
-    // worker marks itself free on decode so the capture loop can dispatch the
-    // next frame to a different free worker (parallel decode across cores).
-    // Ingest stays serialized: receive worker is a single serial consumer.
-    qrWorkers.forEach((qr, i) => {
-      qr.addEventListener("message", (e: MessageEvent) => {
-        const d = e.data
-        if (d?.type === "decoded") {
-          qrBusyRef.current[i] = false
-          const n = Array.isArray(d.payloads) ? d.payloads.length : 0
-          if (n > 0) {
-            framesDecodedRef.current += 1
-            decodedCodesRef.current += n
-            // 采样日志：每 10 帧打一次，避免刷屏
-            if (framesDecodedRef.current % 10 === 1) {
-              dbg(
-                `[qr#${i}] decoded #${framesDecodedRef.current}: ${n} payload(s)`
-              )
-            }
-            recv.postMessage({
-              type: "frames",
-              frames: d.payloads,
-              jobId: jobIdRef.current,
-            })
-          }
-        } else if (d?.type === "error") {
-          qrBusyRef.current[i] = false
-          dbg(`[qr#${i}] decode error: ${d.message}`)
-        }
-      })
-    })
+    // (Each qr worker's decoded/error forwarding + fatal-error replacement is
+    // already wired inside `spawnQrWorker` above.)
 
     // Wire receive worker → UI (status / meta / result / error).
     recv.addEventListener("message", (e: MessageEvent) => {
@@ -876,7 +913,7 @@ export function ReceivePage(): React.ReactElement {
       } else if (d.type === "warn") {
         dbg(`[recv] warn: ${d.message}`)
       } else if (d.type === "segment") {
-        // A descriptor-v4 segment was verified and durably committed. Resume
+        // A descriptor-v5 segment was verified and durably committed. Resume
         // capture for the next child session; the worker intentionally drops
         // the completed decoder so root-sized bytes never accumulate in RAM.
         setProgress((p) => ({

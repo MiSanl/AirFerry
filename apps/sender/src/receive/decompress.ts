@@ -25,12 +25,20 @@ export const COMPRESSION_XZ = 2
  * Hard output cap for the **browser** receiver's in-memory decompression. The
  * native receivers (Android/Windows) stream decompression to disk and are not
  * bounded by this — but the web receiver has no disk-streaming codec, so it
- * holds the decompressed original in JS memory (which is typically multi-GB),
- * and this backstop guards against a decompression bomb. The value is higher
- * than the native legacy whole-transfer ceiling so a descriptor-v4 single file
- * larger than 256 MiB can still be recovered in the browser within JS limits.
+ * holds the decompressed original in JS memory. Unlike the native receiver
+ * (which streams to disk via `decompress_stream_to_file` and stays memory-
+ * bounded), the browser has no streaming disk decompressor: the recovery path
+ * (`recoverStoredTask`) builds the whole compressed stream AND the whole
+ * decompressed result in JS memory simultaneously (plus a copy for SHA-256),
+ * so the peak is roughly `compressedSize + ~2× decompressedSize`.
+ *
+ * The earlier 2 GiB figure was a theoretical JS-array ceiling, not a realistic
+ * recoverable size — a 1 GiB file would already need ~2-3 GiB resident and OOM
+ * a typical tab. 256 MiB keeps peak memory under ~1 GiB on a default tab,
+ * matching the native single-object ceiling; larger files should use the
+ * Android/Windows receiver (streaming disk decompression, unbounded file size).
  */
-export const MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+export const MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 
 /** 128 MiB memory ceiling for the XZ decoder (mirrors the native budget). */
 const XZ_MEM_LIMIT = 128 * 1024 * 1024

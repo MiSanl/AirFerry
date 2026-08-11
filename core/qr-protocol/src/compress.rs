@@ -215,18 +215,22 @@ pub fn decompress_stream_to_file(
         Ok(())
     };
 
+    // Build the decoder and run the decode loop, threading ALL errors through
+    // `result` (never `?` out of this match) so the `if let Err(e) = result`
+    // cleanup below removes the partial output file on ANY failure — including
+    // decoder construction (a corrupt/truncated compressed stream can make
+    // `Decoder::new` / `Stream::new_stream_decoder` fail, leaving a freshly-
+    // created empty output file that must not linger).
     let result: Result<()> = match compression {
-        COMPRESSION_ZSTD => {
-            let mut dec = zstd::stream::read::Decoder::new(in_file)
-                .map_err(|e| Error::Compress(e.to_string()))?;
-            decode(&mut dec)
-        }
-        COMPRESSION_XZ => {
-            let stream = xz2::stream::Stream::new_stream_decoder(XZ_DECODER_MEMORY_LIMIT, 0)
-                .map_err(|e| Error::Compress(e.to_string()))?;
-            let mut dec = xz2::read::XzDecoder::new_stream(in_file, stream);
-            decode(&mut dec)
-        }
+        COMPRESSION_ZSTD => zstd::stream::read::Decoder::new(in_file)
+            .map_err(|e| Error::Compress(e.to_string()))
+            .and_then(|mut dec| decode(&mut dec)),
+        COMPRESSION_XZ => xz2::stream::Stream::new_stream_decoder(XZ_DECODER_MEMORY_LIMIT, 0)
+            .map_err(|e| Error::Compress(e.to_string()))
+            .and_then(|stream| {
+                let mut dec = xz2::read::XzDecoder::new_stream(in_file, stream);
+                decode(&mut dec)
+            }),
         _ => {
             // COMPRESSION_NONE (or unknown tag with empty input): the "stream"
             // is already the original bytes — copy as-is.
@@ -259,9 +263,15 @@ pub fn decompress_stream_to_file(
             "decompressed output exceeds expected size".into(),
         ));
     }
-    writer
-        .flush()
-        .map_err(|e| Error::Compress(format!("flush: {e}")))?;
+    // Flush is the last fallible step. The documented contract is "any failure
+    // removes the partial output" — flush must not be a `?` that bypasses the
+    // remove (a failed flush can leave a partial/truncated file on disk). Handle
+    // it inline and remove on failure, mirroring the decode/over-limit branches.
+    if let Err(e) = writer.flush() {
+        drop(writer);
+        let _ = std::fs::remove_file(output_path);
+        return Err(Error::Compress(format!("flush: {e}")));
+    }
     let digest = sha.finalize();
     Ok(DecompressStreamOutcome {
         output_size: written,

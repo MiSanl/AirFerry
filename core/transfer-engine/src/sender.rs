@@ -61,7 +61,7 @@ pub struct SenderSession {
     encoder: Encoder,
     meta: ObjectMeta,
     file_meta: FileMeta,
-    /// Descriptor-v4 metadata for a large-transfer child object.
+    /// Descriptor-v5 metadata for a large-transfer child object.
     segment_meta: Option<SegmentMeta>,
     /// Total source symbols K across all blocks.
     total_k: u32,
@@ -99,7 +99,7 @@ impl SenderSession {
         Self::new_inner(compressed_payload, session_id, config, file_meta, None)
     }
 
-    /// Create one independently encoded descriptor-v4 large-transfer segment.
+    /// Create one independently encoded descriptor-v5 large-transfer segment.
     pub fn new_segment(
         compressed_payload: &[u8],
         child_session_id: SessionId,

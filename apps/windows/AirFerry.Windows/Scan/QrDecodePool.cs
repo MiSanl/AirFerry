@@ -362,9 +362,26 @@ public sealed class QrDecodePool : IDisposable
         _running = false;
         _cts.Cancel();
         _queue.CompleteAdding();
+        // Bounded join: _cts.Cancel() only interrupts TryTake; a worker currently
+        // inside ZxingDecoder.DecodeMulti (native C++ finder scan over a 1080p
+        // frame, which can take tens of ms — or much longer on a pathological
+        // frame) cannot be interrupted and would block an unbounded Join()
+        // forever. That would hang the whole teardown (Stop is called from the
+        // background cleanup task) and, if the app exits while it's stuck, leak
+        // the DirectShow capture handle (camera locked system-wide). Mirror the
+        // Android pool's bounded join(300ms) pattern with a 2s ceiling per
+        // worker — enough for a slow decode to finish, short enough that a
+        // wedged worker cannot deadlock teardown. Workers are managed threads,
+        // so a join timeout just abandons them to be reaped at process exit.
         foreach (Thread worker in _workers)
         {
-            worker.Join();
+            if (!worker.Join(2_000))
+            {
+                // Worker wedged in native decode; abandon it rather than hang
+                // teardown. The native receiver/capture are still disposed on
+                // this thread; only the stuck worker thread leaks (reaped at
+                // process exit).
+            }
         }
         _workers.Clear();
         while (_queue.TryTake(out GrayFrame? frame))

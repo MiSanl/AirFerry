@@ -8,7 +8,7 @@ using AirFerry.Windows.Scan;
 namespace AirFerry.Windows.Bundle;
 
 /// <summary>
-/// Durable, disk-backed assembler for one descriptor-v4 root transfer.
+/// Durable, disk-backed assembler for one descriptor-v5 root transfer.
 /// A logical transfer is compressed **once** into a single compressed stream,
 /// then split into fixed <see cref="SegmentRawBytes"/> (~32 MiB) segments. Each
 /// completed segment's **compressed** bytes are written at their canonical
@@ -268,15 +268,41 @@ public sealed class SegmentAssembler
 
             string outPath = Path.Combine(_dir, "transfer.decompressed");
             if (File.Exists(outPath)) File.Delete(outPath);
+            // Re-check free space against the DECOMPRESSED size right before the
+            // final streaming decompress. The initial Open() check only verified
+            // compressedSize (the segment payload budget); the decompressed result
+            // can be far larger (legitimate highly-compressible file, or a hostile
+            // compressed stream that expands to the declared decompressedSize).
+            // Trusting only the descriptor's decompressedSize here can fill the disk.
+            long available = AvailableBytes(_dir);
+            // Guard against long overflow: a hostile descriptor can declare a
+            // decompressedSize near long.MaxValue, and the naive
+            // `decompressedSize + reserve` would wrap to a negative number,
+            // bypassing the space check. Compare without adding: if
+            // decompressedSize alone already exceeds what the volume can hold
+            // (minus the reserve), reject. Use saturating math.
+            long needed = _decompressedSize > long.MaxValue - MinFreeReserveBytes
+                ? long.MaxValue
+                : _decompressedSize + MinFreeReserveBytes;
+            if (available < needed)
+            {
+                return null;
+            }
+            // Paths cross the P/Invoke boundary as NUL-terminated UTF-8 byte[]:
+            // the store root (<MyDocuments>\AirFerry\store\...) can be non-ASCII
+            // on a localized Windows (文档 / non-ASCII username), and Rust reads
+            // them as UTF-8. Encoding as UTF-8 here matches the Rust contract.
+            // _rootSha256 is lowercase ASCII hex, but encode it the same way for
+            // signature consistency.
             int ok = NativeBridge.DecompressStreamToFile(
-                PartialPath,
-                outPath,
+                Encoding.UTF8.GetBytes(PartialPath + "\0"),
+                Encoding.UTF8.GetBytes(outPath + "\0"),
                 _compression,
                 (ulong)_decompressedSize, // hard output cap (decompression-bomb guard)
                 (ulong)_decompressedSize, // expected decompressed size
                 _crc32,
                 _crc32Known,
-                _rootSha256);
+                Encoding.UTF8.GetBytes(_rootSha256 + "\0"));
             if (ok != 1)
             {
                 if (File.Exists(outPath)) File.Delete(outPath);

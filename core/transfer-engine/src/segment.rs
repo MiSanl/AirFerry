@@ -5,7 +5,7 @@
 //! fixed `SEGMENT_BYTES` (32 MiB) segments. Each segment is an independent
 //! RaptorQ-encoded child object. The existing 60-byte frame header remains
 //! unchanged: each object uses a deterministic child session id, while
-//! descriptor v4 carries the stable root transfer id and the segment's
+//! descriptor v5 carries the stable root transfer id and the segment's
 //! canonical range **within the compressed stream**.
 //!
 //! On the receive side the compressed bytes of every segment are concatenated
@@ -19,7 +19,7 @@ use crate::descriptor::FileMeta;
 use qr_protocol::{frame::SessionIdRaw, SessionId};
 use raptorq_core::{MAX_OBJECT_BYTES, MAX_SYMBOL_SIZE};
 
-/// Fixed **compressed-stream** segment size used by descriptor v4.
+/// Fixed **compressed-stream** segment size used by descriptor v5.
 ///
 /// The sender splits the compressed payload into chunks of at most this many
 /// bytes. It is sized `MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE` (≈ 32 MiB) so that a
@@ -35,7 +35,7 @@ pub const SEGMENT_RAW_BYTES: u64 = MAX_OBJECT_BYTES - (MAX_SYMBOL_SIZE as u64);
 /// descriptor count above this bound.
 pub const MAX_SEGMENT_COUNT: u32 = 131_072;
 
-/// Descriptor-v4 metadata for one segment of the compressed root stream.
+/// Descriptor-v5 metadata for one segment of the compressed root stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMeta {
     /// Stable identity of the complete file/task.

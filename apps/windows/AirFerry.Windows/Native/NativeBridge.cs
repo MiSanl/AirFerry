@@ -114,6 +114,18 @@ internal static class NativeBridge
     /// <see cref="IntPtr.Zero"/> / 0 is a no-op. Never call this on a pointer
     /// the host allocated itself.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Layout contract (UB if violated):</b> Rust frees the buffer via
+    /// <c>Box::from_raw(slice::from_raw_parts_mut(ptr, len))</c>, so
+    /// <paramref name="ptr"/> and <paramref name="len"/> MUST be the exact,
+    /// still-owned pair returned by <see cref="ReceiverAssemble"/> — i.e. the
+    /// same <c>nuint</c> length the assemble call wrote to the host's
+    /// <c>outLen</c>. Passing a mismatched <paramref name="len"/> reconstructs
+    /// the <c>Box&lt;[u8]&gt;</c> with the wrong layout and is undefined
+    /// behavior (Rust's allocator deallocates with the wrong size/alignment).
+    /// Always capture <paramref name="len"/> from the assemble call's out-param
+    /// and pass it through unmodified.</para>
+    /// </remarks>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_buffer_free")]
     public static extern void BufferFree(IntPtr ptr, nuint len);
@@ -166,17 +178,31 @@ internal static class NativeBridge
     /// (<paramref name="expectedShaHex"/>, lowercase hex) all match; on any
     /// failure the partial output file is removed.
     /// </summary>
+    /// <remarks>
+    /// <para><b>UTF-8 path encoding:</b> the three path/hex string params are
+    /// passed as NUL-terminated UTF-8 <see cref="byte"/>[] (built with
+    /// <c>Encoding.UTF8.GetBytes(s + "\0")</c>), NOT <c>[MarshalAs(LPStr)]
+    /// string</c>. The Rust side (<c>cffi.rs::cstr</c>) reads them via
+    /// <c>CStr::from_ptr().to_bytes()</c> + <c>from_utf8_lossy</c>, i.e. it
+    /// assumes UTF-8. <c>LPStr</c> marshals as ANSI (system codepage = GBK on
+    /// zh-CN), which corrupts any non-ASCII path — and the store root is
+    /// <c>&lt;MyDocuments&gt;\AirFerry\store\...</c>, which on a localized
+    /// Windows is under <c>文档</c> or a non-ASCII username. Using UTF-8
+    /// <see cref="byte"/>[] matches the existing <see cref="ReceiverIngest"/>
+    /// / <see cref="DecompressBytes"/> <c>byte[]</c> convention and the Android
+    /// JNI bridge (which also passes UTF-8).</para>
+    /// </remarks>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_decompress_stream_to_file")]
     public static extern int DecompressStreamToFile(
-        [MarshalAs(UnmanagedType.LPStr)] string inputPath,
-        [MarshalAs(UnmanagedType.LPStr)] string outputPath,
+        byte[] inputPathUtf8,
+        byte[] outputPathUtf8,
         byte compression,
         ulong maxOutput,
         ulong expectedSize,
         uint expectedCrc,
         [MarshalAs(UnmanagedType.I1)] bool crcKnown,
-        [MarshalAs(UnmanagedType.LPStr)] string expectedShaHex);
+        byte[] expectedShaHexUtf8);
 
     /// <summary>
     /// Write the NUL-terminated progress JSON into <paramref name="outBuf"/>.
@@ -218,9 +244,9 @@ internal static class NativeBridge
         EntryPoint = "airferry_receiver_crc32_known")]
     public static extern int ReceiverCrc32Known(IntPtr handle);
 
-    // ── descriptor-v4 segment metadata (large-transfer child objects) ───────
+    // ── descriptor-v5 segment metadata (large-transfer child objects) ───────
 
-    /// <summary>1 if the confirmed descriptor was a v4 large-transfer child object.</summary>
+    /// <summary>1 if the confirmed descriptor was a v5 large-transfer child object.</summary>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "airferry_receiver_is_segmented")]
     public static extern int ReceiverIsSegmented(IntPtr handle);

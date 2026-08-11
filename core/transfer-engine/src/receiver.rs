@@ -17,10 +17,19 @@ pub const PRE_META_SYMBOL_CACHE_MAX: usize = 12_000;
 
 /// Pre-descriptor bootstrap cache ceiling in *bytes* of wire payload. Bounded
 /// by [`MAX_OBJECT_BYTES`] — a single receiver session (whether a standalone
-/// object or one segment of a descriptor-v4 transfer) can hold at most that
+/// object or one segment of a descriptor-v5 transfer) can hold at most that
 /// much payload, so allowing the replay cache to grow to the same budget cannot
 /// let a hostile stream allocate more RAM than the decoder itself is bounded to.
 const PRE_META_CACHE_BYTES_BUDGET: u64 = MAX_OBJECT_BYTES;
+
+/// Conservative lower bound on the real per-entry RAM cost of one cached
+/// `HashMap<(u32, u32), Vec<u8>>` entry: 8B `(sbn, esi)` key tuple + 24B `Vec`
+/// header (ptr+len+cap) + ~32B hashbrown slot/control overhead + small-allocation
+/// rounding. Measured ~64–96B for tiny symbols; 64 is a safe floor so that
+/// charging only `symbol_size` bytes per entry cannot under-count a hostile
+/// `symbol_size = 1` stream (which would otherwise permit ~33M entries × ~64–96B
+/// = multi-GB of resident RAM under a nominally 32 MiB budget).
+const PRE_META_CACHE_BYTES_PER_ENTRY: usize = 64;
 
 /// Compute the current pre-descriptor bootstrap cache cap for the given
 /// `pending_symbol_size` (bytes per symbol from the frame header, 0 before any
@@ -30,14 +39,28 @@ const PRE_META_CACHE_BYTES_BUDGET: u64 = MAX_OBJECT_BYTES;
 /// seconds until the descriptor replay resumed progress. Scaling by symbol size
 /// lets the cache absorb most of an object's symbols while waiting, while still
 /// bounding hostile-stream payload RAM to the same ~32 MiB budget the decoder
-/// itself is limited to.
+/// itself is limited to. Each entry is charged at least
+/// [`PRE_META_CACHE_BYTES_PER_ENTRY`] (the larger of payload and overhead) so
+/// that tiny `symbol_size` values cannot exploit per-entry HashMap/Vec overhead
+/// to exceed the budget.
 fn pre_meta_cache_max(pending_symbol_size: u32) -> usize {
     if pending_symbol_size == 0 {
+        // No frame observed yet → use the fixed floor as the default ceiling.
+        // We don't know the per-entry cost, so assume the historical default.
         return PRE_META_SYMBOL_CACHE_MAX;
     }
     let budget_bytes = usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap_or(usize::MAX);
-    let by_size = budget_bytes.div_ceil(pending_symbol_size as usize);
-    by_size.max(PRE_META_SYMBOL_CACHE_MAX)
+    // Charge the larger of payload bytes and fixed per-entry HashMap/Vec
+    // overhead so symbol_size=1 (payload ≈ 1B but real entry ≈ 64–96B) cannot
+    // allocate ~33M entries. The result is NOT clamped back up to
+    // PRE_META_SYMBOL_CACHE_MAX once the size is known: doing so would let a
+    // large symbol_size (e.g. 65 528) re-bloat the cache to 12 000 entries ×
+    // ~96 B/entry ≈ 1.1 GB, violating the very byte budget this cap enforces.
+    // The "已识别符号" gauge may plateau early for huge-symbol objects; that is
+    // a UX trade-off accepted to keep RAM bounded (the prior unconditional
+    // `.max(PRE_META_SYMBOL_CACHE_MAX)` was a memory-safety hole).
+    let per_entry = (pending_symbol_size as usize).max(PRE_META_CACHE_BYTES_PER_ENTRY);
+    budget_bytes.div_ceil(per_entry)
 }
 
 /// A receiver session.
@@ -67,8 +90,8 @@ pub struct ReceiverSession {
     descriptor_seen: bool,
     /// File metadata learned from the descriptor frame (filename, size, CRC32).
     file_meta: crate::descriptor::FileMeta,
-    /// Descriptor-v4 large-transfer segment metadata, present only when the
-    /// confirmed descriptor was a v4 segmented child object. None for legacy
+    /// Descriptor-v5 large-transfer segment metadata, present only when the
+    /// confirmed descriptor was a v5 segmented child object. None for legacy
     /// v1/v2/v3 descriptors.
     segment_meta: Option<crate::segment::SegmentMeta>,
     received: Vec<HashSet<u32>>,
@@ -191,7 +214,7 @@ impl ReceiverSession {
         &self.file_meta
     }
 
-    /// Descriptor-v4 segment metadata, if the confirmed descriptor was a
+    /// Descriptor-v5 segment metadata, if the confirmed descriptor was a
     /// large-transfer child object. None for legacy descriptors.
     pub fn segment_meta(&self) -> Option<&crate::segment::SegmentMeta> {
         self.segment_meta.as_ref()
@@ -246,7 +269,7 @@ impl ReceiverSession {
                 });
                 // The decompression-bomb bound (`MAX_ORIGINAL_BYTES`) applies
                 // only to single-object transfers, where the host decompresses
-                // the whole original in memory. For descriptor-v4 segmented
+                // the whole original in memory. For descriptor-v5 segmented
                 // transfers `file_meta.original_size` is the whole-file
                 // decompressed size (shared across segments), which can exceed
                 // 256 MiB by design; the host instead streams the concatenated
@@ -257,7 +280,19 @@ impl ReceiverSession {
                         || (info.segment.is_none()
                             && info.file_meta.original_size > MAX_ORIGINAL_BYTES)
                         || (info.file_meta.compressed_size_known
-                            && info.file_meta.compressed_size > info.meta.transfer_length);
+                            && info.file_meta.compressed_size > info.meta.transfer_length)
+                        // A compressed object must declare a non-zero
+                        // original_size: assemble_result bounds decompression
+                        // to original_size and verifies the decompressed length
+                        // against it. original_size == 0 with compression !=
+                        // NONE would silently skip the length check (the size
+                        // guard is gated on original_size > 0) and let the
+                        // decompressor expand up to MAX_ORIGINAL_BYTES of
+                        // attacker-shaped output unverified. Reject it up front.
+                        || (info.segment.is_none()
+                            && info.file_meta.compression
+                                != qr_protocol::compress::COMPRESSION_NONE
+                            && info.file_meta.original_size == 0);
                 if info.meta.validate().is_err()
                     || frame_geometry_invalid
                     || file_meta_invalid
@@ -994,7 +1029,8 @@ mod tests {
     fn pre_meta_cache_max_scales_with_symbol_size() {
         // Default browser/core symbol size (T≈1400): 32 MiB / 1400 ≈ 23 960.
         assert!(pre_meta_cache_max(1400) > PRE_META_SYMBOL_CACHE_MAX);
-        // Tiny symbols get a much larger ceiling, bounded by the wire budget.
+        // At the per-entry overhead floor (64B), payload and overhead coincide,
+        // so the cap is still the byte budget divided by 64.
         assert_eq!(
             pre_meta_cache_max(64),
             usize::try_from(PRE_META_CACHE_BYTES_BUDGET)
@@ -1003,6 +1039,52 @@ mod tests {
         );
         // 0 (before any frame) must still return the floor, never 0.
         assert_eq!(pre_meta_cache_max(0), PRE_META_SYMBOL_CACHE_MAX);
+    }
+
+    /// A hostile `symbol_size = 1` stream used to be able to fill ~33M cache
+    /// entries (32 MiB / 1B) because per-entry HashMap/Vec overhead (~64–96B)
+    /// was ignored — multi-GB of resident RAM under a nominally 32 MiB budget.
+    /// The cap must now charge at least `PRE_META_CACHE_BYTES_PER_ENTRY` per
+    /// entry so tiny symbols cannot blow past the byte budget.
+    #[test]
+    fn pre_meta_cache_max_charges_per_entry_overhead_for_tiny_symbols() {
+        let budget = usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap();
+        // symbol_size < per-entry floor: cap is budget / floor (not budget / 1).
+        assert_eq!(
+            pre_meta_cache_max(1),
+            budget.div_ceil(PRE_META_CACHE_BYTES_PER_ENTRY)
+        );
+        // Same value as at the floor itself, since max(1, 64) == max(64, 64).
+        assert_eq!(pre_meta_cache_max(1), pre_meta_cache_max(64));
+        // And it must be far smaller than the old buggy 33M-entry ceiling.
+        assert!(pre_meta_cache_max(1) < budget);
+        assert!(pre_meta_cache_max(1) >= PRE_META_SYMBOL_CACHE_MAX);
+    }
+
+    /// A large `symbol_size` (e.g. the protocol max 65 528) used to be
+    /// re-clamped up to `PRE_META_SYMBOL_CACHE_MAX` (12 000) by an
+    /// unconditional `.max` — but 12 000 × ~96 B/entry ≈ 1.1 GB, violating the
+    /// 32 MiB budget the cap is supposed to enforce. Once the size is known the
+    /// cap must follow the byte budget strictly, never re-bloating to the floor.
+    #[test]
+    fn pre_meta_cache_max_does_not_rebloat_for_large_symbols() {
+        let budget = usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap();
+        // symbol_size = 65 528 (protocol max): per-entry cost is the symbol
+        // itself (65 528 > 64 floor), so cap = budget / 65 528 ≈ 512.
+        let cap_large = pre_meta_cache_max(65_528);
+        assert_eq!(cap_large, budget.div_ceil(65_528));
+        // Must NOT be inflated back up to the 12 000 floor.
+        assert!(cap_large < PRE_META_SYMBOL_CACHE_MAX);
+        // And the worst-case resident RAM (cap × per-entry real cost) stays
+        // within a small multiple of the 32 MiB budget — never multi-hundred-MB.
+        // Use the payload bytes as the dominant cost for large symbols.
+        let worst_case_bytes = cap_large * 65_528;
+        assert!(
+            worst_case_bytes <= budget * 2,
+            "large-symbol cache worst-case RAM {} exceeds 2× budget {}",
+            worst_case_bytes,
+            budget
+        );
     }
 
     #[test]

@@ -128,6 +128,34 @@ ${safeForInlineScript(mainJsCode)}
 const outHtml = path.join(outDir, "index.html")
 fs.writeFileSync(outHtml, html)
 
+// The deliverable is a SINGLE self-contained index.html. Remove the now-redundant
+// intermediate Vite artifacts (main JS, CSS, zstd WASM, the worker chunk + its
+// hashed sibling files) AND the receiver-side files copied from public/
+// (airferry_zxing.* and zxing_reader.wasm), so dist-standalone/ holds only
+// index.html — leftover intermediates would otherwise linger in the output dir
+// and confuse packaging. The single-file build inlines all WASM/worker/code into
+// index.html, so those public/ copies are not needed by the standalone artifact.
+for (const f of [mainJs, cssFile, zstdWasm]) {
+  try {
+    fs.unlinkSync(f) // these are already absolute paths under outDir
+  } catch (_) {
+    /* already absent */
+  }
+}
+// Files copied from public/ that the single-file build does not need.
+for (const f of ["airferry_zxing.js", "airferry_zxing.wasm", "zxing_reader.wasm"]) {
+  try {
+    fs.unlinkSync(path.join(outDir, f))
+  } catch (_) {
+    /* already absent */
+  }
+}
+try {
+  fs.rmSync(assetsDir, { recursive: true, force: true })
+} catch (_) {
+  /* already absent */
+}
+
 // Report sizes.
 const htmlKb = (fs.statSync(outHtml).size / 1024).toFixed(0)
 const workerKb = (workerCodeRaw.length / 1024).toFixed(0)
@@ -135,4 +163,5 @@ const zstdKb = (zstdB64.length / 1024).toFixed(0)
 console.log(`\n✓ Standalone single-file HTML written:`)
 console.log(`    ${path.relative(root, outHtml)}  (${htmlKb} KB)`)
 console.log(`    inlined: worker (${workerKb} KB), wasm-zstd (${zstdKb} KB base64)`)
-console.log(`    transfer_engine + lzma WASM already inlined by Vite into the JS bundle.\n`)
+console.log(`    transfer_engine + lzma WASM already inlined by Vite into the JS bundle.`)
+console.log(`    cleaned ${path.relative(root, outDir)} intermediates (index.js / web.css / wasm-zstd.wasm / assets/)\n`)

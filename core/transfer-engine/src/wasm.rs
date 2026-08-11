@@ -110,7 +110,7 @@ impl SenderSessionWasm {
         })
     }
 
-    /// Create one descriptor-v4 compressed-stream segment session.
+    /// Create one descriptor-v5 compressed-stream segment session.
     ///
     /// A logical transfer is compressed once into a single compressed stream,
     /// then split into N fixed `SEGMENT_RAW_BYTES` (≈ 32 MiB) slices of that
@@ -427,7 +427,7 @@ impl SenderSessionWasm {
             .map(|s| s.segment_count)
             .unwrap_or(1)
     }
-    /// Whether this session is a descriptor-v4 large-transfer child object.
+    /// Whether this session is a descriptor-v5 large-transfer child object.
     pub fn is_segmented(&self) -> bool {
         self.inner.segment_meta().is_some()
     }
@@ -675,9 +675,9 @@ impl ReceiverSessionWasm {
         self.inner.is_meta_confirmed()
     }
 
-    // ─── descriptor-v4 segment metadata (large-transfer child objects) ─────
+    // ─── descriptor-v5 segment metadata (large-transfer child objects) ─────
 
-    /// 1 if the confirmed descriptor was a v4 large-transfer child object.
+    /// 1 if the confirmed descriptor was a v5 large-transfer child object.
     pub fn is_segmented(&self) -> bool {
         self.inner.segment_meta().is_some()
     }

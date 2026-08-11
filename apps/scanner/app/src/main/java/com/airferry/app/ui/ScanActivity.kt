@@ -72,7 +72,7 @@ class ScanActivity : ComponentActivity() {
     /** Parallel QR decode pool (capture → queue → N workers → serialized ingest). */
     private var decodePool: QrDecodePool? = null
 
-    /** Disk-backed assembler for a descriptor-v4 large transfer (null = none in progress). */
+    /** Disk-backed assembler for a descriptor-v5 large transfer (null = none in progress). */
     private var segAssembler: com.airferry.app.scan.SegmentAssembler? = null
     /** Optional task selected from history; unrelated roots are ignored. */
     private var resumeRootId: String? = null
@@ -716,17 +716,33 @@ class ScanActivity : ComponentActivity() {
             // further ingest touches the native session, and we wrap the JNI
             // access in runExclusive so it cannot race a straggler or destroy().
             val snapshotFileName = s.fileName
+            // Capture the pool at enqueue time and use THIS captured ref inside
+            // the task — never re-read the `decodePool` field. onDestroy (main
+            // thread) nulls `decodePool` and captures `session` to a local for its
+            // own background destroy via the SAME pool instance. If this task
+            // re-read the field it could (a) take the lock-less `?: work()`
+            // branch once onDestroy has nulled the field, and (b) race destroy()
+            // on the native handle (isInitialized is only a TOCTOU hint, not a
+            // real guard). By pinning the pool here, the recovery and onDestroy's
+            // destroy are GUARANTEED to serialize on the same pool.runExclusive
+            // (ingestLock) — recovery holds the lock while assemble() runs,
+            // destroy blocks on the lock until recovery returns, no
+            // use-after-free, no TOCTOU. recoverAndStage reads the `session`
+            // field, but onDestroy never reassigns it (only destroys in place),
+            // so after destroy the field's isInitialized==false and the guarded
+            // getters no-op → recoverAndStage returns null harmlessly.
+            val poolAtEnqueue = decodePool
             ioExecutor.execute {
-                // Run the recovery under the pool's ingest lock (it touches the
-                // native session via assemble/crc32/fileSize), then post the
-                // resulting Intent to the main thread. runExclusive returns Unit,
-                // so capture the Intent in a holder.
                 try {
                     var intent: Intent? = null
-                    val work = {
+                    val work = fun() {
                         intent = recoverAndStage(snapshotFileName)
                     }
-                    decodePool?.runExclusive(work) ?: work()
+                    // Always serialize via the captured pool. If the pool was
+                    // already null at enqueue (shouldn't happen mid-scan, but be
+                    // defensive), skip recovery entirely — calling recoverAndStage
+                    // without the lock would race destroy() on the native handle.
+                    poolAtEnqueue?.runExclusive(work)
                     intent?.let { runOnUiThread { startActivity(it) } }
                 } catch (e: Exception) {
                     clearRecoveryStage()
@@ -764,7 +780,7 @@ class ScanActivity : ComponentActivity() {
     private fun recoverAndStage(displayName: String): Intent? {
         updateRecoveryStage("正在组装数据…")
         if (session.isSegmented()) {
-            // Descriptor-v4 large transfer: recover this segment's **compressed**
+            // Descriptor-v5 large transfer: recover this segment's **compressed**
             // bytes (no per-segment decompression — the whole stream is
             // decompressed once after every segment arrives) and store it.
             val compressed = session.assembleRawBytes() ?: run {
@@ -966,7 +982,7 @@ class ScanActivity : ComponentActivity() {
     }
 
     /**
-     * Store one recovered descriptor-v4 segment into the disk-backed assembler.
+     * Store one recovered descriptor-v5 segment into the disk-backed assembler.
      *
      * Returns an Intent (navigates to the detail page) only once every segment
      * of the root transfer has arrived and been merged; otherwise null (the
@@ -1253,7 +1269,7 @@ class ScanActivity : ComponentActivity() {
     }
 
     /**
-     * Swap the receiver to a fresh session for the *next* descriptor-v4 segment.
+     * Swap the receiver to a fresh session for the *next* descriptor-v5 segment.
      *
      * Called from `recoverAndStage` which runs *inside* the decode pool's ingest
      * lock, so we must NOT re-acquire it (`resetSession()` would deadlock).
@@ -1374,28 +1390,45 @@ class ScanActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        // Drain the IO executor BEFORE tearing down the decode pool: the pending
-        // recovery task holds the pool's ingest lock and touches the native
-        // session, so freeing the handle first would race it. Shutdown + await
-        // lets an in-flight stage finish (bounded; assemble is the slow part and
-        // already running under ingestStopped, which halted further ingest).
-        ioExecutor.shutdown()
-        try {
-            ioExecutor.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        // Stop workers, then destroy the native receiver UNDER the ingest lock so a
-        // straggler that outran shutdown()'s join timeout can't still be mid-ingest
-        // (&mut) when destroy() frees the handle (use-after-free).
+        // Snapshot the native-session owner and decode pool to locals, then drop
+        // the Activity fields so any post-destroy callback / Activity-recreation
+        // cannot reach them. The actual drain + destroy happens on a detached
+        // daemon thread (below) — NEVER on the main thread. The previous code
+        // called ioExecutor.awaitTermination(30s) here, which for a large
+        // segmented transfer (stream-decompress + SHA over hundreds of MiB on
+        // ioExecutor) blocked the main thread for up to 30 s → guaranteed ANR on
+        // rotation / recents. Mirrors the Windows ScanViewModel 2 s quarantine.
         val pool = decodePool
         decodePool = null
-        if (pool != null) {
-            pool.shutdown()
-            pool.runExclusive { session.destroy() }
-        } else {
-            session.destroy()
-        }
+        val sessionRef = session
+        // Drain the IO executor BEFORE tearing down the decode pool: the pending
+        // recovery task holds the pool's ingest lock and touches the native
+        // session, so freeing the handle first would race it. Shutdown lets an
+        // in-flight stage finish (bounded; assemble is the slow part and already
+        // running under ingestStopped, which halted further ingest). The drain
+        // + destroy run on a daemon thread so the main thread is never blocked.
+        ioExecutor.shutdown()
+        // The correctness anchor: the in-flight recovery job and destroy() both
+        // go through pool.runExclusive (ingestLock), so they are mutually
+        // exclusive regardless of timing — no use-after-free even if the await
+        // below is skipped.
+        Thread {
+            try {
+                ioExecutor.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            // Stop workers, then destroy the (captured) native receiver UNDER
+            // the ingest lock so a straggler that outran shutdown()'s join
+            // timeout can't still be mid-ingest (&mut) when destroy() frees the
+            // handle (use-after-free). destroy() is idempotent.
+            if (pool != null) {
+                pool.shutdown()
+                pool.runExclusive { sessionRef.destroy() }
+            } else {
+                sessionRef.destroy()
+            }
+        }.apply { isDaemon = true; name = "airferry-destroy" }.start()
     }
 
     companion object {

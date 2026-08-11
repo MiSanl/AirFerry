@@ -3,7 +3,7 @@
 //! A logical transfer is compressed **once** into a single compressed stream,
 //! then split into fixed `SEGMENT_RAW_BYTES` (32 MiB) segments. Each segment is
 //! independently RaptorQ-encoded with its own child session id (see
-//! `SessionId::derive_segment`) and a descriptor-v4 frame. The receiver
+//! `SessionId::derive_segment`) and a descriptor-v5 frame. The receiver
 //! recovers each segment with an ordinary `ReceiverSession`, then hands the
 //! recovered *compressed* bytes to a `TransferAssembler` which validates each
 //! segment's length + SHA-256 and concatenates the full compressed stream once
@@ -11,7 +11,7 @@
 //! concatenation (here COMPRESSION_NONE so the compressed stream == original).
 //!
 //! This test drives the whole chain through the real QR frame wire format,
-//! including simulated frame loss, so it exercises descriptor-v4 parsing, the
+//! including simulated frame loss, so it exercises descriptor-v5 parsing, the
 //! sender's `new_segment`, the receiver's segment metadata exposure, and the
 //! assembler's validation + concatenation.
 
@@ -169,11 +169,11 @@ fn recover_segment_with(
         "segment {} failed to recover",
         seg.segment_index
     );
-    // A v4 descriptor must expose the segment metadata.
+    // A v5 descriptor must expose the segment metadata.
     assert_eq!(
         rx.segment_meta().map(|s| s.segment_index),
         Some(seg.segment_index),
-        "receiver must expose descriptor-v4 segment meta"
+        "receiver must expose descriptor-v5 segment meta"
     );
     // Trim RaptorQ symbol padding back to this segment's real compressed size,
     // mirroring how the native hosts (jni/cffi) post-process `assemble_raw`.

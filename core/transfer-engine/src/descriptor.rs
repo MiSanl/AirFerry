@@ -71,13 +71,13 @@ impl Default for FileMeta {
 pub struct DescriptorInfo {
     pub meta: ObjectMeta,
     pub file_meta: FileMeta,
-    /// Present only for descriptor v4 large-transfer child objects.
+    /// Present only for descriptor v5 large-transfer child objects.
     pub segment: Option<SegmentMeta>,
 }
 
 /// Compact on-wire descriptor layout (big-endian):
 ///   u8  magic        = 0xD5
-///   u8  version      = 3 (legacy object) or 4 (large-transfer segment)
+///   u8  version      = 3 (legacy object) or 5 (large-transfer segment)
 ///   u16 num_blocks
 ///   u64 transfer_length
 ///   u32 symbol_size
@@ -91,7 +91,7 @@ pub struct DescriptorInfo {
 ///   --- v3 extension ---
 ///   u8  compression         (0=None, 1=Zstd, 2=Xz)
 ///   u64 compressed_size     (compressed payload bytes, before RaptorQ padding)
-///   --- v4 segmented extension ---
+///   --- v5 segmented extension (compress-then-segment model) ---
 ///   u128 root_session_id
 ///   u32  segment_index
 ///   u32  segment_count
@@ -103,8 +103,25 @@ pub struct DescriptorInfo {
 /// Total v1 part = 28 + 16*B. v2 extension = 1 + filename_len + 8 + 4.
 /// v3 extension = 1 + 8 = 9.
 /// Must fit in one symbol payload (default 1024 bytes).
+///
+/// # Version history
+/// - v1/v2/v3: legacy single-object descriptors (still emitted for non-segmented
+///   transfers; a segmented child object never uses these).
+/// - v4 (LEGACY, REJECTED): the original segmentation model — 8 MiB *raw original*
+///   segments, each independently compressed. Used by withdrawn early v1.2.0
+///   pre-release builds. Superseded by v5; receivers fail-closed reject v4 because its
+///   field semantics (raw_sha256 over uncompressed segment bytes, 8 MiB segment
+///   size, per-segment compression) are incompatible with v5 and silently
+///   accepting it would mis-parse a segmented transfer as a single object.
+/// - v5 (CURRENT): compress-then-segment model — compress the whole payload
+///   once, then split the compressed stream into ~31.9 MiB segments. Introduced
+///   in the final v1.2.0 release; withdrawn pre-release builds used stale v4
+///   semantics and are intentionally unsupported.
 const DESC_MAGIC: u8 = 0xD5;
-const DESC_VERSION: u8 = 4;
+const DESC_VERSION: u8 = 5;
+/// Legacy v4 segmentation model (8 MiB raw-segment, per-segment compression).
+/// Superseded by v5 (compress-then-segment). Receivers reject v4 fail-closed.
+const DESC_LEGACY_V4: u8 = 4;
 const DESC_V3_VERSION: u8 = 3;
 const DESC_FIXED_OVERHEAD: usize = 28;
 /// Size of the v2 extension fields excluding the variable filename bytes:
@@ -112,8 +129,12 @@ const DESC_FIXED_OVERHEAD: usize = 28;
 const DESC_V2_TAIL_FIXED: usize = 13;
 /// Size of the v3 extension fields: u8 compression + u64 compressed_size = 9.
 const DESC_V3_TAIL_FIXED: usize = 9;
-/// Size of the descriptor-v4 segment extension.
-const DESC_V4_TAIL_FIXED: usize = 16 + 4 + 4 + 8 + 8 + 32 + 32;
+/// Size of the segmented-extension tail (introduced by v4, unchanged layout in
+/// v5 — only the field *semantics* and the version byte differ). 104 bytes:
+/// u128 root_session_id + u32 segment_index + u32 segment_count +
+/// u64 original_offset + u64 root_original_size + u8[32] root_sha256 +
+/// u8[32] raw_sha256.
+const DESC_SEGMENT_TAIL_FIXED: usize = 16 + 4 + 4 + 8 + 8 + 32 + 32;
 
 /// Serialize object metadata + file metadata into a descriptor payload, padded
 /// with zeros to `symbol_size` bytes.
@@ -121,7 +142,7 @@ pub fn build_payload(meta: &ObjectMeta, file_meta: &FileMeta) -> Result<Vec<u8>>
     build_payload_inner(meta, file_meta, None)
 }
 
-/// Serialize a descriptor-v4 large-transfer child object.
+/// Serialize a descriptor-v5 large-transfer child object.
 pub fn build_segment_payload(
     meta: &ObjectMeta,
     file_meta: &FileMeta,
@@ -142,7 +163,7 @@ fn build_payload_inner(
     // strict decoder and would reject an invalid descriptor.
     let blocks_len = meta.blocks.len() * 16;
     let segment_tail = if segment.is_some() {
-        DESC_V4_TAIL_FIXED
+        DESC_SEGMENT_TAIL_FIXED
     } else {
         0
     };
@@ -225,20 +246,31 @@ fn build_payload_inner(
     Ok(buf)
 }
 
-/// Parse a descriptor payload. Accepts v1, v2, v3, and segmented v4 descriptors.
+/// Parse a descriptor payload. Accepts v1, v2, v3, and segmented v5 descriptors.
 ///
 /// Extension parsing is gated by the explicit version byte. Descriptor symbols
 /// are zero-padded, so using payload length to infer a newer version would parse
 /// v1/v2 padding as real fields and could truncate a recovered file to zero.
 ///
-/// Returns `None` only if the payload is not a descriptor at all (bad magic or
-/// truncated below the fixed header + declared block table).
+/// **Legacy v4 is rejected**: v4 used the 8 MiB raw-segment + per-segment-
+/// compression model (incompatible with v5's compress-then-segment). Silently
+/// accepting a v4 segmented transfer would mis-parse it as a single object.
+///
+/// Returns `None` if the payload is not a descriptor, uses an unknown/legacy
+/// version, or is truncated below the fixed header + declared block table.
 pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
     if payload.len() < DESC_FIXED_OVERHEAD || payload[0] != DESC_MAGIC {
         return None;
     }
     let version = payload[1];
     if !(1..=DESC_VERSION).contains(&version) {
+        return None;
+    }
+    // Reject the legacy v4 segmentation model (8 MiB raw-segment, per-segment
+    // compression) fail-closed: its field semantics are incompatible with v5,
+    // and accepting it would mis-parse a v4 segmented transfer as a single
+    // object (the v4 segment tail would be silently dropped).
+    if version == DESC_LEGACY_V4 {
         return None;
     }
 
@@ -334,7 +366,7 @@ pub fn parse_payload(payload: &[u8]) -> Option<DescriptorInfo> {
     };
 
     let segment = if version == DESC_VERSION {
-        if payload.len() < o + DESC_V4_TAIL_FIXED {
+        if payload.len() < o + DESC_SEGMENT_TAIL_FIXED {
             return None;
         }
         let root_session_id = u128::from_be_bytes(payload[o..o + 16].try_into().ok()?);
@@ -395,7 +427,7 @@ pub fn build_frame(
     ))
 }
 
-/// Build a descriptor-v4 frame for one large-transfer child object.
+/// Build a descriptor-v5 frame for one large-transfer child object.
 pub fn build_segment_frame(
     meta: &ObjectMeta,
     file_meta: &FileMeta,
@@ -520,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_roundtrip_v4_binds_root_sha256() {
+    fn descriptor_roundtrip_v5_binds_root_sha256() {
         let data = vec![0x5au8; 4_096];
         let sender = SenderSession::new(
             &data,
@@ -586,6 +618,55 @@ mod tests {
         let mut payload = build_payload(sender.meta(), sender.file_meta()).unwrap();
         payload[1] = DESC_VERSION + 1;
         assert!(parse_payload(&payload).is_none());
+    }
+
+    /// The legacy v4 segmentation model (8 MiB raw-segment + per-segment
+    /// compression, used by withdrawn early v1.2.0 pre-release builds) is incompatible with v5's
+    /// compress-then-segment semantics. Receivers must reject v4 fail-closed so
+    /// a v4 segmented transfer is never silently mis-parsed as a single object
+    /// (which would drop the segment tail and corrupt recovery). Two builds
+    /// both labelled "v1.2.0" carrying different v4 semantics was the original
+    /// bug; this rejection makes the incompatibility explicit.
+    #[test]
+    fn rejects_legacy_v4_descriptor() {
+        let data = vec![0x5au8; 4_096];
+        let sender = SenderSession::new(
+            &data,
+            SessionId::zero(),
+            SenderConfig::default(),
+            FileMeta {
+                filename: "legacy.bin".to_string(),
+                original_size: data.len() as u64,
+                ..FileMeta::default()
+            },
+        )
+        .unwrap();
+        // Build a current (v5) segment payload, then forge the version byte to
+        // legacy v4 — simulating a v1.2.0-tagged sender's frame reaching a v5
+        // receiver. parse_payload must refuse it.
+        let segment = SegmentMeta {
+            root_session_id: 0x1234,
+            segment_index: 0,
+            segment_count: 1,
+            original_offset: 0,
+            root_original_size: data.len() as u64,
+            root_sha256: [0xa5; 32],
+            raw_sha256: [0x5a; 32],
+        };
+        let mut payload =
+            build_segment_payload(sender.meta(), sender.file_meta(), &segment).unwrap();
+        assert_eq!(payload[1], DESC_VERSION); // currently 5
+        payload[1] = DESC_LEGACY_V4; // forge legacy v4
+        assert!(
+            parse_payload(&payload).is_none(),
+            "legacy v4 descriptor must be rejected, not silently mis-parsed"
+        );
+        // A non-segmented v3 payload with version forged to 4 is also rejected
+        // (no valid descriptor uses v4 anymore).
+        let mut plain = build_payload(sender.meta(), sender.file_meta()).unwrap();
+        assert_eq!(plain[1], DESC_V3_VERSION);
+        plain[1] = DESC_LEGACY_V4;
+        assert!(parse_payload(&plain).is_none());
     }
 
     /// A genuine v2 descriptor — exactly what a real legacy v2 sender transmits:

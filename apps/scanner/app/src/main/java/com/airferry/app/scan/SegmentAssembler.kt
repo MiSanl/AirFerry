@@ -11,7 +11,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 /**
- * Disk-backed assembler for a descriptor-v4 large transfer.
+ * Disk-backed assembler for a descriptor-v5 large transfer.
  *
  * A logical transfer is compressed **once** into a single compressed stream,
  * then split into fixed `SEGMENT_RAW_BYTES` (~32 MiB) segments. Each segment is
@@ -87,7 +87,7 @@ class SegmentAssembler private constructor(
         require(MessageDigest.isEqual(actualSha256, expectedSha256)) {
             "segment $index SHA-256 mismatch"
         }
-        val hashHex = actualSha256.toHex()
+        val hashHex = toHex(actualSha256)
         if (received[index]) {
             require(hashes[index] == hashHex) { "duplicate segment metadata conflicts" }
             return false
@@ -147,7 +147,7 @@ class SegmentAssembler private constructor(
         name: String,
     ): Boolean =
         rootSessionIdLo == lo && rootSessionIdHi == hi && segmentCount == count &&
-            compressedSize == size && rootSha256 == rootHash.toHex() && fileName == name
+            compressedSize == size && rootSha256 == toHex(rootHash) && fileName == name
 
     @Synchronized
     fun isComplete(): Boolean = receivedCount >= segmentCount
@@ -173,8 +173,35 @@ class SegmentAssembler private constructor(
         if (!isComplete()) return null
         if (!partialFile.exists()) return null
         if (partialFile.length() != compressedSize) return null
+        // Re-check free space against the DECOMPRESSED size right before the
+        // final streaming decompress. The initial open() check only verified
+        // compressedSize (the segment payload budget); the decompressed result
+        // can be far larger (legitimate highly-compressible file, or a hostile
+        // compressed stream that expands to the declared decompressedSize).
+        // Trusting only the descriptor's decompressedSize here can fill the disk.
+        // outFile is created on the same volume as dir.
         val outFile = File(dir, "transfer.decompressed")
         if (outFile.exists()) outFile.delete()
+        val usable = dir.usableSpace
+        // Guard against Long overflow: a hostile descriptor can declare a
+        // decompressedSize near Long.MAX_VALUE, and the naive `decompressedSize +
+        // reserve` would wrap to a negative number, bypassing the space check.
+        // Compare without adding: if decompressedSize alone already exceeds what
+        // the volume can hold (minus the reserve), reject. Use saturating math.
+        val needed = if (decompressedSize > Long.MAX_VALUE - MIN_FREE_RESERVE_BYTES) {
+            Long.MAX_VALUE // overflow → treat as unmeetable
+        } else {
+            decompressedSize + MIN_FREE_RESERVE_BYTES
+        }
+        if (usable < needed) {
+            android.util.Log.w(
+                "SegmentAssembler",
+                "insufficient free space for decompressed output: need " +
+                    "${needed / 1024 / 1024} MiB, " +
+                    "have ${usable / 1024 / 1024} MiB"
+            )
+            return null
+        }
         val ok = NativeBridge.decompressStreamToFile(
             partialFile.absolutePath,
             outFile.absolutePath,
@@ -306,6 +333,13 @@ class SegmentAssembler private constructor(
         ): SegmentAssembler {
             require(segmentCount in 1..MAX_SEGMENT_COUNT) { "segment count out of range" }
             require(compressedSize > 0) { "compressed stream size must be positive" }
+            // The decompressed (original) size is forwarded to the streaming
+            // decompressor as the output cap (decompression-bomb guard), so it
+            // must be strictly positive — a non-positive value would either
+            // reject every stream (0) or, if it ever slipped through, disable the
+            // cap. Positive values are also validated against i64/Long range by
+            // construction and the disk-space re-check below.
+            require(decompressedSize > 0) { "decompressed size must be positive" }
             val expectedCount = ((compressedSize - 1) / SEGMENT_RAW_BYTES + 1)
             require(expectedCount == segmentCount.toLong()) {
                 "segment count inconsistent with compressed stream size"
@@ -391,11 +425,58 @@ class SegmentAssembler private constructor(
         fun hasStoredSegment(root: File, rootSessionIdLo: Long, rootSessionIdHi: Long, index: Int): Boolean {
             if (index < 0) return false
             val hex = rootSessionIdHex(rootSessionIdLo, rootSessionIdHi)
-            val bm = File(File(root, "seg/$hex"), "bitmap.json")
+            val dir = File(root, "seg/$hex")
+            val bm = File(dir, "bitmap.json")
             if (!bm.isFile) return false
             return try {
-                val recv = JSONObject(bm.readText()).optJSONArray("received")
-                recv != null && index < recv.length() && recv.optBoolean(index)
+                val obj = JSONObject(bm.readText())
+                val recv = obj.optJSONArray("received")
+                val on = recv != null && index < recv.length() && recv.optBoolean(index)
+                if (!on) return false
+                // Ledger claims the segment was received — also verify its bytes
+                // are actually present in transfer.partial AND hash to the SHA-256
+                // the ledger committed when the segment was first stored. A crash
+                // can leave a checked bitmap entry whose .partial is missing,
+                // truncated, or corrupted in place; a mere presence/length or
+                // zero-sample check can be fooled by same-length corrupt bytes.
+                // Only returning true when the full segment re-hashes correctly
+                // guarantees the scanner may safely skip it. Any mismatch (or a
+                // ledger without a per-segment hash, i.e. a legacy record) makes
+                // the caller rescan, which then hits storeSegment's
+                // heal-on-duplicate logic and repairs the record.
+                val partial = File(dir, "transfer.partial")
+                if (!partial.isFile) return false
+                val compressedSize = obj.getString("compressedSize").toLong()
+                if (partial.length() != compressedSize) return false
+                // Segment range must be within the file (offset + length ≤ size),
+                // mirroring canonicalOffset/canonicalLength.
+                val offset = index.toLong() * SEGMENT_RAW_BYTES
+                val length = minOf(SEGMENT_RAW_BYTES, compressedSize - offset)
+                if (offset !in 0 until compressedSize || length <= 0 || offset + length > compressedSize) {
+                    return false
+                }
+                val savedHashes = obj.optJSONArray("hashes")
+                val expectedHash = if (savedHashes == null || savedHashes.isNull(index)) {
+                    null
+                } else {
+                    savedHashes.optString(index).takeIf { it.length == 64 }
+                }
+                if (expectedHash == null) return false
+                // Full SHA-256 over the entire segment range (not a 1 KiB sample):
+                // same-length corruption anywhere in the segment must be caught.
+                val md = MessageDigest.getInstance("SHA-256")
+                RandomAccessFile(partial, "r").use { raf ->
+                    raf.seek(offset)
+                    val buf = ByteArray(64 * 1024)
+                    var left = length
+                    while (left > 0) {
+                        val n = raf.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                        if (n <= 0) return false
+                        md.update(buf, 0, n)
+                        left -= n
+                    }
+                }
+                toHex(md.digest()) == expectedHash
             } catch (_: Exception) {
                 false
             }
@@ -450,6 +531,16 @@ class SegmentAssembler private constructor(
             val dir = File(root, "seg/$hex")
             if (dir.exists()) dir.deleteRecursively()
         }
+
+        /**
+         * ByteArray → lowercase hex. Lives in the companion so both companion
+         * members (e.g. [hasStoredSegment]) and instance members (e.g.
+         * [verifyPersistedSegment], [storeSegment]) can use it — a top-level
+         * extension/function in the class body would be invisible to the
+         * companion object.
+         */
+        private fun toHex(bytes: ByteArray): String =
+            bytes.joinToString("") { "%02x".format(it) }
     }
 
     private fun canonicalLength(index: Int): Long {
@@ -474,11 +565,9 @@ class SegmentAssembler private constructor(
                     left -= n
                 }
             }
-            md.digest().toHex() == expectedHash
+            toHex(md.digest()) == expectedHash
         } catch (_: Exception) {
             false
         }
     }
-
-    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }

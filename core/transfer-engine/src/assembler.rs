@@ -3,7 +3,7 @@
 //! A logical transfer is compressed **once** into a single compressed stream,
 //! then that stream is split into fixed `SEGMENT_RAW_BYTES` (32 MiB) segments.
 //! Each segment is a *separate* wire session carrying its own child session id
-//! (see [`crate::SessionId::derive_segment`]) and a descriptor-v4 frame whose
+//! (see [`crate::SessionId::derive_segment`]) and a descriptor-v5 frame whose
 //! `SegmentMeta` describes the root transfer and the segment's canonical range
 //! within the compressed stream.
 //!
@@ -11,7 +11,7 @@
 //! with **no protocol or 32 MiB-budget change** — each segment is an ordinary
 //! single object. [`TransferAssembler`] is the receiving-side coordinator: it
 //! accumulates the recovered *compressed* bytes of each segment, verifies each
-//! segment's length and SHA-256 against its descriptor-v4 `SegmentMeta`, and
+//! segment's length and SHA-256 against its descriptor-v5 `SegmentMeta`, and
 //! once every segment has arrived returns the **full compressed stream** in
 //! `segment_index` order. Decompression of that concatenated stream is the
 //! caller's job (the assembler has no codec); the caller then verifies the
@@ -44,14 +44,14 @@ pub struct TransferAssembler {
     root_session_id: u128,
     /// Display name of the root file (from the first segment's file_meta).
     filename: String,
-    /// Total number of segments (== segment_count in the first v4 descriptor).
+    /// Total number of segments (== segment_count in the first v5 descriptor).
     total_segments: u32,
     /// Total size of the **compressed** root stream.
     root_compressed_size: u64,
     /// Total decompressed size of the whole file.
     root_original_size: u64,
     /// Complete-file digest of the decompressed original, shared by every
-    /// descriptor-v4 segment.
+    /// descriptor-v5 segment.
     root_sha256: [u8; 32],
     /// Per-segment compressed bytes. Index == segment_index.
     segments: Vec<Option<Vec<u8>>>,
@@ -62,7 +62,7 @@ pub struct TransferAssembler {
 }
 
 impl TransferAssembler {
-    /// Start a new assembly from the first-observed descriptor-v4 segment.
+    /// Start a new assembly from the first-observed descriptor-v5 segment.
     ///
     /// `seg`/`file_meta` come from the first segment whose descriptor is seen.
     /// The assembler allocates `seg.segment_count` slots up front so a hostile

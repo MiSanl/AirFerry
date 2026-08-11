@@ -31,6 +31,7 @@ use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use qr_protocol::frame::SessionIdRaw;
+use raptorq_core::MAX_ORIGINAL_BYTES;
 use std::os::raw::c_char;
 
 // Per-frame status packing + the error sentinel now live in the shared
@@ -215,7 +216,7 @@ pub unsafe extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
 }
 
 /// Reassemble this segment's transmitted bytes **as received** (trimmed to its
-/// `compressed_size`), **without** decompression. For descriptor-v4
+/// `compressed_size`), **without** decompression. For descriptor-v5
 /// compressed-stream segmentation, Kotlin/C# stores these compressed bytes and
 /// concatenates + decompresses once after every segment arrives.
 ///
@@ -329,9 +330,11 @@ pub unsafe extern "C" fn airferry_decompress_bytes(
         return 0;
     }
     let input = unsafe { std::slice::from_raw_parts(data, data_len) };
-    let out =
-        match qr_protocol::compress::decompress_with_limit(input, compression, max_output as usize)
-        {
+    // Clamp the host-supplied cap to MAX_ORIGINAL_BYTES so a careless or
+    // hostile caller cannot disable decompress_with_limit's bomb bound by
+    // passing a huge / usize::MAX-equivalent max_output.
+    let cap = (max_output.min(MAX_ORIGINAL_BYTES)) as usize;
+    let out = match qr_protocol::compress::decompress_with_limit(input, compression, cap) {
             Ok(bytes) => bytes,
             Err(e) => {
                 cffi_log(&format!("decompress_bytes failed: {e}"));
@@ -515,13 +518,13 @@ pub unsafe extern "C" fn airferry_receiver_crc32_known(handle: *const ReceiverSe
     session.file_meta().crc32_known as i32
 }
 
-// ─── descriptor-v4 segment metadata getters ───────────────────────────────
+// ─── descriptor-v5 segment metadata getters ───────────────────────────────
 // A large transfer is split into independent child sessions (one per segment).
-// These getters let a host detect that the confirmed descriptor is a v4
+// These getters let a host detect that the confirmed descriptor is a v5
 // segment and drive a disk-backed `.partial` writer. All mirror the JNI and
 // WASM bindings and read `session.segment_meta()`.
 
-/// Return 1 if the confirmed descriptor was a v4 large-transfer child object,
+/// Return 1 if the confirmed descriptor was a v5 large-transfer child object,
 /// else 0.
 ///
 /// # Safety
@@ -637,7 +640,7 @@ pub unsafe extern "C" fn airferry_receiver_root_session_id_hi(
 /// Returns the number of bytes that *would* be written (32), mirroring the
 /// two-pass length protocol used by `airferry_receiver_file_name`. If `out` is
 /// null or `cap < 32`, nothing is written and 32 is returned. Returns 0 if the
-/// confirmed descriptor is not a v4 segment.
+/// confirmed descriptor is not a v5 segment.
 ///
 /// # Safety
 /// A non-null handle must refer to a live receiver and be externally

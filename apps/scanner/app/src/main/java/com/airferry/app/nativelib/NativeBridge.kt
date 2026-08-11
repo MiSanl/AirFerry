@@ -51,7 +51,7 @@ object NativeBridge {
 
     /**
      * Reassemble the transmitted bytes exactly as received (trimmed to
-     * `compressed_size`), **without** decompressing. For descriptor-v4
+     * `compressed_size`), **without** decompressing. For descriptor-v5
      * compressed-stream segments this yields the segment's compressed bytes,
      * which Kotlin concatenates and decompresses once after the whole set
      * arrives. Empty byte[] when decoding is incomplete.
@@ -125,9 +125,9 @@ object NativeBridge {
      */
     external fun receiverCrc32Known(handle: Long): Int
 
-    // ---- descriptor-v4 segment metadata (large-transfer child objects) ----
+    // ---- descriptor-v5 segment metadata (large-transfer child objects) ----
 
-    /** 1 if the confirmed descriptor was a v4 large-transfer child object. */
+    /** 1 if the confirmed descriptor was a v5 large-transfer child object. */
     external fun receiverIsSegmented(handle: Long): Int
 
     /** Zero-based index of this segment within the root transfer (0 if not segmented). */

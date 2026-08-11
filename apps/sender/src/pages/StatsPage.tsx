@@ -32,6 +32,7 @@ export function StatsPage({ session, fileSize }: Props) {
 
   useEffect(() => {
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     const tick = () => {
       if (cancelled) return
       try {
@@ -46,11 +47,12 @@ export function StatsPage({ session, fileSize }: Props) {
       } catch {
         /* ignore */
       }
-      setTimeout(tick, 500)
+      timer = setTimeout(tick, 500)
     }
     tick()
     return () => {
       cancelled = true
+      if (timer !== null) clearTimeout(timer)
     }
   }, [session])
 

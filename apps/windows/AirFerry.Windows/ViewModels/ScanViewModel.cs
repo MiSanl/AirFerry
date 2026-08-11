@@ -55,7 +55,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private const int RateWindowSeconds = 3;
     private const int RateMinMilliseconds = 500;
     private string? _resumeRootId;
-    /// <summary>Disk-backed assembler for a descriptor-v4 large transfer (null = none).</summary>
+    /// <summary>Disk-backed assembler for a descriptor-v5 large transfer (null = none).</summary>
     private AirFerry.Windows.Bundle.SegmentAssembler? _segAssembler;
 
     private sealed record AssembledPayload(
@@ -571,7 +571,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     {
         pool.IngestStopped = true;
 
-        // descriptor-v4 large transfer: store this segment into the disk-backed
+        // descriptor-v5 large transfer: store this segment into the disk-backed
         // assembler and return once every segment has arrived.
         if (pool.RunExclusive(() => session.IsSegmented()))
         {
@@ -657,7 +657,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Store one recovered descriptor-v4 segment into the disk-backed assembler.
+    /// Store one recovered descriptor-v5 segment into the disk-backed assembler.
     /// Returns a <see cref="RecoveryResult"/> only once every segment of the root
     /// transfer has arrived and been merged; otherwise null (the receiver keeps
     /// scanning for the next segment).

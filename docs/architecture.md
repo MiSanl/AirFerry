@@ -94,7 +94,7 @@ core/
   ├─ Windows 同一采集句柄节流 BGR24 快照 → WPF 预览（UI 不读设备）
   ├─ 串行 ingest（锁）：帧校验 → 去重 → RaptorQ
   └─ assemble + 解压后分流：
-       ⓪ descriptor-v4 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘（bounded RAM）
+       ⓪ descriptor-v5 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘（bounded RAM）
        ① ETTEXTv1 → ReceiveText（复制/分享/存盘）
        ② ETBUNDL1 → 拆包；文本类扩展名可点进 ReceiveText
        ③ 单文件 + TextLike 扩展名 + 严格 UTF-8 → ReceiveText

@@ -290,12 +290,15 @@ pack_dist() {
   # 拆成两个独立 zip，各自自包含可独立部署：
   #   • airferry-sender-web-v{VER}.zip    ← dist/        （index.html 发送端）
   #   • airferry-receiver-web-v{VER}.zip  ← dist-receiver/（receiver.html 接收端）
-  # 发送端 zip 排除 zxing_reader.wasm（接收端 QR 解码专用）；接收端自带
-  # wasm-zstd.wasm（解压 zstd 载荷）+ zxing_reader.wasm。与 Windows 同样用
-  # warn 而非 error：用户可能只想发扩展+APK 而不发网页端。
+  # 发送端 zip 排除接收端 QR 解码专用资产：zxing_reader.wasm（zxing-wasm 兼容
+  # 后端）以及 airferry_zxing.js/.wasm（FAST ZXing-C++ 后端，~850 KiB）——它们
+  # 只被接收端 receiver.html 的 qr-decode worker 使用，发送端 zip 不应带入。
+  # 接收端自带 wasm-zstd.wasm（解压 zstd 载荷）+ zxing_reader.wasm +
+  # airferry_zxing.*。与 Windows 同样用 warn 而非 error：用户可能只想发扩展
+  # +APK 而不发网页端。
   local web_dist="$ROOT/apps/web/dist"
   if [[ -d "$web_dist" ]]; then
-    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . -x 'zxing_reader.wasm' )
+    ( cd "$web_dist" && zip -r -q -X "$ROOT/dist/airferry-sender-web-v${VER}.zip" . -x 'zxing_reader.wasm' -x 'airferry_zxing.js' -x 'airferry_zxing.wasm' )
     info "发送端网页 → dist/airferry-sender-web-v${VER}.zip（index.html）"
   else
     warn "未找到发送端网页构建产物（${web_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
