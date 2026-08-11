@@ -536,16 +536,19 @@ class ScanActivity : ComponentActivity() {
         // segment is rejected on the descriptor frame itself, before the UI
         // even shows "receiving".
         if (!status.complete && session.isInitialized && session.isSegmented()) {
-            val asm = segAssembler
             val idx = session.segmentIndex()
             val cnt = session.segmentCount()
-            val dup = asm != null &&
-                asm.rootSessionIdLo() == session.rootSessionIdLo() &&
-                asm.rootSessionIdHi() == session.rootSessionIdHi() &&
-                asm.hasSegment(idx)
-            Log.w(TAG, "dupSeg: segIdx=$idx cnt=$cnt asm=${asm != null} " +
-                "rootMatch=${asm != null && asm.rootSessionIdLo() == session.rootSessionIdLo() && asm.rootSessionIdHi() == session.rootSessionIdHi()} " +
-                "hasSeg=${asm?.hasSegment(idx) ?: false} => dup=$dup")
+            val lo = session.rootSessionIdLo()
+            val hi = session.rootSessionIdHi()
+            // In-memory ledger for the ongoing transfer; fall back to the
+            // durable disk ledger (e.g. after the app restarted / resume) so a
+            // re-scanned already-completed segment is still rejected.
+            val asm = segAssembler
+            val inMem = asm != null && asm.rootSessionIdLo() == lo && asm.rootSessionIdHi() == hi
+            val dup = if (inMem) asm!!.hasSegment(idx)
+                else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)
+            Log.w(TAG, "dupSeg: segIdx=$idx cnt=$cnt inMem=$inMem " +
+                "hasSeg=${if (inMem) asm!!.hasSegment(idx) else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)} => dup=$dup")
             if (dup) {
                 val dupText = "第 ${idx + 1}/$cnt 段已接收过，自动跳过"
                 runOnUiThread {

@@ -382,6 +382,25 @@ class SegmentAssembler private constructor(
             return asm
         }
 
+        /**
+         * Read-only check whether a segment is already durably received for a
+         * given root transfer. Unlike [open] this needs no full metadata and
+         * never mutates any state — used to reject re-scanning an already
+         * completed segment (the scan-side duplicate-segment fast path).
+         */
+        fun hasStoredSegment(root: File, rootSessionIdLo: Long, rootSessionIdHi: Long, index: Int): Boolean {
+            if (index < 0) return false
+            val hex = rootSessionIdHex(rootSessionIdLo, rootSessionIdHi)
+            val bm = File(File(root, "seg/$hex"), "bitmap.json")
+            if (!bm.isFile) return false
+            return try {
+                val recv = JSONObject(bm.readText()).optJSONArray("received")
+                recv != null && index < recv.length() && recv.optBoolean(index)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
         /** List durable incomplete/completed-but-not-yet-archived tasks. */
         fun listTasks(root: File): List<Task> {
             val segRoot = File(root, "seg")
