@@ -53,11 +53,11 @@ session_id = FNV1a_128(
 
 发送端在写入前验证 `file_count`（产品上限 4096）与每个 UTF-8 文件名均可无损表示为 u16；文件名超过 65535 字节会明确报错，不允许静默截断并造成容器错位。接收端有**两个独立上限**：**压缩对象（wire）上限** `raptorq_core::MAX_OBJECT_BYTES` = **32 MiB**，以及**原始（解压后）内容上限** `raptorq_core::MAX_ORIGINAL_BYTES` = **256 MiB**。多文件包/文字超过原始上限时发送端硬性阻止并提示分批；单个真实文件则自动转为 descriptor-v4 分段，不受该根大小上限。单个 0 B 文件会在发送前明确拒绝（bundle 内的空条目仍可表示）。
 
-**发送端 wire 上限硬门（单对象）**：由于接收端对超过 `MAX_OBJECT_BYTES`（32 MiB）的 wire 对象是**硬性拒绝**（无法还原，非警告），发送端在压缩 worker（`apps/sender/src/workers/compress.worker.ts`）内**压缩完成后**检查实际 `compressed_size`：若超过 32 MiB，直接报错并终止，不再进入播放流程。这覆盖了 256 MiB 原始确认框**漏掉**的关键场景——原始大小介于 32 MiB 与 256 MiB 之间、但压缩后仍超 32 MiB。
+**发送端 wire 上限硬门（单对象）**：由于接收端对超过 `MAX_OBJECT_BYTES`（32 MiB）的 wire 对象是**硬性拒绝**（无法还原，非警告），发送端在压缩 worker（`apps/sender/src/workers/compress.worker.ts`）内**压缩完成后**按 `compressed_size` 决定是否分段：若压缩流 ≤ `SEGMENT_RAW_BYTES`（≈ 32 MiB）则作为单对象发送；否则把压缩流切成多个段发送。压缩流模型下任何大小的内容都是可发送的（段是同一压缩流的切片），不再有"压缩后仍超 32 MiB 即失败"的硬门。
 
-**大文件分段（descriptor v4）**：单个文件原始大小超过 32 MiB 时，发送端按产品策略把文件切成多个 **8 MiB 原始段**，每段独立压缩、独立 RaptorQ 编码、独立发送（descriptor v4 + 独立 child session id）。这样即使整文件可压缩到 32 MiB 内，也能把发送端/接收端峰值内存和一次暂停的回退量限制在当前段。发送端 worker 首次只准备第 1 段，用户切换或直接输入段号时才重新读取、压缩目标段；主线程也只保留当前段。
+**大文件分段（descriptor v4，压缩后分段）**：逻辑传输（单个文件、多文件包 ETBUNDL1、文字 ETTEXTv1 均可）先被**整段压缩一次**（三算法选优），得到一条压缩流；若压缩流超过 `SEGMENT_RAW_BYTES`（`MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE` ≈ 31.9 MiB，保证经 RaptorQ 符号补齐后不超 32 MiB wire 上限），再把**压缩字节流**切成多个段，每段独立 RaptorQ 编码、独立发送（descriptor v4 + 独立 child session id）。接收端把每段恢复出的**压缩字节**按序拼接，得到完整压缩流后**只解压一次**，再解析为文件/包/文字。与旧模型（每段独立压缩、独立解压、按原始字节偏移拼回）不同，压缩流模型的段不是可独立解压的——单一 zstd/xz 流无法切成可解码的片，因此必须收齐全部段才能恢复。
 
-发送端先增量计算整文件 SHA-256，并把同一个 `root_sha256` 写进每段描述符。Android/Windows 把通过 CRC32 + 段 SHA-256 的段按规范偏移写入任务私有 `.partial` 并原子更新位图；网页接收端在一个 IndexedDB 事务中提交段 Blob 与任务账本。全部段到齐后，三端流式重算根 SHA-256 后才发布。原生端先检查可用空间并把完成文件同卷原子移动到内容库，且用根任务派生的稳定历史 ID 保证崩溃重试不会生成重复记录，避免常态二次完整拷贝；网页端优先通过 File System Access API 逐段哈希并写入用户文件，不构造根文件大小的内存数组。无 File System Access 的 Blob 回退仅允许 ≤64 MiB，较大任务须用 Chrome/Edge 桌面版导出。
+发送端为整份原始内容计算 CRC32 与 SHA-256，把同一个 `root_sha256`（解压后原文摘要）、`original_size`（解压后总大小）、`compression`（整条流的算法）、`crc32` 写进每段描述符；每段的 `compressed_size` 是该段压缩字节数，`raw_sha256` 是该段压缩字节的摘要。Android/Windows 把通过段 SHA-256 的压缩段按压缩流规范偏移写入任务私有 `.partial` 并原子更新位图；网页接收端在一个 IndexedDB 事务中提交段 Blob 与任务账本。全部段到齐后，原生端通过 `qr_protocol::compress::decompress_stream_to_file` 把 `.partial` **流式解压到磁盘**（zstd/xz streaming decoder，边解压边算 CRC32 + SHA-256，内存恒有界），校验解压后长度 + CRC32 + 根 SHA-256 后才发布——因此 > 256 MiB 的超大单文件也能在原生端恢复；网页端没有磁盘流式编解码器，仍在内存量级内拼接压缩流并解压一次（浏览器接收上限提高到 2 GiB，受 JS 内存约束）。原生端先检查可用空间并把完成文件同卷原子移动到内容库，且用根任务派生的稳定历史 ID 保证崩溃重试不会生成重复记录，避免常态二次完整拷贝；网页端优先通过 File System Access API 写入用户文件，不构造根文件大小的内存数组。无 File System Access 的 Blob 回退仅允许 ≤64 MiB，较大任务须用 Chrome/Edge 桌面版导出。
 
 ## 帧格式 (Frame Format)
 
@@ -146,21 +146,21 @@ session_id = FNV1a_128(
 
 剩余字节（从 `Q+9` 到符号末尾）为零填充。
 
-**v4 扩展（大文件分段对象；version == 4）**：紧跟 v3 扩展。version 4 描述符描述一个**大文件传输的分段子对象**——逻辑文件被切成多个 ≤ 8 MiB 的原始段，每段独立压缩、独立 RaptorQ 编码、独立发送（各自携带自己的 child session id），接收端用 descriptor-v4 元数据把各段按偏移拼回完整文件。`file_meta`（filename/original_size/crc32/compression/compressed_size）描述的是**当前这一段**，分段坐标放在 v4 段元数据里：
+**v4 扩展（压缩流分段对象；version == 4）**：紧跟 v3 扩展。version 4 描述符描述一个**压缩流分段子对象**——逻辑传输（文件/包/文字）被整段压缩一次后，把**压缩字节流**切成多个 ≤ `SEGMENT_RAW_BYTES` 的段，每段独立 RaptorQ 编码、独立发送（各自携带自己的 child session id），接收端用 descriptor-v4 元数据把各段**压缩字节**按序拼接、解压一次得到完整原文。`file_meta.compressed_size` 描述**当前段的压缩字节数**；`file_meta.original_size`、`crc32`、`compression`、以及 v4 里的 `root_sha256` 描述**整份解压后原文**（跨段一致），分段坐标放在 v4 段元数据里：
 
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
-| R | 16 | root_session_id | u128 BE（根文件传输 ID，全局一致） |
+| R | 16 | root_session_id | u128 BE（根传输 ID，全局一致） |
 | R+16 | 4 | segment_index | u32 BE（本段在根中的序号，0 起） |
-| R+20 | 4 | segment_count | u32 BE（根文件总段数） |
-| R+24 | 8 | original_offset | u64 BE（本段在根文件中的字节偏移 = index × 8 MiB） |
-| R+32 | 8 | root_original_size | u64 BE（根文件解压后总字节数） |
-| R+40 | 32 | root_sha256 | SHA-256（完整根文件原始字节；每段一致） |
-| R+72 | 32 | raw_sha256 | SHA-256（本段解压后原始字节） |
+| R+20 | 4 | segment_count | u32 BE（根传输总段数） |
+| R+24 | 8 | original_offset | u64 BE（本段在压缩流中的字节偏移 = index × `SEGMENT_RAW_BYTES`） |
+| R+32 | 8 | root_original_size | u64 BE（根压缩流总字节数） |
+| R+40 | 32 | root_sha256 | SHA-256（完整解压后原文；每段一致） |
+| R+72 | 32 | raw_sha256 | SHA-256（本段压缩字节） |
 
-`R = Q + 9`。v4 只接受 `version == 4`；`raw_sha256` 用于逐段校验，`root_sha256` 阻止把不同文件修订版中各自合法的段混到同一任务，并在最终发布前校验完整根文件。固定常量 `SEGMENT_RAW_BYTES = 8 MiB`、`MAX_SEGMENT_COUNT = 131072` 见 `core/transfer-engine/src/segment.rs`。本次 v4 尾部扩展为 104 字节，因此 v1.2.0 的大文件分段要求收发端都升级；普通 version 3 对象不受影响。
+`R = Q + 9`。v4 只接受 `version == 4`；`raw_sha256` 用于逐段校验（对压缩字节），`root_sha256` 阻止把不同文件修订版中各自合法的段混到同一任务，并在最终解压后校验完整原文。固定常量 `SEGMENT_RAW_BYTES = MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE = 32 MiB - 65_528 ≈ 31.9 MiB`（保证一段经 RaptorQ 符号补齐后不超 32 MiB wire 上限）、`MAX_SEGMENT_COUNT = 131072` 见 `core/transfer-engine/src/segment.rs`。本次 v4 尾部扩展为 104 字节，因此大文件分段要求收发端都升级；普通 version 3 对象不受影响。
 
-child session id 的位级派生固定为 `FNV1a_128(ASCII("AirFerry.segment.v1") || root_session_id_BE128 || segment_index_BE32)`。接收端还会强制 `segment_count = ceil(root_original_size / 8 MiB)`、`original_offset = index × 8 MiB`，并要求末段长度精确覆盖根文件尾部；因此不存在洞、重叠或借伪造段数触发巨额分配的空间。
+child session id 的位级派生固定为 `FNV1a_128(ASCII("AirFerry.segment.v1") || root_session_id_BE128 || segment_index_BE32)`。接收端还会强制 `segment_count = ceil(root_original_size / SEGMENT_RAW_BYTES)`、`original_offset = index × SEGMENT_RAW_BYTES`，并要求每段压缩字节数 ≤ 其规范切片长度（发送端可为 RaptorQ 符号补齐留一个符号的余量）；因此不存在洞、重叠或借伪造段数触发巨额分配的空间。
 
 **v2/v3 兼容说明**：真实 v2 发送端只写到 `crc32`，其后为补零区。由于载荷总是补齐到 `symbol_size`，仅凭"剩余 ≥ 9 字节"无法区分 v3 尾部与 v2 补零——全零的 9 字节尾部会被误读为 `compressed_size=0`，导致接收端把恢复结果截成空文件。解析器因此仅当 `version ≥ 3` **或**尾部非全零时才将其当作 v3 扩展；否则按 v2 处理（`compression=None`、`compressed_size == original_size`）。`version == 4` 时额外要求 104 字节 v4 尾段完整，否则拒绝。
 
@@ -216,4 +216,4 @@ child session id 的位级派生固定为 `FNV1a_128(ASCII("AirFerry.segment.v1"
 
 核心 `ResumeState` 可保存 `session_id`、`ObjectMeta`、ESI 摘要和**实际保留的符号载荷**。新 Decoder 只能回放有载荷的符号；仅有 ESI、没有字节的数据绝不能算作已接收，否则重传会被误判为重复。恢复 JSON 输入/输出封顶 128 MiB，并在反序列化和 restore 前校验 OTI、块数、SBN/ESI、符号尺寸及本地预算。
 
-当前实现为控制内存，在 descriptor 确认、符号喂入 Decoder 后不长期保留所有符号字节，因此普通单对象的进程重启会从当前对象重新扫描，而不是承诺“符号级无损续传”。产品级大文件断点由 descriptor-v4 的**完成段账本**承担：Android/Windows/网页均跨重启保留已通过 CRC32 + SHA-256 的完整段，当前尚未完成的 8 MiB 段最多重扫一次。历史页可查看缺失段、继续指定根任务或删除记录。
+当前实现为控制内存，在 descriptor 确认、符号喂入 Decoder 后不长期保留所有符号字节，因此普通单对象的进程重启会从当前对象重新扫描，而不是承诺“符号级无损续传”。产品级大文件断点由 descriptor-v4 的**完成段账本**承担：Android/Windows/网页均跨重启保留已通过段 SHA-256 的完整压缩段，当前尚未完成的 ~32 MiB 段最多重扫一次。历史页可查看缺失段、继续指定根任务或删除记录。**重复段早检测**：网页接收端在确认到某段描述符的瞬间就查询账本，若该段已收齐则立即提示“已接收过”并继续扫描下一段，而不是把整段扫完后再去重；Android/Windows 的完成账本同样可跨重启识别已收段。

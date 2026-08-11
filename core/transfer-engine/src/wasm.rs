@@ -110,19 +110,20 @@ impl SenderSessionWasm {
         })
     }
 
-    /// Create one descriptor-v4 large-transfer segment session.
+    /// Create one descriptor-v4 compressed-stream segment session.
     ///
-    /// A logical file is split into N fixed `SEGMENT_RAW_BYTES` (8 MiB) raw
-    /// segments, each independently compressed and RaptorQ-encoded. This
-    /// constructor wraps one such segment as its own session whose child
-    /// `session_id` is deterministically derived from `(root_session_id,
-    /// segment_index)` — so the outer 60-byte frame format is unchanged and a
-    /// receiver demultiplexes segments purely by that distinct session id.
+    /// A logical transfer is compressed once into a single compressed stream,
+    /// then split into N fixed `SEGMENT_RAW_BYTES` (≈ 32 MiB) slices of that
+    /// stream; each slice is RaptorQ-encoded independently. This constructor
+    /// wraps one such slice as its own session whose child `session_id` is
+    /// deterministically derived from `(root_session_id, segment_index)` — so
+    /// the outer 60-byte frame format is unchanged and a receiver
+    /// demultiplexes segments purely by that distinct session id.
     ///
-    /// `raw_sha256` is the SHA-256 of the segment's *uncompressed* raw bytes
-    /// (32 bytes); `original_size` is that raw segment's length (≤ 8 MiB; the
-    /// final segment may be shorter). `root_session_id_lo/hi`,
-    /// `segment_index`, `segment_count`, `original_offset`,
+    /// `raw_sha256` is the SHA-256 of this segment's *compressed* bytes
+    /// (32 bytes); `original_size` is the whole decompressed original size
+    /// (shared across every segment; may exceed 32 MiB). `root_session_id_lo/
+    /// hi`, `segment_index`, `segment_count`, `original_offset`,
     /// `root_original_size` describe the segment's canonical range within the
     /// root file.
     /// Static factory: `SenderSessionWasm.new_segment(...)`. Exposed as an

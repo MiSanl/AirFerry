@@ -1,26 +1,37 @@
 /**
  * Large-transfer segmentation for the browser sender.
  *
- * A logical file larger than a single RaptorQ object's 32 MiB wire budget is
- * split into fixed `SEGMENT_RAW_BYTES` (8 MiB) *raw* segments. Each segment is
- * independently compressed and independently RaptorQ-encoded as a descriptor-v4
- * child session (child session id = `deriveSegment(root, index)`), so the
- * receiver recovers one segment at a time and assembles the full file.
+ * A logical transfer (single file, multi-file bundle, or text) is compressed
+ * **once** into a single compressed stream, then that stream is split into
+ * fixed `SEGMENT_RAW_BYTES` (~32 MiB) segments. Each segment is independently
+ * RaptorQ-encoded as a descriptor-v4 child session (child session id =
+ * `deriveSegment(root, index)`). The receiver recovers each segment's
+ * **compressed** bytes, concatenates them in order, and decompresses exactly
+ * once to rebuild the original payload.
  *
- * This module only handles the *splitting bookkeeping*: slicing the raw file,
- * computing each segment's SHA-256 (the descriptor's `raw_sha256`), and
+ * This module only handles the *splitting bookkeeping*: slicing the compressed
+ * stream, computing each segment's SHA-256 (the descriptor's `raw_sha256`), and
  * deriving the deterministic child session id. Compression + RaptorQ encoding
  * stay in the existing `compress` / `SenderSessionWasm.new_segment` paths.
  *
  * Protocol constants mirror `core/transfer-engine/src/segment.rs`:
- *   - `SEGMENT_RAW_BYTES` = 8 MiB
+ *   - `SEGMENT_RAW_BYTES` = `MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE` (≈ 32 MiB),
+ *     sized so a full segment still fits the 32 MiB wire ceiling after RaptorQ
+ *     pads it up to a whole symbol for any legal symbol size.
  *   - child id = FNV-1a 128 over b"AirFerry.segment.v1" || root BE || index BE
  */
 
 import { deriveSessionId } from "./session"
 
-/** Fixed uncompressed segment size (mirrors Rust `SEGMENT_RAW_BYTES`). */
-export const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
+/** Wire ceiling and largest symbol size (mirror raptorq_core). */
+const MAX_OBJECT_BYTES = 32 * 1024 * 1024
+const MAX_SYMBOL_SIZE = 65_528
+/**
+ * Fixed compressed-stream segment size (mirrors Rust `SEGMENT_RAW_BYTES`).
+ * ≈ 31.9 MiB; a full segment, after RaptorQ symbol padding, stays within the
+ * 32 MiB wire ceiling for any legal symbol size.
+ */
+export const SEGMENT_RAW_BYTES = MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE
 /** Resource ceiling mirrored from Rust `MAX_SEGMENT_COUNT`. */
 export const MAX_SEGMENT_COUNT = 131_072
 
@@ -91,46 +102,45 @@ export function deriveSegmentId(
 }
 
 /**
- * Slice `file` into its canonical raw segments. Returns one `Uint8Array` per
- * segment (its raw, uncompressed bytes). For a file ≤ 8 MiB this returns a
- * single segment equal to the whole file.
- *
- * Reads the whole file into memory; for very large files callers should stream
- * `File.slice` per segment instead (see `sliceSegment`).
+ * Slice a **compressed stream** into its canonical segments. Returns one
+ * `Uint8Array` per segment (this segment's slice of the compressed bytes). For
+ * a stream ≤ `SEGMENT_RAW_BYTES` this returns a single segment equal to the
+ * whole stream.
  */
-export async function sliceSegments(file: File): Promise<Uint8Array[]> {
-  const count = segmentCountFor(file.size)
+export function sliceSegments(compressed: Uint8Array): Uint8Array[] {
+  const count = segmentCountFor(compressed.length)
   const out: Uint8Array[] = []
   for (let i = 0; i < count; i++) {
-    out.push(await sliceSegment(file, i))
+    out.push(sliceSegment(compressed, i))
   }
   return out
 }
 
-/** Read exactly one canonical segment's raw bytes (streams via File.slice). */
-export async function sliceSegment(file: File, segmentIndex: number): Promise<Uint8Array> {
+/** Read exactly one canonical segment's bytes from a compressed stream. */
+export function sliceSegment(compressed: Uint8Array, segmentIndex: number): Uint8Array {
   const start = segmentOffset(segmentIndex)
-  const end = Math.min(file.size, start + SEGMENT_RAW_BYTES)
+  const end = Math.min(compressed.length, start + SEGMENT_RAW_BYTES)
   if (start >= end) {
     throw new Error(`segment ${segmentIndex} out of range`)
   }
-  const blob = file.slice(start, end)
-  return new Uint8Array(await blob.arrayBuffer())
+  return compressed.slice(start, end)
 }
 
 /**
- * Build the descriptor-v4 metadata for a single segment of a root file.
- * `raw` is that segment's uncompressed bytes (used for the SHA-256).
+ * Build the descriptor-v4 metadata for a single segment of a compressed root
+ * stream. `segmentCompressed` is this segment's compressed bytes (used for the
+ * descriptor's `raw_sha256`). `rootOriginalSize` is the **whole decompressed**
+ * original size and `rootCompressedSize` the whole compressed stream size.
  */
 export async function buildSegmentMeta(
   rootSessionId: { lo: bigint; hi: bigint },
   rootSha256: Uint8Array,
   segmentIndex: number,
   segmentCount: number,
-  rootOriginalSize: number,
-  raw: Uint8Array
+  rootCompressedSize: number,
+  segmentCompressed: Uint8Array
 ): Promise<SegmentMetaWasm> {
-  const sha = await sha256(raw)
+  const sha = await sha256(segmentCompressed)
   return {
     rootSessionIdLo: rootSessionId.lo & 0xffffffffffffffffn,
     rootSessionIdHi: rootSessionId.hi & 0xffffffffffffffffn,
@@ -138,7 +148,7 @@ export async function buildSegmentMeta(
     segmentIndex,
     segmentCount,
     originalOffset: segmentOffset(segmentIndex),
-    rootOriginalSize,
+    rootOriginalSize: rootCompressedSize,
     rootSha256,
     rawSha256: sha
   }

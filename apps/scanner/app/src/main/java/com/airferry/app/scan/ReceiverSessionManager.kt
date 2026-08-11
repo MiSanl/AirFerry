@@ -289,6 +289,30 @@ class ReceiverSessionManager {
     fun lastAssembleError(): String =
         if (initialized) NativeBridge.receiverLastAssembleError(handle) else ""
 
+    // ---- compressed-stream segment access (descriptor-v4) ----
+
+    /**
+     * Reassemble this segment's **compressed** bytes (no decompression).
+     * Empty byte[] when decoding is incomplete.
+     */
+    fun assembleRawBytes(): ByteArray? {
+        if (!initialized) return null
+        val bytes = NativeBridge.receiverAssembleRawBytes(handle) ?: return null
+        return bytes.takeIf { it.isNotEmpty() }
+    }
+
+    /** Compression-algorithm tag of the whole stream (0=None,1=Zstd,2=Xz). */
+    fun compression(): Int =
+        if (initialized) NativeBridge.receiverCompression(handle) else 0
+
+    /** This segment's transmitted (compressed) payload length. */
+    fun compressedSize(): Long =
+        if (initialized) NativeBridge.receiverCompressedSize(handle) else 0L
+
+    /** Whole decompressed original size (same across segments of a root). */
+    fun originalSize(): Long =
+        if (initialized) NativeBridge.receiverOriginalSize(handle) else 0L
+
     fun sessionIdHex(): String {
         val lo = java.lang.Long.toUnsignedString(sessionIdLo, 16).padStart(16, '0')
         val hi = java.lang.Long.toUnsignedString(sessionIdHi, 16).padStart(16, '0')

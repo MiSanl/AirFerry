@@ -335,6 +335,53 @@ public sealed class ReceiverSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reassemble this segment's transmitted (compressed) bytes as received,
+    /// without decompression. Returns the raw bytes, or null when incomplete.
+    /// </summary>
+    public byte[]? AssembleRaw()
+    {
+        lock (_gate)
+        {
+            if (!_initialized) return null;
+            int ok = NativeBridge.ReceiverAssembleRaw(_handle, out IntPtr buf, out nuint len);
+            if (ok == 0 || buf == IntPtr.Zero || len == 0) return null;
+            if (len > int.MaxValue)
+            {
+                NativeBridge.BufferFree(buf, len);
+                return null;
+            }
+            try
+            {
+                byte[] all = new byte[(int)len];
+                Marshal.Copy(buf, all, 0, (int)len);
+                return all;
+            }
+            finally
+            {
+                NativeBridge.BufferFree(buf, len);
+            }
+        }
+    }
+
+    /// <summary>Compression-algorithm tag of the confirmed descriptor.</summary>
+    public byte Compression()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverCompression(_handle) : (byte)0;
+    }
+
+    /// <summary>This object's transmitted (compressed) payload length.</summary>
+    public ulong CompressedSize()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverCompressedSize(_handle) : 0UL;
+    }
+
+    /// <summary>Whole decompressed original size (same across segments of a root).</summary>
+    public ulong OriginalSize()
+    {
+        lock (_gate) return _initialized ? NativeBridge.ReceiverOriginalSize(_handle) : 0UL;
+    }
+
     /// <summary>Session id as a lowercase hex string (high||low, 32 chars).</summary>
     public string SessionIdHex()
     {

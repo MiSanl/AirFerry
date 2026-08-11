@@ -49,6 +49,55 @@ object NativeBridge {
     /** Non-empty when the last assemble failed after decode completed (e.g. decompress). */
     external fun receiverLastAssembleError(handle: Long): String
 
+    /**
+     * Reassemble the transmitted bytes exactly as received (trimmed to
+     * `compressed_size`), **without** decompressing. For descriptor-v4
+     * compressed-stream segments this yields the segment's compressed bytes,
+     * which Kotlin concatenates and decompresses once after the whole set
+     * arrives. Empty byte[] when decoding is incomplete.
+     */
+    external fun receiverAssembleRawBytes(handle: Long): ByteArray?
+
+    /** Compression-algorithm tag of the confirmed descriptor (0=None,1=Zstd,2=Xz). */
+    external fun receiverCompression(handle: Long): Int
+
+    /** This object's transmitted (compressed) payload length. */
+    external fun receiverCompressedSize(handle: Long): Long
+
+    /** Whole decompressed original size (same across segments of a root). */
+    external fun receiverOriginalSize(handle: Long): Long
+
+    /**
+     * Decompress `data` according to `compression` (0=None,1=Zstd,2=Xz),
+     * bounded by `maxOutput`. Used to decompress the concatenated compressed
+     * stream of a segmented transfer exactly once. Empty byte[] on failure.
+     */
+    external fun decompressBytes(
+        data: ByteArray,
+        compression: Int,
+        maxOutput: Long
+    ): ByteArray?
+
+    /**
+     * Stream-decompress the concatenated compressed stream at `inputPath` to
+     * `outputPath` (zstd/xz streaming decoder) while computing CRC32 + SHA-256
+     * incrementally — neither input nor output is held wholly in memory, so very
+     * large files are recoverable in bounded RAM. Returns true only when the
+     * decompressed size, CRC32 (when [crcKnown]) and SHA-256 (`expectedShaHex`,
+     * lowercase hex) all match the descriptor; on any failure the partial
+     * output file is removed.
+     */
+    external fun decompressStreamToFile(
+        inputPath: String,
+        outputPath: String,
+        compression: Int,
+        maxOutput: Long,
+        expectedSize: Long,
+        expectedCrc: Long,
+        crcKnown: Boolean,
+        expectedShaHex: String
+    ): Boolean
+
     external fun receiverDestroy(handle: Long)
 
     // ---- File metadata (populated from descriptor frames) ----

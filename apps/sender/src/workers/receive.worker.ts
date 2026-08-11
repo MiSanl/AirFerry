@@ -27,6 +27,7 @@ import {
   ParseError,
 } from "@/receive/parse"
 import {
+  hasStoredSegment,
   storeVerifiedSegment,
   type StoredSegmentTask,
 } from "@/receive/taskStore"
@@ -80,6 +81,24 @@ let activeJobId = 0
 let ready = false
 let lastMetaSent = false
 
+/**
+ * wasm-bindgen `free()` is not idempotent: a second call can dereference an
+ * already-released native pointer (and this object's `__wbg_ptr` becomes 0, so
+ * any later method call throws "null pointer passed to rust"). Guard every
+ * release so a session is never freed twice, no matter how many code paths
+ * (reset / assemble / segment-complete / error) reach it.
+ */
+const freedSessions = new WeakSet<ReceiverSessionWasm>()
+function freeSession(s: ReceiverSessionWasm | null | undefined): void {
+  if (!s || freedSessions.has(s)) return
+  freedSessions.add(s)
+  try {
+    s.free()
+  } catch {
+    /* best-effort */
+  }
+}
+
 function post(msg: unknown, transfer: Transferable[] = []): void {
   ;(postMessage as (m: unknown, transfer?: Transferable[]) => void)(msg, transfer)
 }
@@ -98,14 +117,8 @@ function recoveredTransferables(recovered: Recovered): Transferable[] {
 
 /** Drop the current session (if any); called on a new job / reset. */
 function dropSession(): void {
-  if (session) {
-    try {
-      session.free()
-    } catch {
-      /* best-effort */
-    }
-    session = null
-  }
+  freeSession(session)
+  session = null
   lastMetaSent = false
 }
 
@@ -276,8 +289,32 @@ function ingestBatch(frames: Uint8Array[], jobId: number): IngestBatchResult {
 function maybePostMeta(jobId: number): void {
   if (!session || lastMetaSent) return
   if (!session.meta_confirmed()) return
-  post({ type: "meta", meta: readMeta(session), jobId })
+  const meta = readMeta(session)
+  post({ type: "meta", meta, jobId })
   lastMetaSent = true
+  // Early duplicate detection: the moment a segmented descriptor is confirmed,
+  // check whether this segment was already stored. If so, tell the UI to skip it
+  // immediately instead of scanning the whole segment again and only
+  // de-duplicating after it fully plays out.
+  if (meta.segmented && meta.rootId) {
+    const rootLo = session.root_session_id_lo()
+    const rootHi = session.root_session_id_hi()
+    const index = session.segment_index()
+    void (async () => {
+      try {
+        if (await hasStoredSegment(rootLo, rootHi, index)) {
+          post({
+            type: "segment-duplicate",
+            index,
+            jobId,
+          })
+          dropSession()
+        }
+      } catch {
+        // Store unavailable — fall through to normal scanning / deferred dedupe.
+      }
+    })()
+  }
 }
 
 /** Assemble + decompress + verify + parse. Throws on hard failure. */
@@ -319,26 +356,20 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
     offset: Number(session.original_offset()),
     rootOriginalSize: Number(session.root_original_size()),
   }
-  const raw = session.assemble_raw()
-  if (raw.length === 0) {
+  const meta = readMeta(session)
+
+  // Segments carry **compressed** bytes in the compressed-stream model. Each
+  // recovered segment is a slice of the single root compressed stream, so it is
+  // NOT independently decompressible; it is stored as-is (compressed) and the
+  // receiver concatenates all segments in order and decompresses exactly once
+  // at save time. Per-segment CRC32 does not apply — CRC32 is over the whole
+  // original payload.
+  const compressed = session.assemble_raw()
+  if (compressed.length === 0) {
     throw new Error("分段恢复尚未完成或组装失败")
   }
-  const meta = readMeta(session)
-  const verify = await decompressAndVerify(
-    raw,
-    meta.compression,
-    meta.originalSize,
-    meta.crc32,
-    meta.crc32Known
-  )
-  if (verify.bytes.length === 0) {
-    throw new Error("分段解压结果为空")
-  }
-  if (verify.crcKnown && !verify.crcOk) {
-    throw new Error(`分段 ${seg.index + 1}/${seg.count} CRC32 校验失败，已拒绝写入`)
-  }
 
-  // Descriptor v4 requires a SHA-256 over the uncompressed segment bytes.
+  // Descriptor v4 requires a SHA-256 over this segment's **compressed** bytes.
   const expectedSha = session.raw_sha256()
   const expectedRootSha = session.root_sha256()
   if (expectedSha.length !== 32 || expectedRootSha.length !== 32) {
@@ -347,19 +378,17 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
   const actualSha = new Uint8Array(
     await crypto.subtle.digest(
       "SHA-256",
-      verify.bytes.slice().buffer as ArrayBuffer
+      compressed.slice().buffer as ArrayBuffer
     )
   )
   if (!actualSha.every((v, i) => v === expectedSha[i])) {
     throw new Error(`分段 ${seg.index + 1}/${seg.count} SHA-256 校验失败，已拒绝写入`)
   }
 
-  const expectedCount = Math.ceil(seg.rootOriginalSize / (8 * 1024 * 1024))
-  const expectedOffset = seg.index * 8 * 1024 * 1024
-  const expectedLength = Math.min(
-    8 * 1024 * 1024,
-    seg.rootOriginalSize - expectedOffset
-  )
+  // Range consistency against the canonical compressed-stream coordinates.
+  const SEGMENT_BYTES = 32 * 1024 * 1024 - 65_528 // mirrors Rust SEGMENT_RAW_BYTES
+  const expectedCount = Math.ceil(seg.rootOriginalSize / SEGMENT_BYTES)
+  const expectedOffset = seg.index * SEGMENT_BYTES
   if (
     !Number.isSafeInteger(seg.rootOriginalSize) ||
     seg.rootOriginalSize <= 0 ||
@@ -372,8 +401,7 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
     seg.index >= seg.count ||
     !Number.isSafeInteger(seg.offset) ||
     seg.offset !== expectedOffset ||
-    meta.originalSize !== expectedLength ||
-    verify.bytes.length !== expectedLength
+    compressed.length > Math.min(SEGMENT_BYTES, seg.rootOriginalSize - expectedOffset)
   ) {
     throw new Error("分段描述符的段数、偏移或长度不一致")
   }
@@ -387,12 +415,16 @@ async function handleSegmentComplete(jobId: number): Promise<StoredSegmentTask |
     rootLo: seg.rootLo,
     rootHi: seg.rootHi,
     fileName: meta.fileName,
-    rootOriginalSize: seg.rootOriginalSize,
+    originalSize: meta.originalSize,
+    compressedSize: seg.rootOriginalSize,
+    compression: meta.compression,
+    crc32: meta.crc32,
+    crc32Known: meta.crc32Known,
     segmentCount: seg.count,
     index: seg.index,
     sha256Hex,
     rootSha256Hex,
-    bytes: verify.bytes,
+    bytes: compressed,
   })
   post({
     type: "segment",

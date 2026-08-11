@@ -665,10 +665,11 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private RecoveryResult? HandleSegmentedTransfer(ReceiverSession session, QrDecodePool pool)
     {
         // Take a coherent native snapshot under the ingest lock: metadata +
-        // assembled (uncompressed) bytes for this segment.
+        // assembled **compressed** bytes for this segment (no decompression —
+        // the whole compressed stream is decompressed once at archive time).
         SegmentPayload? seg = pool.RunExclusive<SegmentPayload?>(() =>
         {
-            byte[]? bytes = session.Assemble();
+            byte[]? bytes = session.AssembleRaw();
             if (bytes is null || bytes.Length == 0) return null;
             return new SegmentPayload(
                 bytes,
@@ -678,12 +679,14 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 session.RootSessionIdLo(),
                 session.RootSessionIdHi(),
                 session.FileName(),
-                session.FileSize(),
+                session.CompressedSize(),
                 session.OriginalOffset(),
                 session.RawSha256(),
                 session.RootSha256(),
                 session.Crc32(),
-                session.Crc32Known());
+                session.Crc32Known(),
+                session.Compression(),
+                session.OriginalSize());
         });
         if (seg is null)
         {
@@ -693,17 +696,18 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
         int index = (int)seg.SegmentIndex;
         int count = (int)seg.SegmentCount;
-        ulong rootSize = seg.RootOriginalSize;
+        ulong rootSize = seg.RootOriginalSize; // whole **compressed** stream size
         ulong lo = seg.RootLo;
         ulong hi = seg.RootHi;
         string rootId = $"{hi:x16}{lo:x16}";
         string displayName = string.IsNullOrEmpty(seg.FileName) ? "received_file" : seg.FileName;
+        ulong decompressedSize = seg.DecompressedSize;
 
         byte[] segBytes = seg.Bytes;
         if (count is <= 0 or > AirFerry.Windows.Bundle.SegmentAssembler.MaxSegmentCount)
             throw new InvalidDataException("分段数量超出安全上限");
         if (rootSize == 0 || rootSize > (ulong)long.MaxValue)
-            throw new InvalidDataException("根文件大小无效");
+            throw new InvalidDataException("压缩流大小无效");
         if (index < 0 || index >= count ||
             seg.OriginalOffset != checked((ulong)index *
                 (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes))
@@ -711,7 +715,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong expectedCount = checked((rootSize - 1) /
             (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes + 1);
         if ((ulong)count != expectedCount)
-            throw new InvalidDataException("分段数量与根文件大小不一致");
+            throw new InvalidDataException("分段数量与压缩流大小不一致");
         ulong expectedLength = Math.Min(
             (ulong)AirFerry.Windows.Bundle.SegmentAssembler.SegmentRawBytes,
             rootSize - seg.OriginalOffset);
@@ -722,8 +726,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             throw new InvalidDataException("分段描述符缺少 SHA-256");
         if (seg.RootSha256.Length != 32)
             throw new InvalidDataException("分段描述符缺少整文件 SHA-256");
-        if (seg.CrcKnown && Crc32.Compute(segBytes) != seg.ExpectedCrc)
-            throw new InvalidDataException($"分段 {index + 1}/{count} CRC32 校验失败");
+        if (decompressedSize == 0 || decompressedSize > (ulong)long.MaxValue)
+            throw new InvalidDataException("原始文件大小无效");
         if (_resumeRootId is not null &&
             !string.Equals(rootId, _resumeRootId, StringComparison.Ordinal))
         {
@@ -732,14 +736,16 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         }
 
         // Reuse the active root so a long, sequential transfer does not reopen
-        // the ledger and re-hash every earlier 8 MiB segment for each child.
+        // the ledger and re-hash every earlier ~32 MiB segment for each child.
         // Interleaved roots still open their own identity-bound assembler.
         var asm = _segAssembler is not null
                   && _segAssembler.Matches(
                       lo, hi, count, (long)rootSize, seg.RootSha256, displayName)
             ? _segAssembler
             : AirFerry.Windows.Bundle.SegmentAssembler.Open(
-                lo, hi, count, (long)rootSize, seg.RootSha256, displayName);
+                lo, hi, count, (long)rootSize, (long)decompressedSize,
+                seg.Compression, (uint)seg.ExpectedCrc, seg.CrcKnown,
+                seg.RootSha256, displayName);
         _segAssembler = asm;
 
         // Crash recovery: all segments may already be durable while history
@@ -773,27 +779,85 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         string displayName,
         ulong rootSize)
     {
-        string finalPath = asm.Finish()
+        // Concatenate the compressed segments and stream-decompress exactly once
+        // to a temp file. The native call already verified the decompressed
+        // length + CRC32 (when known) + root SHA-256 over the decompressed bytes.
+        string decompressedPath = asm.Finish()
             ?? throw new InvalidDataException(
-                "分段账本已完成，但临时文件缺失或损坏");
-        var put = AirFerry.Windows.Bundle.ContentStore.PutFile(
-            displayName, finalPath,
-            crcHex: "unknown", crcUnknown: true, kind: "file",
-            expectedSha256Hex: asm.RootSha256Hex,
-            expectedSize: checked((long)rootSize),
-            stableEntryId: $"segment-{asm.RootSessionIdHex}");
+                "分段账本已完成，但解压或完整性校验失败");
+        ulong expectedCrc = asm.Crc32();
+        bool crcKnown = asm.Crc32Known();
+
+        RecoveryResult result;
+        long length = new FileInfo(decompressedPath).Length;
+        // Text / bundle detection needs the bytes in memory. Anything larger
+        // than the legacy whole-transfer ceiling is a single file by
+        // construction, so skip the in-memory dispatch and stream-copy straight
+        // to the content store — this is what lets > 256 MiB files be recovered.
+        if (length <= 256L * 1024 * 1024)
+        {
+            byte[] original = File.ReadAllBytes(decompressedPath);
+            ulong receivedCrc = Crc32.Compute(original);
+            ulong originalSize = (ulong)original.LongLength;
+
+            if (TextParser.IsText(original) &&
+                FileNameUtil.FitsTextUi(original.LongLength - TextParser.Magic.Length))
+            {
+                string? text = TextParser.Parse(original);
+                result = text is not null
+                    ? StageEtText(text, displayName, expectedCrc, crcKnown, receivedCrc)
+                    : StageSingleFile(original, displayName, originalSize,
+                        expectedCrc, crcKnown, receivedCrc);
+            }
+            else if (BundleParser.IsBundle(original))
+            {
+                result = StageBundle(original, expectedCrc, crcKnown, receivedCrc);
+                result ??= StageSingleFile(original, displayName, originalSize,
+                    expectedCrc, crcKnown, receivedCrc);
+            }
+            else if (FileNameUtil.IsTextLikeName(
+                         string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
+                     && FileNameUtil.FitsTextUi(original.LongLength))
+            {
+                string? text = FileNameUtil.DecodeUtf8Strict(original);
+                result = text is not null
+                    ? StageTextLikeFile(original, displayName, originalSize,
+                        expectedCrc, crcKnown, receivedCrc, text)
+                    : StageSingleFile(original, displayName, originalSize,
+                        expectedCrc, crcKnown, receivedCrc);
+            }
+            else
+            {
+                result = StageSingleFile(original, displayName, originalSize,
+                    expectedCrc, crcKnown, receivedCrc);
+            }
+        }
+        else
+        {
+            // Very large single file: stream/atomically-move the decompressed
+            // temp file into ContentStore without holding it in memory.
+            string finalName = string.IsNullOrEmpty(displayName) ? "received_file" : displayName;
+            ContentStore.PutResult put = ContentStore.PutFile(
+                finalName, decompressedPath,
+                crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
+                crcUnknown: !crcKnown, kind: "file",
+                expectedSha256Hex: asm.RootSha256Hex,
+                expectedSize: rootSize);
+            result = new RecoveryResult(
+                SingleFilePath: put.Path,
+                SingleFileSize: rootSize,
+                ExpectedCrc32: crcKnown ? expectedCrc : null,
+                Crc32Known: crcKnown,
+                ReceivedCrc32: null,
+                Bundle: null,
+                BundleDir: null,
+                DisplayName: finalName);
+        }
+
         asm.CommitArchived();
         _segAssembler = null;
         _resumeRootId = null;
-        return new RecoveryResult(
-            SingleFilePath: put.Path,
-            SingleFileSize: rootSize,
-            ExpectedCrc32: null,
-            Crc32Known: false,
-            ReceivedCrc32: null,
-            Bundle: null,
-            BundleDir: null,
-            DisplayName: displayName);
+        return result;
     }
 
     private sealed record SegmentPayload(
@@ -809,7 +873,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         byte[] RawSha256,
         byte[] RootSha256,
         ulong ExpectedCrc,
-        bool CrcKnown);
+        bool CrcKnown,
+        byte Compression,
+        ulong DecompressedSize);
 
     private void UpdateSegmentedProgress(AirFerry.Windows.Bundle.SegmentAssembler asm)
     {

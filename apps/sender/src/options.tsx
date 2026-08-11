@@ -111,24 +111,27 @@ async function initializeCompressWorker(worker: Worker): Promise<void> {
 
 export type { Page, PendingItem, TransferConfig }
 
-/** One descriptor-v4 large-transfer segment (independently compressed). */
+/** One descriptor-v4 segment of the compressed root stream. */
 interface PreparedSegment {
-  /** This segment's compressed payload (fed to SenderSessionWasm.new_segment). */
+  /** This segment's slice of the compressed stream (fed to new_segment). */
   compressed: Uint8Array
-  /** Compression algorithm of this segment's payload. */
+  /** Compression algorithm of the whole stream (shared by every segment). */
   compressionAlgorithm: number
-  /** CRC32 over this segment's raw bytes. */
+  /** CRC32 over the whole pre-compression payload (file_meta.crc32). */
   preCrc32: number
   segmentIndex: number
   segmentCount: number
+  /** Offset of this segment within the compressed stream. */
   originalOffset: number
+  /** Whole compressed stream size (SegmentMeta.root_original_size). */
   rootOriginalSize: number
   rootSessionId: { lo: bigint; hi: bigint }
   childSessionId: { lo: bigint; hi: bigint }
-  /** SHA-256 shared by every segment of the complete root file. */
+  /** SHA-256 of the whole decompressed original (shared by every segment). */
   rootSha256: Uint8Array
-  /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
+  /** SHA-256 (raw 32 bytes) of this segment's compressed bytes. */
   rawSha256: Uint8Array
+  /** Whole decompressed original size (file_meta.original_size). */
   originalSize: number
 }
 
@@ -173,9 +176,9 @@ interface PreparedPayload {
   rootSessionId: { lo: bigint; hi: bigint }
   /** Total segment count (1 when non-segmented). */
   segmentCount: number
-  /** Total original (uncompressed) size of the root file. */
+  /** Whole decompressed original size of the root transfer. */
   rootOriginalSize: number
-  /** Currently prepared segment only when segmented; empty otherwise. */
+  /** All segments of the compressed stream (only when segmented). */
   segments: PreparedSegment[]
 }
 
@@ -618,44 +621,18 @@ export default function App() {
       if (!p?.needsSegmentation || state.initializing || state.compressPhase != null) return
       const clamped = Math.max(0, Math.min(p.segmentCount - 1, nextIndex))
       if (clamped === state.activeSegmentIndex) return
-      const worker = workerRef.current
-      const item = state.items.length === 1 ? state.items[0] : null
-      if (!worker || item?.kind !== "file") {
-        setState((s) => ({ ...s, error: "无法读取原文件，请重新选择" }))
+      // All segments are delivered in the worker's `done` message, so the
+      // segment is already present — no worker round-trip needed.
+      const segment = p.segments.find((s) => s.segmentIndex === clamped)
+      if (!segment) {
+        setState((s) => ({ ...s, error: `分段 ${clamped + 1} 尚未准备完成` }))
         return
       }
-      const rootSha256 = p.segments[0]?.rootSha256
-      if (!rootSha256 || rootSha256.length !== 32) {
-        setState((s) => ({ ...s, error: "分段任务缺少完整文件 SHA-256" }))
-        return
-      }
-      // A segment switch is its own worker request. Giving every request a
-      // fresh epoch prevents a slow result for an earlier rapid click from
-      // resolving the promise that belongs to the latest requested segment.
-      epoch.current += 1
-      const requestEpoch = epoch.current
-      cancelSegmentRequest("已由新的分段请求替代")
-      issuedEpoch.current = requestEpoch
-      setState((s) => ({ ...s, initializing: true, compressPhase: "reading", error: null }))
+      setState((s) => ({ ...s, initializing: true, error: null }))
       try {
-        const segment = await new Promise<PreparedSegment>((resolve, reject) => {
-          segmentRequestRef.current = { resolve, reject }
-          worker.postMessage({
-            type: "prepare-segment",
-            jobId: requestEpoch,
-            file: item.file,
-            segmentIndex: clamped,
-            segmentCount: p.segmentCount,
-            rootSessionId: {
-              lo: p.rootSessionId.lo.toString(),
-              hi: p.rootSessionId.hi.toString(),
-            },
-            rootSha256: rootSha256.slice().buffer,
-          })
-        })
-        if (!mountedRef.current || epoch.current !== requestEpoch) return
         await ensureWasm()
-        const nextPrepared = { ...p, segments: [segment] }
+        if (!mountedRef.current) return
+        const nextPrepared = { ...p }
         const session = buildSegmentSession(nextPrepared, segment, state.config)
         releaseOwnedSession()
         ownedSessionRef.current = session
@@ -665,16 +642,13 @@ export default function App() {
           session,
           activeSegmentIndex: clamped,
           initializing: false,
-          compressPhase: null,
           error: null,
         }))
       } catch (e: unknown) {
-        if (!mountedRef.current || epoch.current !== requestEpoch) return
         console.error("Segment session creation failed:", e)
         setState((s) => ({
           ...s,
           initializing: false,
-          compressPhase: null,
           error: `切换分段失败: ${e instanceof Error ? e.message : String(e)}`
         }))
       }
@@ -683,7 +657,6 @@ export default function App() {
       state.prepared,
       state.activeSegmentIndex,
       state.config,
-      state.items,
       state.initializing,
       state.compressPhase,
       releaseOwnedSession,

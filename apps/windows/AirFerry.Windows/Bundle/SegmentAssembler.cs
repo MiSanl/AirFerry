@@ -2,24 +2,40 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using AirFerry.Windows.Native;
+using AirFerry.Windows.Scan;
 
 namespace AirFerry.Windows.Bundle;
 
 /// <summary>
 /// Durable, disk-backed assembler for one descriptor-v4 root transfer.
-/// Verified raw segments are written at canonical 8 MiB offsets and the receipt
-/// bitmap is atomically published only after the segment bytes reach disk.
+/// A logical transfer is compressed **once** into a single compressed stream,
+/// then split into fixed <see cref="SegmentRawBytes"/> (~32 MiB) segments. Each
+/// completed segment's **compressed** bytes are written at their canonical
+/// offset within the compressed stream, and the receipt bitmap is atomically
+/// published only after the bytes reach disk. When every segment has arrived,
+/// the concatenated compressed stream is decompressed exactly once to recover
+/// the original payload (which may be a file, a multi-file bundle, or text).
 /// </summary>
 public sealed class SegmentAssembler
 {
-    public const long SegmentRawBytes = 8L * 1024 * 1024;
+    public const long SegmentRawBytes = (32L * 1024 * 1024) - 65_528L;
     public const int MaxSegmentCount = 131_072;
     private const long MinFreeReserveBytes = 64L * 1024 * 1024;
+    private const long MaxDecompressedBytes = 256L * 1024 * 1024;
 
     private readonly ulong _rootLo;
     private readonly ulong _rootHi;
     private readonly int _segmentCount;
-    private readonly long _rootOriginalSize;
+    /// <summary>Whole **compressed** stream size (== sum of every segment's compressed bytes).</summary>
+    private readonly long _compressedSize;
+    /// <summary>Whole **decompressed** original size.</summary>
+    private readonly long _decompressedSize;
+    /// <summary>Compression-algorithm tag of the whole stream (0=None,1=Zstd,2=Xz).</summary>
+    private readonly byte _compression;
+    /// <summary>CRC32 over the whole decompressed original (0 if unknown).</summary>
+    private readonly uint _crc32;
+    private readonly bool _crc32Known;
     private readonly string _rootSha256;
     private readonly string _fileName;
     private readonly string _dir;
@@ -30,7 +46,6 @@ public sealed class SegmentAssembler
 
     private string RootSessionIdHex => $"{_rootHi:x16}{_rootLo:x16}";
     private string PartialPath => Path.Combine(_dir, "transfer.partial");
-    private string CompletePath => Path.Combine(_dir, "transfer.complete");
     private string BitmapPath => Path.Combine(_dir, "bitmap.json");
 
     public static string SegmentAssemblerRoot => Path.Combine(ContentStore.RootDir, "seg");
@@ -50,13 +65,18 @@ public sealed class SegmentAssembler
     }
 
     private SegmentAssembler(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        ulong rootLo, ulong rootHi, int segmentCount, long compressedSize,
+        long decompressedSize, byte compression, uint crc32, bool crc32Known,
         byte[] rootSha256, string fileName)
     {
         _rootLo = rootLo;
         _rootHi = rootHi;
         _segmentCount = segmentCount;
-        _rootOriginalSize = rootOriginalSize;
+        _compressedSize = compressedSize;
+        _decompressedSize = decompressedSize;
+        _compression = compression;
+        _crc32 = crc32;
+        _crc32Known = crc32Known;
         _rootSha256 = Convert.ToHexString(rootSha256).ToLowerInvariant();
         _fileName = fileName;
         _dir = Path.Combine(SegmentAssemblerRoot, RootSessionIdHex);
@@ -66,34 +86,36 @@ public sealed class SegmentAssembler
     }
 
     public static SegmentAssembler Open(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        ulong rootLo, ulong rootHi, int segmentCount, long compressedSize,
+        long decompressedSize, byte compression, uint crc32, bool crc32Known,
         byte[] rootSha256, string fileName)
     {
         if (segmentCount is <= 0 or > MaxSegmentCount)
             throw new InvalidDataException("segment count out of range");
-        if (rootOriginalSize <= 0)
-            throw new InvalidDataException("root size must be positive");
-        long expected = checked((rootOriginalSize - 1) / SegmentRawBytes + 1);
+        if (compressedSize <= 0)
+            throw new InvalidDataException("compressed stream size must be positive");
+        long expected = checked((compressedSize - 1) / SegmentRawBytes + 1);
         if (expected != segmentCount)
-            throw new InvalidDataException("segment count inconsistent with root size");
+            throw new InvalidDataException("segment count inconsistent with compressed stream size");
         if (rootSha256.Length != 32)
             throw new InvalidDataException("root SHA-256 must be 32 bytes");
 
         var asm = new SegmentAssembler(
-            rootLo, rootHi, segmentCount, rootOriginalSize, rootSha256,
+            rootLo, rootHi, segmentCount, compressedSize, decompressedSize,
+            compression, crc32, crc32Known, rootSha256,
             string.IsNullOrWhiteSpace(fileName) ? "received_file" : fileName);
         if (File.Exists(asm.BitmapPath) && IsLegacyLedger(asm.BitmapPath))
         {
-            // v1.1.6 tasks lack a complete-file digest and cannot be resumed
-            // safely. Start them over under the revised descriptor-v4 contract.
+            // Tasks from an older model (per-segment decompressed bytes) are
+            // incompatible with the compressed-stream segment layout. Reset them.
             Directory.Delete(asm._dir, recursive: true);
         }
         if (!File.Exists(asm.BitmapPath))
         {
             long available = AvailableBytes(ContentStore.RootDir);
-            if (available < rootOriginalSize + MinFreeReserveBytes)
+            if (available < compressedSize + MinFreeReserveBytes)
                 throw new IOException(
-                    $"存储空间不足：大文件任务需要约 {rootOriginalSize / 1024 / 1024} MiB 可用空间");
+                    $"存储空间不足：大文件任务需要约 {compressedSize / 1024 / 1024} MiB 可用空间");
         }
         asm.Resume();
         return asm;
@@ -109,7 +131,11 @@ public sealed class SegmentAssembler
             bool same = root.GetProperty("rootLo").GetString() == _rootLo.ToString()
                         && root.GetProperty("rootHi").GetString() == _rootHi.ToString()
                         && root.GetProperty("count").GetInt32() == _segmentCount
-                        && root.GetProperty("rootSize").GetString() == _rootOriginalSize.ToString()
+                        && root.GetProperty("compressedSize").GetString() == _compressedSize.ToString()
+                        && root.GetProperty("decompressedSize").GetString() == _decompressedSize.ToString()
+                        && root.GetProperty("compression").GetInt32() == _compression
+                        && root.GetProperty("crc32").GetString() == _crc32.ToString()
+                        && root.GetProperty("crc32Known").GetBoolean() == _crc32Known
                         && root.GetProperty("rootSha256").GetString() == _rootSha256
                         && root.GetProperty("name").GetString() == _fileName;
             if (!same) throw new InvalidDataException("同一根任务的分段元数据冲突");
@@ -175,7 +201,7 @@ public sealed class SegmentAssembler
             using (var fs = new FileStream(PartialPath, FileMode.OpenOrCreate, FileAccess.Write,
                        FileShare.None, 64 * 1024, FileOptions.WriteThrough))
             {
-                if (fs.Length < _rootOriginalSize) fs.SetLength(_rootOriginalSize);
+                if (fs.Length < _compressedSize) fs.SetLength(_compressedSize);
                 fs.Position = checked((long)index * SegmentRawBytes);
                 fs.Write(bytes);
                 fs.Flush(flushToDisk: true);
@@ -193,8 +219,13 @@ public sealed class SegmentAssembler
     public int ReceivedCount() { lock (this) return _receivedCount; }
     public int SegmentCount() { lock (this) return _segmentCount; }
     public bool IsComplete() { lock (this) return _receivedCount == _segmentCount; }
+    public uint Crc32() { lock (this) return _crc32; }
+    public bool Crc32Known() { lock (this) return _crc32Known; }
+    public string RootSha256Hex { get { lock (this) return _rootSha256; } }
+    public long DecompressedSize() { lock (this) return _decompressedSize; }
+
     public bool Matches(
-        ulong rootLo, ulong rootHi, int segmentCount, long rootOriginalSize,
+        ulong rootLo, ulong rootHi, int segmentCount, long compressedSize,
         byte[] rootSha256, string fileName)
     {
         string normalizedName = string.IsNullOrWhiteSpace(fileName) ? "received_file" : fileName;
@@ -202,7 +233,7 @@ public sealed class SegmentAssembler
         {
             return _rootLo == rootLo && _rootHi == rootHi
                    && _segmentCount == segmentCount
-                   && _rootOriginalSize == rootOriginalSize
+                   && _compressedSize == compressedSize
                    && rootSha256.Length == 32
                    && string.Equals(
                        _rootSha256,
@@ -217,29 +248,41 @@ public sealed class SegmentAssembler
     }
 
     /// <summary>
-    /// Promote the complete partial to a task-owned complete file. The bitmap is
-    /// deliberately retained until <see cref="CommitArchived"/>.
+    /// Finish the transfer: stream the concatenated compressed stream (already
+    /// in <c>transfer.partial</c>) to <c>transfer.decompressed</c>, decompressing
+    /// **once** via native Rust while computing CRC32 + SHA-256 incrementally.
+    /// The native call verifies the decompressed size, CRC32 (when known) and
+    /// root SHA-256 (over the decompressed bytes) before returning success, and
+    /// removes the partial output on any mismatch — so neither the compressed
+    /// stream nor the original is ever held wholly in memory (very large files
+    /// are recoverable). Returns the decompressed file path, or null if
+    /// segments are still missing or verification failed.
     /// </summary>
     public string? Finish()
     {
         lock (this)
         {
             if (!IsComplete()) return null;
-            if (File.Exists(CompletePath))
+            if (!File.Exists(PartialPath)) return null;
+            if (new FileInfo(PartialPath).Length != _compressedSize) return null;
+
+            string outPath = Path.Combine(_dir, "transfer.decompressed");
+            if (File.Exists(outPath)) File.Delete(outPath);
+            int ok = NativeBridge.DecompressStreamToFile(
+                PartialPath,
+                outPath,
+                _compression,
+                (ulong)_decompressedSize, // hard output cap (decompression-bomb guard)
+                (ulong)_decompressedSize, // expected decompressed size
+                _crc32,
+                _crc32Known,
+                _rootSha256);
+            if (ok != 1)
             {
-                if (new FileInfo(CompletePath).Length != _rootOriginalSize ||
-                    !string.Equals(Sha256HexFile(CompletePath), _rootSha256,
-                        StringComparison.Ordinal))
-                    throw new InvalidDataException("整文件 SHA-256 校验失败");
-                return CompletePath;
+                if (File.Exists(outPath)) File.Delete(outPath);
+                return null;
             }
-            if (!File.Exists(PartialPath)) return CompletePath;
-            if (new FileInfo(PartialPath).Length != _rootOriginalSize) return null;
-            if (!string.Equals(Sha256HexFile(PartialPath), _rootSha256,
-                    StringComparison.Ordinal))
-                throw new InvalidDataException("整文件 SHA-256 校验失败");
-            File.Move(PartialPath, CompletePath, overwrite: false);
-            return CompletePath;
+            return outPath;
         }
     }
 
@@ -265,7 +308,7 @@ public sealed class SegmentAssembler
                 using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(bitmap));
                 JsonElement root = doc.RootElement;
                 int count = root.GetProperty("count").GetInt32();
-                long size = long.Parse(root.GetProperty("rootSize").GetString()!);
+                long size = long.Parse(root.GetProperty("compressedSize").GetString()!);
                 if (count is <= 0 or > MaxSegmentCount || size <= 0) continue;
                 string rootSha256 = root.GetProperty("rootSha256").GetString() ?? "";
                 if (rootSha256.Length != 64 || rootSha256.Any(c => !Uri.IsHexDigit(c)))
@@ -274,13 +317,16 @@ public sealed class SegmentAssembler
                 var receivedIndices = new List<int>();
                 for (int i = 0; i < count && i < recv.GetArrayLength(); i++)
                     if (recv[i].GetBoolean()) receivedIndices.Add(i);
+                long displaySize = root.TryGetProperty("decompressedSize", out JsonElement ds)
+                    ? long.Parse(ds.GetString()!)
+                    : size;
                 result.Add(new TaskInfo(
                     ulong.Parse(root.GetProperty("rootLo").GetString()!),
                     ulong.Parse(root.GetProperty("rootHi").GetString()!),
                     root.TryGetProperty("name", out JsonElement name)
                         ? name.GetString() ?? "received_file"
                         : "received_file",
-                    size,
+                    displaySize,
                     rootSha256,
                     count,
                     receivedIndices.Count,
@@ -312,7 +358,11 @@ public sealed class SegmentAssembler
             rootLo = _rootLo.ToString(),
             rootHi = _rootHi.ToString(),
             count = _segmentCount,
-            rootSize = _rootOriginalSize.ToString(),
+            compressedSize = _compressedSize.ToString(),
+            decompressedSize = _decompressedSize.ToString(),
+            compression = (int)_compression,
+            crc32 = _crc32.ToString(),
+            crc32Known = _crc32Known,
             rootSha256 = _rootSha256,
             name = _fileName,
             updatedAt = _updatedAt,
@@ -340,18 +390,17 @@ public sealed class SegmentAssembler
 
     private long CanonicalLength(int index)
     {
-        long remaining = _rootOriginalSize - checked((long)index * SegmentRawBytes);
+        long remaining = _compressedSize - checked((long)index * SegmentRawBytes);
         return Math.Min(SegmentRawBytes, remaining);
     }
 
     private bool VerifyPersistedSegment(int index, string expectedHash)
     {
-        string source = File.Exists(PartialPath) ? PartialPath : CompletePath;
-        if (!File.Exists(source) || new FileInfo(source).Length != _rootOriginalSize) return false;
+        if (!File.Exists(PartialPath) || new FileInfo(PartialPath).Length != _compressedSize) return false;
         try
         {
             using var incremental = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            using var fs = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             fs.Position = checked((long)index * SegmentRawBytes);
             long left = CanonicalLength(index);
             byte[] buffer = new byte[64 * 1024];
@@ -370,8 +419,6 @@ public sealed class SegmentAssembler
             return false;
         }
     }
-
-    public string RootSha256Hex => _rootSha256;
 
     private static string Sha256HexFile(string path)
     {
@@ -393,9 +440,8 @@ public sealed class SegmentAssembler
         try
         {
             using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(bitmapPath));
-            return !doc.RootElement.TryGetProperty("rootSha256", out JsonElement hash)
-                   || hash.ValueKind != JsonValueKind.String
-                   || hash.GetString() is not { Length: 64 };
+            return !doc.RootElement.TryGetProperty("compressedSize", out JsonElement cs)
+                   || cs.ValueKind != JsonValueKind.String;
         }
         catch
         {

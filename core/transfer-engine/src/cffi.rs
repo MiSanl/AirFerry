@@ -31,6 +31,7 @@ use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
 use qr_protocol::frame::SessionIdRaw;
+use std::os::raw::c_char;
 
 // Per-frame status packing + the error sentinel now live in the shared
 // [`ingest_status`] module so the JNI, C ABI, and WASM bindings cannot drift
@@ -211,6 +212,215 @@ pub unsafe extern "C" fn airferry_buffer_free(ptr: *mut u8, len: usize) {
         let slice = std::slice::from_raw_parts_mut(ptr, len);
         let _ = Box::from_raw(slice as *mut [u8]);
     }
+}
+
+/// Reassemble this segment's transmitted bytes **as received** (trimmed to its
+/// `compressed_size`), **without** decompression. For descriptor-v4
+/// compressed-stream segmentation, Kotlin/C# stores these compressed bytes and
+/// concatenates + decompresses once after every segment arrives.
+///
+/// The returned buffer is freed with [`airferry_buffer_free`].
+///
+/// # Safety
+/// Identical contract to [`airferry_receiver_assemble`].
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_assemble_raw(
+    handle: *mut ReceiverSession,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return 0;
+    }
+    unsafe {
+        *out_buf = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &mut *handle };
+    let Some(mut data) = session.assemble_raw() else {
+        return 0;
+    };
+    let fm = session.file_meta();
+    if fm.compressed_size_known {
+        if let Ok(len) = usize::try_from(fm.compressed_size) {
+            if len <= data.len() {
+                data.truncate(len);
+            }
+        }
+    }
+    let len = data.len();
+    let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
+    unsafe {
+        *out_buf = ptr;
+        *out_len = len;
+    }
+    1
+}
+
+/// Compression-algorithm tag of the confirmed descriptor (0=None,1=Zstd,2=Xz).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_compression(handle: *const ReceiverSession) -> u8 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.file_meta().compression
+}
+
+/// Transmitted (compressed) payload length of this object.
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_compressed_size(handle: *const ReceiverSession) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.file_meta().compressed_size
+}
+
+/// Whole decompressed original size (same across every segment of a root).
+///
+/// # Safety
+/// A non-null handle must refer to a live receiver and be externally serialized.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_receiver_original_size(handle: *const ReceiverSession) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let session = unsafe { &*handle };
+    session.file_meta().original_size
+}
+
+/// Decompress a caller-provided byte buffer according to a compression tag
+/// (0=None, 1=Zstd, 2=Xz), bounded by `max_output` bytes. Used by the host to
+/// decompress the concatenated compressed stream of a segmented transfer once.
+///
+/// Returns 1 on success (with a Rust-allocated buffer + length to free via
+/// [`airferry_buffer_free`]) or 0 on failure / empty output.
+///
+/// # Safety
+/// `data`/`data_len` must describe a valid, readable byte slice for the call
+/// duration; `out_buf`/`out_len` must be writable out-params.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_decompress_bytes(
+    data: *const u8,
+    data_len: usize,
+    compression: u8,
+    max_output: u64,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return 0;
+    }
+    unsafe {
+        *out_buf = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if data.is_null() || data_len == 0 {
+        return 0;
+    }
+    let input = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let out =
+        match qr_protocol::compress::decompress_with_limit(input, compression, max_output as usize)
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                cffi_log(&format!("decompress_bytes failed: {e}"));
+                return 0;
+            }
+        };
+    if out.is_empty() {
+        return 0;
+    }
+    let len = out.len();
+    let ptr = Box::into_raw(out.into_boxed_slice()) as *mut u8;
+    unsafe {
+        *out_buf = ptr;
+        *out_len = len;
+    }
+    1
+}
+
+/// Stream a concatenated compressed stream from `input_path` to `output_path`,
+/// decompressing as it goes while computing CRC32 + SHA-256 incrementally
+/// (bounded RAM for very large files). Verifies decompressed size, CRC32 (when
+/// known) and SHA-256 before returning 1; any mismatch or I/O error removes the
+/// partial output and returns 0.
+///
+/// `max_output` caps the decompressed size (decompression-bomb guard).
+///
+/// # Safety
+/// `input_path`/`output_path`/`expected_sha_hex` must be valid NUL-terminated
+/// C strings for the call duration.
+#[no_mangle]
+pub unsafe extern "C" fn airferry_decompress_stream_to_file(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    compression: u8,
+    max_output: u64,
+    expected_size: u64,
+    expected_crc: u32,
+    crc_known: bool,
+    expected_sha_hex: *const c_char,
+) -> i32 {
+    fn cstr(ptr: *const c_char) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees NUL-terminated C strings.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes();
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+    let (Some(input), Some(output), Some(expected_sha)) =
+        (cstr(input_path), cstr(output_path), cstr(expected_sha_hex))
+    else {
+        cffi_log("decompress_stream_to_file: missing argument");
+        return 0;
+    };
+    let outcome = match qr_protocol::compress::decompress_stream_to_file(
+        &input,
+        &output,
+        compression,
+        max_output,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            cffi_log(&format!("decompress_stream_to_file failed: {e}"));
+            return 0;
+        }
+    };
+    if outcome.output_size != expected_size {
+        cffi_log(&format!(
+            "decompress_stream_to_file size mismatch: {} != {}",
+            outcome.output_size, expected_size
+        ));
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    if crc_known && outcome.crc32 != expected_crc {
+        cffi_log(&format!(
+            "decompress_stream_to_file crc mismatch: {:08x} != {:08x}",
+            outcome.crc32, expected_crc
+        ));
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    let actual_sha: String = outcome.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    if !actual_sha.eq_ignore_ascii_case(&expected_sha) {
+        cffi_log("decompress_stream_to_file sha mismatch");
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    1
 }
 
 /// Write the NUL-terminated progress JSON into the caller-owned `out` buffer.

@@ -59,11 +59,29 @@ export function QrStream({
   onStatsRef.current = onStats
   onErrorRef.current = onError
 
+  // A rAF callback is scheduled inside the effect's `loop` closure which binds
+  // the `session` captured at render time. When the parent swaps the session
+  // (e.g. a descriptor-v4 segment switch calls `releaseOwnedSession()` which
+  // frees the old `SenderSessionWasm`), a still-queued rAF tick can run against
+  // the *freed* session and wasm-bindgen then throws "null pointer passed to
+  // rust" (use-after-free). `activeSessionRef` always holds the newest prop so
+  // a stale loop can detect the swap and stop instead of touching freed WASM.
+  const activeSessionRef = useRef(session)
+  activeSessionRef.current = session
+
   const render = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext("2d", { alpha: false })
     if (!ctx) return
+
+    // This closure may be invoked by a rAF tick from a PREVIOUS `session`. The
+    // parent has already `free()`d that session (segmented switch / reset), so
+    // calling any method on it would dereference a null wasm pointer. Bail out
+    // and let the owning effect's cleanup stop the loop — we must NOT touch the
+    // shared `rafRef` here, because by the time a stale tick runs it may already
+    // point at the NEW loop's frame id.
+    if (activeSessionRef.current !== session) return
 
     const wantMulti = multiQr >= 2
 

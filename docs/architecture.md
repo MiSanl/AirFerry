@@ -75,7 +75,7 @@ core/
   ├─ 恰好 1 条文字、0 文件 → ETTEXTv1（processText）
   ├─ 否则文字物化为命名 .txt + 文件 → ≥2 则 ETBUNDL1
   ├─ 三算法选优压缩 (Raw / Zstd Lv1 / Xz Lv9)，70% early-exit
-  ├─ 单文件 >32 MiB → 8 MiB 原始段按需压缩；可直接跳到指定段
+  ├─ 整段压缩一次；压缩流 > ~32 MiB → 按 ~32 MiB 切压缩流段（文件/包/文字均可）
   ├─ 零填充到 symbol_size 整数倍
   ├─ RaptorQ 编码（RFC 6330 自动分源块）
   └─ 源符号一遍 → 持续新鲜修复符号；每 16 帧插描述符（首帧即描述符）
@@ -94,7 +94,7 @@ core/
   ├─ Windows 同一采集句柄节流 BGR24 快照 → WPF 预览（UI 不读设备）
   ├─ 串行 ingest（锁）：帧校验 → 去重 → RaptorQ
   └─ assemble + 解压后分流：
-       ⓪ descriptor-v4 → 逐段 CRC/SHA 校验 + 磁盘/IndexedDB 账本
+       ⓪ descriptor-v4 → 逐段 SHA 校验 + 磁盘/IndexedDB 账本；原生端流式解压写盘（bounded RAM）
        ① ETTEXTv1 → ReceiveText（复制/分享/存盘）
        ② ETBUNDL1 → 拆包；文本类扩展名可点进 ReceiveText
        ③ 单文件 + TextLike 扩展名 + 严格 UTF-8 → ReceiveText
@@ -111,14 +111,14 @@ core/
 | 帧乱序 | 符号按 (sbn, esi) 索引 |
 | 帧重复 | per-block ESI 集合去重 |
 | 帧损坏 | 双层 CRC32 丢弃 |
-| 大文件接收端重启 | 已验证完成段持久化；当前未完成的 8 MiB 段重扫 |
+| 大文件接收端重启 | 已验证完成压缩段持久化；当前未完成的 ~32 MiB 段重扫 |
 | 不同文件修订版分段混入 | 每段冻结 `root_sha256`；最终发布前流式重算完整根摘要 |
 | 存储空间不足 | 新建根任务和逐段写入前预检，并保留 64 MiB 安全余量 |
 | 成品归档中途崩溃 | 同卷原子移动 + 预期根摘要恢复；根任务派生稳定历史 ID，重试不生成重复记录 |
 | 晚加入 | 描述符帧定期广播 OTI |
 | 恶意/越界描述符 | `ObjectMeta::validate` |
 | 越界符号坐标 | 拒绝 ESI ≥ 2²⁴ 或载荷长度 ≠ symbol_size |
-| 解压炸弹 | 按 `original_size` 封顶 |
+| 解压炸弹 | 原生端流式解压按 `original_size` 封顶；网页端按浏览器接收上限封顶 |
 
 ## 关键参数
 

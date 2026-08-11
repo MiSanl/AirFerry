@@ -95,10 +95,10 @@ pub struct DescriptorInfo {
 ///   u128 root_session_id
 ///   u32  segment_index
 ///   u32  segment_count
-///   u64  original_offset
-///   u64  root_original_size
-///   u8[32] root_sha256       (complete uncompressed root file)
-///   u8[32] raw_sha256        (uncompressed segment bytes)
+///   u64  original_offset      (offset in the compressed stream)
+///   u64  root_original_size   (whole compressed stream size)
+///   u8[32] root_sha256       (whole decompressed original)
+///   u8[32] raw_sha256        (this segment's compressed bytes)
 ///
 /// Total v1 part = 28 + 16*B. v2 extension = 1 + filename_len + 8 + 4.
 /// v3 extension = 1 + 8 = 9.

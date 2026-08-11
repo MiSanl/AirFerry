@@ -119,6 +119,66 @@ internal static class NativeBridge
     public static extern void BufferFree(IntPtr ptr, nuint len);
 
     /// <summary>
+    /// Reassemble this segment's transmitted (compressed) bytes as received,
+    /// **without** decompression. Free with <see cref="BufferFree"/>.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_assemble_raw")]
+    public static extern int ReceiverAssembleRaw(IntPtr handle, out IntPtr outBuf, out nuint outLen);
+
+    /// <summary>Compression-algorithm tag of the confirmed descriptor (0=None,1=Zstd,2=Xz).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_compression")]
+    public static extern byte ReceiverCompression(IntPtr handle);
+
+    /// <summary>This object's transmitted (compressed) payload length.</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_compressed_size")]
+    public static extern ulong ReceiverCompressedSize(IntPtr handle);
+
+    /// <summary>Whole decompressed original size (same across segments of a root).</summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_receiver_original_size")]
+    public static extern ulong ReceiverOriginalSize(IntPtr handle);
+
+    /// <summary>
+    /// Decompress a byte buffer by tag (0=None,1=Zstd,2=Xz), bounded by
+    /// <paramref name="maxOutput"/> bytes. Returns 1 on success (buffer freed
+    /// with <see cref="BufferFree"/>), 0 on failure.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_decompress_bytes")]
+    public static extern int DecompressBytes(
+        byte[] data,
+        nuint dataLen,
+        byte compression,
+        ulong maxOutput,
+        out IntPtr outBuf,
+        out nuint outLen);
+
+    /// <summary>
+    /// Stream-decompress the concatenated compressed stream at
+    /// <paramref name="inputPath"/> to <paramref name="outputPath"/> (zstd/xz
+    /// streaming decoder) while computing CRC32 + SHA-256 incrementally —
+    /// neither input nor output is held wholly in memory, so very large files
+    /// are recoverable in bounded RAM. Returns 1 only when the decompressed
+    /// size, CRC32 (when <paramref name="crcKnown"/>) and SHA-256
+    /// (<paramref name="expectedShaHex"/>, lowercase hex) all match; on any
+    /// failure the partial output file is removed.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "airferry_decompress_stream_to_file")]
+    public static extern int DecompressStreamToFile(
+        [MarshalAs(UnmanagedType.LPStr)] string inputPath,
+        [MarshalAs(UnmanagedType.LPStr)] string outputPath,
+        byte compression,
+        ulong maxOutput,
+        ulong expectedSize,
+        uint expectedCrc,
+        [MarshalAs(UnmanagedType.I1)] bool crcKnown,
+        [MarshalAs(UnmanagedType.LPStr)] string expectedShaHex);
+
+    /// <summary>
     /// Write the NUL-terminated progress JSON into <paramref name="outBuf"/>.
     /// Two-pass protocol: pass a 0-capacity (or too-small) buffer to learn the
     /// required length (incl. NUL), then call again with a buffer of that size.

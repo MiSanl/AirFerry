@@ -64,7 +64,7 @@ export function ParamsPage({
   initializing
 }: Props) {
   const isSegmented = segmentCount > 1
-  const ratioBase = isSegmented ? Math.min(originalSize, 8 * 1024 * 1024) : originalSize
+  const ratioBase = originalSize
   const ratio = ratioBase > 0 ? compressedSize / ratioBase : 1
 
   // Pre-transfer ETA estimate (before encoder init).
@@ -112,13 +112,13 @@ export function ParamsPage({
             <td>{formatBytes(originalSize)}</td>
           </tr>
           <tr>
-            <td>{isSegmented ? "首段压缩后" : "压缩后"}</td>
+            <td>压缩后</td>
             <td>{formatBytes(compressedSize)} ({(ratio * 100).toFixed(0)}%)</td>
           </tr>
           {isSegmented && (
             <tr>
               <td>分段</td>
-              <td>{segmentCount} 段 × 8 MiB（每段独立传输，接收端自动合并）</td>
+              <td>{segmentCount} 段 × ~32 MiB（压缩流切段，接收端自动合并）</td>
             </tr>
           )}
           <tr>

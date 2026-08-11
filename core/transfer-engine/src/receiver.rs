@@ -216,9 +216,18 @@ impl ReceiverSession {
                         .validate(frame.header.session_id, &info.file_meta)
                         .is_err()
                 });
+                // The decompression-bomb bound (`MAX_ORIGINAL_BYTES`) applies
+                // only to single-object transfers, where the host decompresses
+                // the whole original in memory. For descriptor-v4 segmented
+                // transfers `file_meta.original_size` is the whole-file
+                // decompressed size (shared across segments), which can exceed
+                // 256 MiB by design; the host instead streams the concatenated
+                // compressed stream to disk with its own expected-size cap, so
+                // decompression stays memory-bounded regardless of file size.
                 let file_meta_invalid =
                     !qr_protocol::compress::is_known_compression_tag(info.file_meta.compression)
-                        || info.file_meta.original_size > MAX_ORIGINAL_BYTES
+                        || (info.segment.is_none()
+                            && info.file_meta.original_size > MAX_ORIGINAL_BYTES)
                         || (info.file_meta.compressed_size_known
                             && info.file_meta.compressed_size > info.meta.transfer_length);
                 if info.meta.validate().is_err()

@@ -29,9 +29,11 @@
  *   { jobId: number, text: string, name?: string }
  *       — pure text item. Wrapped in ETTEXTv1; optional `name` becomes the
  *         descriptor filename (default "文字消息.txt", normalized to *.txt).
- *   { type: "prepare-segment", jobId, file, segmentIndex,
- *     rootSessionId, segmentCount }
- *       — prepare exactly one later large-file segment on demand.
+ *
+ * A logical transfer (file, bundle, or text) is compressed **once**; if the
+ * compressed stream fits a single RaptorQ object it is sent directly, otherwise
+ * the compressed stream is split into `SEGMENT_RAW_BYTES` segments and all
+ * segments are delivered in the `done` message (each transferable).
  *
  * `jobId` is the main-thread compress epoch. Stale jobs are ignored so list
  * edits / "back to select" do not apply late results (CPU may still finish the
@@ -61,13 +63,12 @@ import { contentFingerprint, deriveSessionId } from "@/wasm/session"
 import {
   deriveSegmentId,
   segmentCountFor,
-  SEGMENT_RAW_BYTES,
+  segmentOffset,
   sliceSegment
 } from "@/wasm/segment"
-import { buildBundle, MAX_TRANSFER_BYTES, MAX_TRANSFER_MIB } from "@/wasm/bundle"
+import { buildBundle } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
-import { ensureWasm, Sha256Wasm } from "@/wasm/loader"
 
 /** Decimal-string form of the 128-bit session id, clone-safe across threads. */
 export interface SessionIdDto {
@@ -94,35 +95,41 @@ export interface CompressResult {
   sessionId: SessionIdDto
   displayName: string
   /**
-   * Large-transfer segment list. The initial `done` contains segment zero
-   * only; later segments arrive via `segment-done`, keeping memory bounded.
+   * Large-transfer segment list (only when `needsSegmentation`). Every segment
+   * of the compressed stream is delivered in this `done` message, each backed
+   * by its own transferable buffer.
    */
   rootSessionId: SessionIdDto
   segmentCount: number
+  /** Whole decompressed size of the root transfer. */
   rootOriginalSize: number
   rootDisplayName: string
   segments: SegmentSpec[]
 }
 
-/** One descriptor-v4 large-transfer segment produced by the worker. */
+/** One descriptor-v4 segment of the compressed root stream. */
 export interface SegmentSpec {
-  /** Compressed payload for this segment (transferable). */
+  /** This segment's slice of the compressed stream (transferable). */
   compressed: ArrayBuffer
+  /** Compression algorithm of the whole stream (shared by every segment). */
   algorithm: number
-  /** Raw (uncompressed) length of this segment (≤ 8 MiB). */
+  /** Whole decompressed size of the root transfer (`file_meta.original_size`). */
   originalSize: number
+  /** This segment's compressed byte count (`file_meta.compressed_size`). */
   compressedSize: number
-  /** CRC32 over this segment's raw bytes. */
+  /** CRC32 over the whole pre-compression payload (`file_meta.crc32`). */
   preCrc32: number
   segmentIndex: number
   segmentCount: number
+  /** Offset of this segment within the compressed stream. */
   originalOffset: number
+  /** Whole compressed stream size (`SegmentMeta.root_original_size`). */
   rootOriginalSize: number
   rootSessionId: SessionIdDto
   childSessionId: SessionIdDto
-  /** SHA-256 (raw 32 bytes) of this segment's uncompressed bytes. */
+  /** SHA-256 (raw 32 bytes) of this segment's compressed bytes. */
   rawSha256: ArrayBuffer
-  /** SHA-256 of the complete uncompressed root file. */
+  /** SHA-256 of the complete decompressed root payload. */
   rootSha256: ArrayBuffer
   displayName: string
 }
@@ -133,21 +140,11 @@ export type CompressPhase = "reading" | "bundling" | "zstd" | "xz" | "finalizing
 export type WorkerMessage =
   | { phase: CompressPhase; jobId?: number }
   | CompressResult
-  | { phase: "segment-done"; jobId: number; segment: SegmentSpec }
   | { phase: "error"; message: string; jobId?: number }
 
 type PendingJob =
   | { kind: "files"; jobId: number; files: File[] }
   | { kind: "text"; jobId: number; text: string; name?: string }
-  | {
-      kind: "segment"
-      jobId: number
-      file: File
-      segmentIndex: number
-      rootSessionId: SessionIdDto
-      segmentCount: number
-      rootSha256: ArrayBuffer
-    }
 
 /** Latest pending request while the worker is still waiting for first init. */
 let pendingJob: PendingJob | null = null
@@ -168,15 +165,6 @@ self.onmessage = async (
     | { jobId?: number; files: File[] }
     | { jobId?: number; text: string; name?: string }
     | { type: "wasm-init"; zstd?: ArrayBuffer | null }
-    | {
-        type: "prepare-segment"
-        jobId: number
-        file: File
-        segmentIndex: number
-        rootSessionId: SessionIdDto
-        segmentCount: number
-        rootSha256: ArrayBuffer
-      }
   >
 ) => {
   const data = e.data
@@ -203,19 +191,6 @@ self.onmessage = async (
     typeof (data as { jobId?: number }).jobId === "number"
       ? (data as { jobId: number }).jobId
       : 0
-
-  if ("type" in data && data.type === "prepare-segment") {
-    enqueueOrRun({
-      kind: "segment",
-      jobId,
-      file: data.file,
-      segmentIndex: data.segmentIndex,
-      rootSessionId: data.rootSessionId,
-      segmentCount: data.segmentCount,
-      rootSha256: data.rootSha256,
-    })
-    return
-  }
 
   if ("text" in data && typeof (data as { text?: unknown }).text === "string") {
     const text = (data as { text: string; name?: string }).text
@@ -268,10 +243,8 @@ async function runJob(job: PendingJob): Promise<void> {
   try {
     if (job.kind === "files") {
       await processFiles(job.files, job.jobId)
-    } else if (job.kind === "text") {
-      await processText(job.text, job.name, job.jobId)
     } else {
-      await processRequestedSegment(job)
+      await processText(job.text, job.name, job.jobId)
     }
   } finally {
     busy = false
@@ -317,14 +290,6 @@ async function processFiles(files: File[], jobId: number) {
       sessionId = deriveSessionId(namesJoined, BigInt(raw.length), BigInt(mtimeMax), fp)
     } else {
       const f = files[0]
-      // Large file (> 32 MiB raw): cannot fit a single RaptorQ object, so split
-      // it into 8 MiB raw segments and compress each independently. The whole
-      // file is never materialised in one buffer — each segment is streamed via
-      // File.slice.
-      if (f.size > MAX_TRANSFER_BYTES) {
-        await processSegmentedFile(f, jobId)
-        return
-      }
       raw = new Uint8Array(await f.arrayBuffer())
       if (!isCurrent(jobId)) return
       displayName = f.name
@@ -371,210 +336,42 @@ async function processText(text: string, name: string | undefined, jobId: number
 }
 
 /**
- * Large-transfer segmentation for a single file whose raw size exceeds the
- * 32 MiB wire ceiling.
+ * SHA-256 (raw 32 bytes) of `bytes` via WebCrypto.
  *
- * The file is split into fixed `SEGMENT_RAW_BYTES` (8 MiB) raw segments; each
- * segment is independently compressed (zstd/xz via `preparePayload`), CRC32'd,
- * SHA-256'd, and wrapped in a descriptor-v4 `SegmentMeta`. Segment zero is
- * returned initially; the main thread requests later segments on demand.
- *
- * Memory is bounded to ~2× one segment (slice + its compressed output), never
- * the whole file.
+ * Avoids copying the whole input when it is already a whole-buffer view (the
+ * common case for a single file read via `arrayBuffer()`): `subtle.digest`
+ * reads `byteLength` bytes starting at `byteOffset`, so a zero-offset,
+ * full-length view can be hashed in place. Only a partial/subarray view falls
+ * back to `.slice()` (those are per-segment, ≤ SEGMENT_RAW_BYTES, so cheap).
  */
-async function processSegmentedFile(file: File, jobId: number) {
-  if (!isCurrent(jobId)) return
-  post({ phase: "reading", jobId })
-  const count = segmentCountFor(file.size)
-  const rootOriginalSize = file.size
-  const displayName = file.name
-
-  // Root session id: derive from the whole-file identity so every child segment
-  // carries the same root (the receiver keys its assembler on it).
-  const rootSha256 = await sha256File(file, jobId)
-  if (!isCurrent(jobId)) return
-  const rootSessionId = deriveSessionId(
-    file.name,
-    BigInt(file.size),
-    BigInt(file.lastModified),
-    rootSha256
-  )
-
-  // Prepare only the first child. Later children are recompressed on demand,
-  // so neither the worker nor React retains a root-sized list of buffers.
-  const first = await prepareSegmentSpec(
-    file,
-    rootSessionId,
-    rootSha256,
-    0,
-    count,
-    jobId
-  )
-  if (!first || !isCurrent(jobId)) return
-
-  const result: CompressResult = {
-    phase: "done",
-    jobId,
-    needsSegmentation: true,
-    compressed: new ArrayBuffer(0),
-    algorithm: 0,
-    originalSize: 0,
-    compressedSize: 0,
-    preCrc32: 0,
-    sessionId: {
-      lo: rootSessionId.lo.toString(),
-      hi: rootSessionId.hi.toString(),
-    },
-    displayName,
-    rootSessionId: {
-      lo: rootSessionId.lo.toString(),
-      hi: rootSessionId.hi.toString(),
-    },
-    segmentCount: count,
-    rootOriginalSize,
-    rootDisplayName: displayName,
-    segments: [first],
-  }
-  ;(self as unknown as Worker).postMessage(result, [first.compressed])
-}
-
-async function processRequestedSegment(
-  job: Extract<PendingJob, { kind: "segment" }>
-): Promise<void> {
-  try {
-    if (segmentCountFor(job.file.size) !== job.segmentCount) {
-      throw new Error("文件大小已变化，分段数量不再一致")
-    }
-    const rootSha256 = new Uint8Array(job.rootSha256)
-    if (rootSha256.length !== 32) {
-      throw new Error("分段任务缺少完整文件 SHA-256")
-    }
-    const root = deriveSessionId(
-      job.file.name,
-      BigInt(job.file.size),
-      BigInt(job.file.lastModified),
-      rootSha256
-    )
-    if (
-      root.lo.toString() !== job.rootSessionId.lo ||
-      root.hi.toString() !== job.rootSessionId.hi
-    ) {
-      throw new Error("所选文件已变化，无法继续原分段任务")
-    }
-    const segment = await prepareSegmentSpec(
-      job.file,
-      root,
-      rootSha256,
-      job.segmentIndex,
-      job.segmentCount,
-      job.jobId
-    )
-    if (!segment || !isCurrent(job.jobId)) return
-    const message: WorkerMessage = {
-      phase: "segment-done",
-      jobId: job.jobId,
-      segment,
-    }
-    ;(self as unknown as Worker).postMessage(message, [segment.compressed])
-  } catch (err) {
-    if (!isCurrent(job.jobId)) return
-    post({
-      phase: "error",
-      message: err instanceof Error ? err.message : String(err),
-      jobId: job.jobId,
-    })
-  }
-}
-
-/** Prepare exactly one segment; peak memory is bounded to that segment. */
-async function prepareSegmentSpec(
-  file: File,
-  rootSessionId: { lo: bigint; hi: bigint },
-  rootSha256: Uint8Array,
-  segmentIndex: number,
-  segmentCount: number,
-  jobId: number
-): Promise<SegmentSpec | null> {
-  if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= segmentCount) {
-    throw new Error(`segment ${segmentIndex} out of range`)
-  }
-  post({ phase: "reading", jobId })
-  const raw = await sliceSegment(file, segmentIndex)
-  if (!isCurrent(jobId)) return null
-  const childSessionId = deriveSegmentId(rootSessionId, segmentIndex)
-  const { payload: compressed, algorithm, compressedSize } = await preparePayload(
-    raw,
-    (phase) => {
-      if (isCurrent(jobId)) post({ phase, jobId })
-    }
-  )
-  if (!isCurrent(jobId)) return null
-  post({ phase: "finalizing", jobId })
-  const preCrc32 = crc32(raw)
-  const rawSha256 = await sha256Bytes(raw)
-  if (!isCurrent(jobId)) return null
-  const ownsBuffer =
-    compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
-  const outBuf = (ownsBuffer ? compressed.buffer : compressed.slice().buffer) as ArrayBuffer
-  return {
-    compressed: outBuf,
-    algorithm,
-    originalSize: raw.length,
-    compressedSize,
-    preCrc32,
-    segmentIndex,
-    segmentCount,
-    originalOffset: segmentIndex * SEGMENT_RAW_BYTES,
-    rootOriginalSize: file.size,
-    rootSessionId: {
-      lo: rootSessionId.lo.toString(),
-      hi: rootSessionId.hi.toString(),
-    },
-    rootSha256: rootSha256.slice().buffer as ArrayBuffer,
-    childSessionId: {
-      lo: childSessionId.lo.toString(),
-      hi: childSessionId.hi.toString(),
-    },
-    rawSha256,
-    displayName: file.name,
-  }
-}
-
-/** SHA-256 (raw 32 bytes) of `bytes` via WebCrypto. */
 async function sha256Bytes(bytes: Uint8Array): Promise<ArrayBuffer> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    bytes.slice().buffer as ArrayBuffer
-  )
-  return digest
+  const ownsWholeBuffer =
+    bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+  const source = ownsWholeBuffer
+    ? (bytes.buffer as ArrayBuffer)
+    : (bytes.slice().buffer as ArrayBuffer)
+  return crypto.subtle.digest("SHA-256", source)
 }
 
-/** Stream a complete file through Rust's incremental SHA-256 implementation. */
-async function sha256File(file: File, jobId: number): Promise<Uint8Array> {
-  await ensureWasm()
-  const hasher = new Sha256Wasm()
-  const chunkBytes = 4 * 1024 * 1024
-  try {
-    for (let offset = 0; offset < file.size; offset += chunkBytes) {
-      if (!isCurrent(jobId)) throw new Error("分段准备已取消")
-      const chunk = new Uint8Array(
-        await file.slice(offset, Math.min(file.size, offset + chunkBytes)).arrayBuffer()
-      )
-      hasher.update(chunk)
-    }
-    const digest = hasher.digest()
-    if (digest.length !== 32) throw new Error("完整文件 SHA-256 计算失败")
-    return digest
-  } finally {
-    hasher.free()
-  }
+/** Own a transferable ArrayBuffer for `compressed` (detach-safe). */
+function ownBuffer(compressed: Uint8Array): ArrayBuffer {
+  const buf = compressed.buffer as ArrayBuffer
+  const owns = compressed.byteOffset === 0 && compressed.byteLength === buf.byteLength
+  if (owns) return buf
+  const copy = new Uint8Array(compressed.byteLength)
+  copy.set(compressed)
+  return copy.buffer as ArrayBuffer
 }
 
 /**
- * Shared finalize tail for both file and text paths: compress → CRC32 +
- * fingerprint already done by caller → package the transferable result and
- * post `done`. Runs the heavy synchronous-WASM compress here in the worker so
- * the main thread keeps painting the progress overlay.
+ * Shared finalize tail for file, bundle, and text paths: compress once → CRC32
+ * → if the compressed stream fits a single object, post a plain `done`; else
+ * split the compressed stream into fixed `SEGMENT_RAW_BYTES` segments and post
+ * a segmented `done` carrying every segment (each transferable). The receiver
+ * concatenates the compressed segments in order and decompresses exactly once.
+ *
+ * Runs the heavy synchronous-WASM compress here in the worker so the main
+ * thread keeps painting the progress overlay.
  */
 async function finalizeAndPost(
   raw: Uint8Array,
@@ -583,10 +380,11 @@ async function finalizeAndPost(
   jobId: number
 ) {
   if (!isCurrent(jobId)) return
+  // Capture every value derived from `raw` up front so the original buffer can
+  // be released to GC as soon as hashing/crc are done (see below), instead of
+  // holding `raw` (whole original) alongside the whole compressed stream.
+  const originalSize = raw.length
   // --- Compress (zstd always; xz if compressible) ---
-  // preparePayload drives the stage callback so we can post zstd/xz phase
-  // boundaries up to the UI. The compress itself is synchronous WASM but
-  // runs here in the worker, so the main thread keeps painting meanwhile.
   const { payload: compressed, algorithm, compressedSize } = await preparePayload(
     raw,
     (phase) => {
@@ -595,57 +393,108 @@ async function finalizeAndPost(
   )
   if (!isCurrent(jobId)) return
   console.log(
-    `Compression: ${raw.length} → ${compressedSize} bytes ` +
-      `(${raw.length > 0 ? ((compressedSize / raw.length) * 100).toFixed(1) : "0"}%)`
+    `Compression: ${originalSize} → ${compressedSize} bytes ` +
+      `(${originalSize > 0 ? ((compressedSize / originalSize) * 100).toFixed(1) : "0"}%)`
   )
 
-  // --- Wire-ceiling gate (32 MiB, mirrored from raptorq_core::MAX_OBJECT_BYTES) ---
-  // The RaptorQ object actually transmitted over the QR stream is the COMPRESSED
-  // payload. Every receiver (Android / Windows / web) hard-rejects a transfer
-  // whose wire length exceeds 32 MiB — it can never be recovered, no matter how
-  // compressible or how many (or how small) the constituent files are. This is a
-  // hard impossibility, not a "warn and continue" case, so surface a clear error
-  // here (in the worker) rather than silently playing out a transfer the receiver
-  // will always fail. Note this is distinct from the 256 MiB original-size
-  // confirm dialog in FileSelectPage: that one only fires pre-compression for a
-  // selection whose ORIGINAL bytes alone exceed the receiver's post-decompression
-  // budget, and misses exactly this scenario (original between 32 MiB and 256 MiB
-  // that does not compress under the wire ceiling).
-  if (compressedSize > MAX_TRANSFER_BYTES) {
-    const mb = (compressedSize / (1024 * 1024)).toFixed(1)
-    post({
-      phase: "error",
-      message: `压缩后大小 ${mb} MiB 超过 ${MAX_TRANSFER_MIB} MiB 传输上限，接收端（Android/Windows/网页）无法接收，请减少发送内容`,
-      jobId,
-    })
-    return
-  }
-
-  // --- CRC32 (on the pre-compress bytes) ---
-  // 这一段（CRC32 over the whole payload）没有任何阶段回调，是 done 前的"盲区"。
-  // 大文件 CRC 可达数百毫秒，补一个 finalizing 阶段让 UI 步骤清单能显示它，
-  // 而非从"压缩"直接跳到"完成"。
+  // --- Segment-after-compression gate ---
+  // A logical transfer is compressed **once**. If the compressed stream fits a
+  // single RaptorQ object (≤ SEGMENT_RAW_BYTES after symbol padding) it is
+  // sent directly. Only when the compressed stream would exceed that budget do
+  // we split it into segments — this is the "压缩后分段" model. A stream larger
+  // than a whole segment is always splittable (segments are slices of the same
+  // compressed stream), so unlike the old raw-segment model there is no hard
+  // "too big to send" failure: every size is representable.
   post({ phase: "finalizing", jobId })
   const crc = crc32(raw)
   if (!isCurrent(jobId)) return
 
-  // Transfer the compressed buffer back (zero-copy). Ensure it owns a
-  // dedicated ArrayBuffer at offset 0 so the transfer detaches cleanly. The
-  // compress output is always backed by a plain ArrayBuffer (zstd .slice()
-  // or the original File bytes), never a SharedArrayBuffer, so the assert is
-  // safe.
-  const ownsBuffer =
-    compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
-  const outBuf = (ownsBuffer ? compressed.buffer : compressed.slice().buffer) as ArrayBuffer
+  const rootCompressedSize = compressedSize
+  if (segmentCountFor(rootCompressedSize) <= 1) {
+    // Single-object transfer.
+    const outBuf = ownBuffer(compressed)
+    const result: CompressResult = {
+      phase: "done",
+      jobId,
+      needsSegmentation: false,
+      compressed: outBuf,
+      algorithm,
+      originalSize,
+      compressedSize,
+      preCrc32: crc,
+      sessionId: {
+        lo: sessionId.lo.toString(),
+        hi: sessionId.hi.toString(),
+      },
+      displayName,
+      rootSessionId: {
+        lo: sessionId.lo.toString(),
+        hi: sessionId.hi.toString(),
+      },
+      segmentCount: 1,
+      rootOriginalSize: originalSize,
+      rootDisplayName: displayName,
+      segments: [],
+    }
+    ;(self as unknown as Worker).postMessage(result, [outBuf])
+    return
+  }
+
+  // --- Segmented transfer (compressed byte-stream) ---
+  // Every segment shares the same `file_meta` identity: whole-file decompressed
+  // size, compression algorithm, and CRC32 over the original bytes. Only the
+  // per-segment compressed length, offset, and SHA-256 vary.
+  const count = segmentCountFor(rootCompressedSize)
+  const rootSha256 = await sha256Bytes(raw)
+  // The whole original buffer is no longer needed (size, crc, root sha are
+  // captured). Release it so GC can reclaim it while we slice the compressed
+  // stream, instead of holding `raw` (≈ original) + `compressed` (≈ stream)
+  // simultaneously for the rest of the segmentation loop.
+  raw = new Uint8Array(0)
+  if (!isCurrent(jobId)) return
+
+  const segments: SegmentSpec[] = []
+  const transfers: ArrayBuffer[] = []
+  for (let i = 0; i < count; i++) {
+    const seg = sliceSegment(compressed, i)
+    if (!isCurrent(jobId)) return
+    const childSessionId = deriveSegmentId(sessionId, i)
+    const segSha = await sha256Bytes(seg)
+    if (!isCurrent(jobId)) return
+    const outBuf = ownBuffer(seg)
+    segments.push({
+      compressed: outBuf,
+      algorithm,
+      originalSize, // whole decompressed size (file_meta.original_size)
+      compressedSize: seg.length, // this segment's compressed length
+      preCrc32: crc, // whole-file CRC32 (file_meta.crc32)
+      segmentIndex: i,
+      segmentCount: count,
+      originalOffset: segmentOffset(i), // offset in the compressed stream
+      rootOriginalSize: rootCompressedSize, // whole compressed stream size
+      rootSessionId: {
+        lo: sessionId.lo.toString(),
+        hi: sessionId.hi.toString(),
+      },
+      childSessionId: {
+        lo: childSessionId.lo.toString(),
+        hi: childSessionId.hi.toString(),
+      },
+      rawSha256: segSha, // SHA-256 over this segment's compressed bytes
+      rootSha256: rootSha256.slice() as ArrayBuffer, // SHA-256 over whole original
+      displayName,
+    })
+    transfers.push(outBuf)
+  }
 
   const result: CompressResult = {
     phase: "done",
     jobId,
-    needsSegmentation: false,
-    compressed: outBuf,
+    needsSegmentation: true,
+    compressed: new ArrayBuffer(0),
     algorithm,
-    originalSize: raw.length,
-    compressedSize,
+    originalSize,
+    compressedSize: rootCompressedSize,
     preCrc32: crc,
     sessionId: {
       lo: sessionId.lo.toString(),
@@ -656,13 +505,12 @@ async function finalizeAndPost(
       lo: sessionId.lo.toString(),
       hi: sessionId.hi.toString(),
     },
-    segmentCount: 1,
-    rootOriginalSize: raw.length,
+    segmentCount: count,
+    rootOriginalSize: originalSize, // whole decompressed size
     rootDisplayName: displayName,
-    segments: [],
+    segments,
   }
-  // Detach the ArrayBuffer via the transfer list.
-  ;(self as unknown as Worker).postMessage(result, [outBuf])
+  ;(self as unknown as Worker).postMessage(result, transfers)
 }
 
 /**

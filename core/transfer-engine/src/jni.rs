@@ -9,8 +9,8 @@
 use crate::ingest_status;
 use crate::receiver::ReceiverSession;
 use crate::Progress;
-use jni::objects::{JByteArray, JClass};
-use jni::sys::{jint, jlong, jsize};
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jboolean, jint, jlong, jsize};
 use jni::JNIEnv;
 use qr_protocol::frame::SessionIdRaw;
 
@@ -234,6 +234,156 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverAsse
     // reinterpretation for SetByteArrayRegion.
     let i8_buf: &[i8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len()) };
+    if env.set_byte_array_region(&arr, 0, i8_buf).is_ok() {
+        arr.into_raw()
+    } else {
+        null_byte_array(&mut env)
+    }
+}
+
+/// Reassemble the RaptorQ object bytes **exactly as transmitted** (trimmed to
+/// `compressed_size` when known), **without** applying decompression.
+///
+/// For descriptor-v4 segmented transfers the compressed-stream model stores each
+/// segment's **compressed** bytes and concatenates + decompresses once at the
+/// end, so Kotlin calls this instead of `receiverAssembleBytes` (which
+/// decompresses per segment). Returns an empty byte[] if decoding is incomplete.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverAssembleRawBytes(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jbyteArray {
+    if handle == 0 {
+        return null_byte_array(&mut env);
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    let Some(mut raw) = session.assemble_raw() else {
+        return null_byte_array(&mut env);
+    };
+    let fm = session.file_meta();
+    if fm.compressed_size_known {
+        if let Ok(len) = usize::try_from(fm.compressed_size) {
+            if len <= raw.len() {
+                raw.truncate(len);
+            }
+        }
+    }
+    let len = match jsize::try_from(raw.len()) {
+        Ok(n) => n,
+        Err(_) => return null_byte_array(&mut env),
+    };
+    let arr = match env.new_byte_array(len) {
+        Ok(a) => a,
+        Err(_) => return null_byte_array(&mut env),
+    };
+    let i8_buf: &[i8] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+    if env.set_byte_array_region(&arr, 0, i8_buf).is_ok() {
+        arr.into_raw()
+    } else {
+        null_byte_array(&mut env)
+    }
+}
+
+/// Compression-algorithm tag of the confirmed descriptor (0=None, 1=Zstd,
+/// 2=Xz). For segmented transfers this is the algorithm of the whole stream,
+/// shared by every segment.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCompression(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    i32::from(session.file_meta().compression)
+}
+
+/// Transmitted (possibly compressed) payload length of this object. For a
+/// segmented transfer this is the segment's compressed size.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCompressedSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session.file_meta().compressed_size as jlong
+}
+
+/// Whole **decompressed** original size of the transfer (same across every
+/// segment of a segmented root).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverOriginalSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const ReceiverSession) };
+    session.file_meta().original_size as jlong
+}
+
+/// Decompress a byte array according to a compression tag (0=None, 1=Zstd,
+/// 2=Xz), bounded by `max_output`. Used by Kotlin to decompress the
+/// concatenated compressed stream of a segmented transfer exactly once.
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_decompressBytes(
+    mut env: JNIEnv,
+    _class: JClass,
+    data: jni::sys::jbyteArray,
+    compression: jint,
+    max_output: jlong,
+) -> jni::sys::jbyteArray {
+    if data.is_null() {
+        return null_byte_array(&mut env);
+    }
+    // SAFETY: `data` is a non-null `jbyteArray` owned by the JVM for the call
+    // duration (JNI local reference). Wrap it so the typed `jni` crate methods
+    // accept it.
+    let arr = unsafe { JByteArray::from_raw(data) };
+    let len = match env.get_array_length(&arr) {
+        Ok(n) => n,
+        Err(_) => return null_byte_array(&mut env),
+    };
+    if len < 0 {
+        return null_byte_array(&mut env);
+    }
+    // `jni` expects `&mut [i8]`; `u8`/`i8` share the same in-memory layout.
+    let mut buf = vec![0u8; len as usize];
+    let buf_i8: &mut [i8] =
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, buf.len()) };
+    if env.get_byte_array_region(&arr, 0, buf_i8).is_err() {
+        return null_byte_array(&mut env);
+    }
+    let max_out = if max_output > 0 {
+        max_output as usize
+    } else {
+        0
+    };
+    let out = match qr_protocol::compress::decompress_with_limit(&buf, compression as u8, max_out) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            android_log(&format!("decompressBytes failed: {e}"));
+            return null_byte_array(&mut env);
+        }
+    };
+    let out_len = match jsize::try_from(out.len()) {
+        Ok(n) => n,
+        Err(_) => return null_byte_array(&mut env),
+    };
+    let arr = match env.new_byte_array(out_len) {
+        Ok(a) => a,
+        Err(_) => return null_byte_array(&mut env),
+    };
+    let i8_buf: &[i8] = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     if env.set_byte_array_region(&arr, 0, i8_buf).is_ok() {
         arr.into_raw()
     } else {
@@ -503,6 +653,93 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverLast
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Stream a concatenated compressed stream from `input_path` to `output_path`,
+/// decompressing as it goes (zstd/xz streaming decoder) while computing CRC32 +
+/// SHA-256 incrementally — neither input nor output is held wholly in memory, so
+/// very large files can be recovered in bounded RAM. Verifies the decompressed
+/// size, CRC32 (when known) and SHA-256 against the descriptor before returning
+/// success; any mismatch or I/O error removes the partial output and returns
+/// false.
+///
+/// `max_output` caps the decompressed size (decompression-bomb guard).
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_decompressStreamToFile(
+    env: JNIEnv,
+    _class: JClass,
+    input_path: JString,
+    output_path: JString,
+    compression: jint,
+    max_output: jlong,
+    expected_size: jlong,
+    expected_crc: jlong,
+    crc_known: jboolean,
+    expected_sha_hex: JString,
+) -> jboolean {
+    fn jstr(env: &mut JNIEnv, s: JString) -> Option<String> {
+        env.get_string(&s).ok().map(|j| j.into())
+    }
+    let mut env = env;
+    let input = match jstr(&mut env, input_path) {
+        Some(v) => v,
+        None => {
+            android_log("decompressStreamToFile: missing input path");
+            return 0;
+        }
+    };
+    let output = match jstr(&mut env, output_path) {
+        Some(v) => v,
+        None => {
+            android_log("decompressStreamToFile: missing output path");
+            return 0;
+        }
+    };
+    let expected_sha = match jstr(&mut env, expected_sha_hex) {
+        Some(v) => v,
+        None => {
+            android_log("decompressStreamToFile: missing expected sha");
+            return 0;
+        }
+    };
+
+    let max_out = if max_output > 0 { max_output as u64 } else { 0 };
+    let outcome = match qr_protocol::compress::decompress_stream_to_file(
+        &input,
+        &output,
+        compression as u8,
+        max_out,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            android_log(&format!("decompressStreamToFile failed: {e}"));
+            return 0;
+        }
+    };
+
+    if outcome.output_size != expected_size as u64 {
+        android_log(&format!(
+            "decompressStreamToFile size mismatch: {} != {}",
+            outcome.output_size, expected_size
+        ));
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    if crc_known != 0 && outcome.crc32 != expected_crc as u32 {
+        android_log(&format!(
+            "decompressStreamToFile crc mismatch: {:08x} != {:08x}",
+            outcome.crc32, expected_crc as u32
+        ));
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    let actual_sha: String = outcome.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    if !actual_sha.eq_ignore_ascii_case(&expected_sha) {
+        android_log("decompressStreamToFile sha mismatch");
+        let _ = std::fs::remove_file(&output);
+        return 0;
+    }
+    1
 }
 
 fn progress_json(p: &Progress) -> String {

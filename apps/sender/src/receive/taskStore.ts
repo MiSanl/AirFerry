@@ -1,10 +1,15 @@
 /** Durable browser-side ledger for descriptor-v4 segmented receives. */
 
 const DB_NAME = "airferry-receive-v1"
-const DB_VERSION = 2
+const DB_VERSION = 3
 const TASKS = "tasks"
 const SEGMENTS = "segments"
-const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
+// Compressed-stream segment size (mirrors Rust `SEGMENT_RAW_BYTES`).
+// `MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE` so a full segment, after RaptorQ symbol
+// padding, stays within the 32 MiB wire ceiling for any legal symbol size.
+const MAX_OBJECT_BYTES = 32 * 1024 * 1024
+const MAX_SYMBOL_SIZE = 65_528
+const SEGMENT_RAW_BYTES = MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE
 const MAX_SEGMENT_COUNT = 131_072
 const MIN_FREE_RESERVE_BYTES = 64 * 1024 * 1024
 
@@ -13,9 +18,17 @@ export interface StoredSegmentTask {
   rootLo: string
   rootHi: string
   fileName: string
+  /** Whole decompressed size of the original payload (display + verify). */
   rootOriginalSize: number
+  /** Whole compressed stream size (== sum of every segment's compressed bytes). */
+  compressedSize: number
+  /** Compression algorithm of the whole stream (shared by every segment). */
+  compression: number
+  /** CRC32 over the whole decompressed original payload. */
+  crc32: number
+  crc32Known: boolean
   segmentCount: number
-  /** Complete-file digest shared by every descriptor-v4 segment. */
+  /** Complete-file digest (SHA-256 of the whole decompressed original). */
   rootSha256: string
   received: number[]
   hashes: (string | null)[]
@@ -34,7 +47,15 @@ export interface StoreSegmentInput {
   rootLo: bigint
   rootHi: bigint
   fileName: string
-  rootOriginalSize: number
+  /** Whole decompressed size of the original payload. */
+  originalSize: number
+  /** Whole compressed stream size. */
+  compressedSize: number
+  /** Compression algorithm of the whole stream. */
+  compression: number
+  /** CRC32 over the whole decompressed original. */
+  crc32: number
+  crc32Known: boolean
   segmentCount: number
   index: number
   sha256Hex: string
@@ -75,6 +96,14 @@ function openDb(): Promise<IDBDatabase> {
         req.transaction?.objectStore(TASKS).clear()
         req.transaction?.objectStore(SEGMENTS).clear()
       }
+      // Revision 3 switched stored segment blobs from *decompressed* bytes to
+      // *compressed* bytes (compressed-stream segmentation). Any task stored
+      // under an older revision holds incompatible segment bytes, so drop them.
+      if ((event as IDBVersionChangeEvent).oldVersion > 0 &&
+          (event as IDBVersionChangeEvent).oldVersion < 3) {
+        req.transaction?.objectStore(TASKS).clear()
+        req.transaction?.objectStore(SEGMENTS).clear()
+      }
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error ?? new Error("无法打开接收任务数据库"))
@@ -90,15 +119,18 @@ export function rootIdHex(lo: bigint, hi: bigint): string {
 export async function storeVerifiedSegment(
   input: StoreSegmentInput
 ): Promise<{ task: StoredSegmentTask; newlyStored: boolean }> {
-  const expectedCount = Math.ceil(input.rootOriginalSize / SEGMENT_RAW_BYTES)
+  // Segment coordinates are over the **compressed** stream.
+  const expectedCount = Math.ceil(input.compressedSize / SEGMENT_RAW_BYTES)
   const expectedOffset = input.index * SEGMENT_RAW_BYTES
   const expectedLength = Math.min(
     SEGMENT_RAW_BYTES,
-    input.rootOriginalSize - expectedOffset
+    input.compressedSize - expectedOffset
   )
   if (
-    !Number.isSafeInteger(input.rootOriginalSize) ||
-    input.rootOriginalSize <= 0 ||
+    !Number.isSafeInteger(input.compressedSize) ||
+    input.compressedSize <= 0 ||
+    !Number.isSafeInteger(input.originalSize) ||
+    input.originalSize <= 0 ||
     !Number.isInteger(input.segmentCount) ||
     input.segmentCount <= 0 ||
     input.segmentCount > MAX_SEGMENT_COUNT ||
@@ -146,7 +178,11 @@ export async function storeVerifiedSegment(
           rootLo: input.rootLo.toString(),
           rootHi: input.rootHi.toString(),
           fileName: input.fileName,
-          rootOriginalSize: input.rootOriginalSize,
+          rootOriginalSize: input.originalSize,
+          compressedSize: input.compressedSize,
+          compression: input.compression,
+          crc32: input.crc32,
+          crc32Known: input.crc32Known,
           segmentCount: input.segmentCount,
           rootSha256: input.rootSha256Hex,
           received: [],
@@ -160,7 +196,11 @@ export async function storeVerifiedSegment(
       task.rootLo !== input.rootLo.toString() ||
       task.rootHi !== input.rootHi.toString() ||
       task.fileName !== input.fileName ||
-      task.rootOriginalSize !== input.rootOriginalSize ||
+      task.rootOriginalSize !== input.originalSize ||
+      task.compressedSize !== input.compressedSize ||
+      task.compression !== input.compression ||
+      task.crc32 !== input.crc32 ||
+      task.crc32Known !== input.crc32Known ||
       task.segmentCount !== input.segmentCount ||
       task.rootSha256 !== input.rootSha256Hex ||
       task.hashes.length !== input.segmentCount ||
@@ -216,6 +256,34 @@ export async function storeVerifiedSegment(
     tx.objectStore(TASKS).put(task)
     await done
     return { task, newlyStored: true }
+  } finally {
+    db.close()
+  }
+}
+
+/**
+ * Whether a specific segment of a root transfer is already stored.
+ *
+ * Used for **early duplicate detection**: the moment a descriptor-v4 segment's
+ * meta is confirmed, the receiver checks here — if the segment was already
+ * received, the UI is told immediately (instead of scanning the whole segment
+ * again and only de-duplicating after it fully plays out).
+ */
+export async function hasStoredSegment(
+  rootLo: bigint,
+  rootHi: bigint,
+  index: number
+): Promise<boolean> {
+  const rootId = rootIdHex(rootLo, rootHi)
+  const db = await openDb()
+  try {
+    const tx = db.transaction(TASKS, "readonly")
+    const done = transactionDone(tx)
+    const task = (await request(
+      tx.objectStore(TASKS).get(rootId)
+    )) as StoredSegmentTask | undefined
+    await done
+    return !!task && task.received.includes(index)
   } finally {
     db.close()
   }

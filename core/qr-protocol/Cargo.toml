@@ -9,6 +9,7 @@ description = "QR frame format, chunking, compression and session logic for AirF
 [dependencies]
 raptorq-core.workspace = true
 crc32fast.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 # Optimized QR generator (~7-9× faster than the `qrcode` crate on the

@@ -1,6 +1,7 @@
 package com.airferry.app.scan
 
 import android.util.AtomicFile
+import com.airferry.app.nativelib.NativeBridge
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -12,31 +13,46 @@ import java.nio.file.StandardCopyOption
 /**
  * Disk-backed assembler for a descriptor-v4 large transfer.
  *
- * A large file is split into N fixed `SEGMENT_RAW_BYTES` (8 MiB) raw segments,
- * each recovered by an independent `ReceiverSession`. `SegmentAssembler` writes
- * each completed segment's *uncompressed* bytes at its canonical offset in a
- * single `.partial` file (random-access write), persists a completion bitmap
- * atomically, and once every segment has arrived renames the `.partial` to its
- * final name after verifying both per-segment SHA-256 and the root SHA-256.
+ * A logical transfer is compressed **once** into a single compressed stream,
+ * then split into fixed `SEGMENT_RAW_BYTES` (~32 MiB) segments. Each segment is
+ * recovered by an independent `ReceiverSession`. `SegmentAssembler` stores each
+ * completed segment's **compressed** bytes at its canonical offset within the
+ * compressed stream in a single `.partial` file (random-access write), persists
+ * a completion bitmap atomically, and once every segment has arrived
+ * concatenates the compressed stream (already in `.partial`) and decompresses
+ * it **exactly once** to recover the original payload, verifying the whole-file
+ * CRC32 and root SHA-256 (over the decompressed bytes).
  *
- * Memory stays bounded to one segment at a time — unlike the in-memory
- * `TransferAssembler` in core, this streams to disk, which is what the core
- * docs recommend for Android (see `core/transfer-engine/src/assembler.rs`).
+ * Memory stays bounded to one segment at a time while scanning; only the final
+ * decompression materializes the whole original (bounded by
+ * [NativeBridge.decompressBytes]'s output cap). Unlike the legacy per-segment
+ * raw model, a segment is NOT independently decompressible — a single zstd/xz
+ * stream cannot be sliced into decodable pieces — so completion is required
+ * before the file can be recovered.
  *
  * Layout under the cache root:
- *   `<root>/seg/<rootSessionIdHex>/transfer.partial`  — the growing file
+ *   `<root>/seg/<rootSessionIdHex>/transfer.partial`  — the growing compressed stream
  *   `<root>/seg/<rootSessionIdHex>/bitmap.json`       — atomic completion bitmap
  */
 class SegmentAssembler private constructor(
     private val rootSessionIdLo: Long,
     private val rootSessionIdHi: Long,
     private val segmentCount: Int,
-    private val rootOriginalSize: Long,
+    /** Whole **compressed** stream size (== sum of every segment's compressed bytes). */
+    private val compressedSize: Long,
+    /** Whole **decompressed** original size. */
+    private val decompressedSize: Long,
+    /** Compression-algorithm tag of the whole stream (0=None,1=Zstd,2=Xz). */
+    private val compression: Int,
+    /** CRC32 over the whole decompressed original (0 if unknown). */
+    private val crc32: Long,
+    private val crc32Known: Boolean,
+    /** SHA-256 of the whole **decompressed** original. */
     private val rootSha256: String,
     private val fileName: String,
     private val dir: File,
 ) {
-    /** Preallocated final length of the `.partial` file. */
+    /** Preallocated final length of the `.partial` file (the compressed stream). */
     private val partialFile: File = File(dir, "transfer.partial")
 
     // ── bitmap (in-memory + persisted) ──
@@ -55,9 +71,9 @@ class SegmentAssembler private constructor(
     private fun canonicalOffset(index: Int): Long = index.toLong() * SEGMENT_RAW_BYTES
 
     /**
-     * Write one completed segment's uncompressed bytes at its canonical offset.
-     * Returns `true` if this segment was newly stored, `false` if it was a
-     * duplicate.
+     * Write one completed segment's **compressed** bytes at its canonical offset
+     * within the compressed stream. Returns `true` if newly stored, `false` if
+     * a duplicate.
      */
     @Synchronized
     fun storeSegment(index: Int, bytes: ByteArray, expectedSha256: ByteArray): Boolean {
@@ -81,13 +97,14 @@ class SegmentAssembler private constructor(
             "存储空间不足（至少需要保留 ${MIN_FREE_RESERVE_BYTES / 1024 / 1024} MiB）"
         }
 
-        // Grow/truncate the partial file to the root size once, then write at offset.
+        // Grow/truncate the partial file to the compressed stream size once, then
+        // write this segment's compressed bytes at its compressed-stream offset.
         RandomAccessFile(partialFile, "rw").use { raf ->
-            if (raf.length() < rootOriginalSize) raf.setLength(rootOriginalSize)
+            if (raf.length() < compressedSize) raf.setLength(compressedSize)
             val off = canonicalOffset(index)
-            if (off + bytes.size > rootOriginalSize) {
+            if (off + bytes.size > compressedSize) {
                 throw IllegalArgumentException(
-                    "segment $index overruns root: ${off + bytes.size} > $rootOriginalSize"
+                    "segment $index overruns compressed stream: ${off + bytes.size} > $compressedSize"
                 )
             }
             raf.seek(off)
@@ -115,6 +132,12 @@ class SegmentAssembler private constructor(
 
     fun rootSha256Hex(): String = rootSha256
 
+    fun decompressedSize(): Long = decompressedSize
+
+    fun crc32(): Long = crc32
+
+    fun crc32Known(): Boolean = crc32Known
+
     fun matches(
         lo: Long,
         hi: Long,
@@ -124,7 +147,7 @@ class SegmentAssembler private constructor(
         name: String,
     ): Boolean =
         rootSessionIdLo == lo && rootSessionIdHi == hi && segmentCount == count &&
-            rootOriginalSize == size && rootSha256 == rootHash.toHex() && fileName == name
+            compressedSize == size && rootSha256 == rootHash.toHex() && fileName == name
 
     @Synchronized
     fun isComplete(): Boolean = receivedCount >= segmentCount
@@ -135,40 +158,38 @@ class SegmentAssembler private constructor(
         index in 0 until segmentCount && received[index]
 
     /**
-     * Finish the transfer: rename `.partial` → the final name. Verifies the
-     * whole file's size and root SHA-256. Returns the final file, or null if
-     * segments are still missing. If a previous crash already moved the file
-     * into ContentStore, the missing final path is returned so publication can
-     * be retried idempotently against the expected content hash.
+     * Finish the transfer: stream the concatenated compressed stream (already in
+     * `.partial`) to `transfer.decompressed`, decompressing **once** via native
+     * Rust while computing CRC32 + SHA-256 incrementally. The native call
+     * verifies the decompressed size, CRC32 (when known) and root SHA-256
+     * (over the decompressed bytes) before returning success, and removes the
+     * partial output on any mismatch — so neither the compressed stream nor the
+     * original is ever held wholly in memory (very large files are recoverable).
+     * Returns the decompressed file, or null if segments are still missing or
+     * verification failed.
      */
     @Synchronized
     fun finish(): File? {
         if (!isComplete()) return null
-        val final = File(dir, "transfer.complete")
-        if (final.exists()) {
-            require(final.length() == rootOriginalSize && sha256Hex(final) == rootSha256) {
-                "整文件 SHA-256 校验失败"
-            }
-            return final
+        if (!partialFile.exists()) return null
+        if (partialFile.length() != compressedSize) return null
+        val outFile = File(dir, "transfer.decompressed")
+        if (outFile.exists()) outFile.delete()
+        val ok = NativeBridge.decompressStreamToFile(
+            partialFile.absolutePath,
+            outFile.absolutePath,
+            compression,
+            decompressedSize, // hard output cap (decompression-bomb guard)
+            decompressedSize, // expected decompressed size
+            crc32,
+            crc32Known,
+            rootSha256,
+        )
+        if (!ok) {
+            if (outFile.exists()) outFile.delete()
+            return null
         }
-        if (partialFile.exists() && partialFile.length() != rootOriginalSize) return null
-        if (!partialFile.exists()) return final
-        require(sha256Hex(partialFile) == rootSha256) { "整文件 SHA-256 校验失败" }
-        try {
-            Files.move(
-                partialFile.toPath(),
-                final.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-            Files.move(
-                partialFile.toPath(),
-                final.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        }
-        return final
+        return outFile
     }
 
     /** Remove the durable task only after ContentStore has published its index. */
@@ -186,7 +207,11 @@ class SegmentAssembler private constructor(
         obj.put("rootLo", rootSessionIdLo.toString())
         obj.put("rootHi", rootSessionIdHi.toString())
         obj.put("count", segmentCount)
-        obj.put("rootSize", rootOriginalSize.toString())
+        obj.put("compressedSize", compressedSize.toString())
+        obj.put("decompressedSize", decompressedSize.toString())
+        obj.put("compression", compression)
+        obj.put("crc32", crc32.toString())
+        obj.put("crc32Known", crc32Known)
         obj.put("rootSha256", rootSha256)
         obj.put("name", fileName)
         obj.put("updatedAt", updatedAt)
@@ -254,55 +279,61 @@ class SegmentAssembler private constructor(
     }
 
     companion object {
-        /** Fixed uncompressed segment size (mirrors core `SEGMENT_RAW_BYTES`). */
-        const val SEGMENT_RAW_BYTES = 8L * 1024 * 1024
+        /** Fixed compressed-stream segment size (mirrors core `SEGMENT_RAW_BYTES`). */
+        const val SEGMENT_RAW_BYTES = (32L * 1024 * 1024) - 65_528L
         const val MAX_SEGMENT_COUNT = 131_072
         private const val MIN_FREE_RESERVE_BYTES = 64L * 1024 * 1024
+        private const val MAX_DECOMPRESSED_BYTES = 256L * 1024 * 1024
 
         /**
          * Open (or resume) an assembler for a root transfer. `segmentCount` /
-         * `rootOriginalSize` / `fileName` are taken from the first segment's
-         * descriptor and must be consistent across segments.
+         * `compressedSize` / `decompressedSize` / `compression` / `crc32` /
+         * `fileName` are taken from the first segment's descriptor and must be
+         * consistent across segments.
          */
         fun open(
             root: File,
             rootSessionIdLo: Long,
             rootSessionIdHi: Long,
             segmentCount: Int,
-            rootOriginalSize: Long,
+            compressedSize: Long,
+            decompressedSize: Long,
+            compression: Int,
+            crc32: Long,
+            crc32Known: Boolean,
             rootSha256: ByteArray,
             fileName: String,
         ): SegmentAssembler {
             require(segmentCount in 1..MAX_SEGMENT_COUNT) { "segment count out of range" }
-            require(rootOriginalSize > 0) { "root size must be positive" }
-            val expectedCount = ((rootOriginalSize - 1) / SEGMENT_RAW_BYTES + 1)
+            require(compressedSize > 0) { "compressed stream size must be positive" }
+            val expectedCount = ((compressedSize - 1) / SEGMENT_RAW_BYTES + 1)
             require(expectedCount == segmentCount.toLong()) {
-                "segment count inconsistent with root size"
+                "segment count inconsistent with compressed stream size"
             }
             require(rootSha256.size == 32) { "root SHA-256 must be 32 bytes" }
             val hex = rootSessionIdHex(rootSessionIdLo, rootSessionIdHi)
             val dir = File(root, "seg/$hex")
             val bm = File(dir, "bitmap.json")
-            // v1.1.6 ledgers did not bind segments to a root digest. They are
-            // unsafe to resume under the revised descriptor-v4 contract.
+            // Legacy ledgers did not bind segments to a compressed-stream digest /
+            // whole-file metadata. They are unsafe to resume under this model.
             if (bm.exists()) {
                 try {
                     val savedRootHash = JSONObject(bm.readText()).optString("rootSha256")
                     if (savedRootHash.length != 64) dir.deleteRecursively()
                 } catch (_: Exception) {
-                    // A corrupt current-format ledger is handled below without
-                    // deleting its partial file, preserving forensic recovery.
+                    // A corrupt current-format ledger is handled below.
                 }
             }
             if (!bm.exists()) {
-                require(root.usableSpace >= rootOriginalSize + MIN_FREE_RESERVE_BYTES) {
-                    "存储空间不足：大文件任务需要约 ${rootOriginalSize / 1024 / 1024} MiB 可用空间"
+                require(root.usableSpace >= compressedSize + MIN_FREE_RESERVE_BYTES) {
+                    "存储空间不足：大文件任务需要约 ${compressedSize / 1024 / 1024} MiB 可用空间"
                 }
             }
             val rootHashHex = rootSha256.joinToString("") { "%02x".format(it) }
             val asm = SegmentAssembler(
                 rootSessionIdLo, rootSessionIdHi,
-                segmentCount, rootOriginalSize, rootHashHex, fileName, dir
+                segmentCount, compressedSize, decompressedSize, compression,
+                crc32, crc32Known, rootHashHex, fileName, dir
             )
             // Resume from a persisted bitmap if present.
             if (bm.exists()) {
@@ -312,7 +343,11 @@ class SegmentAssembler private constructor(
                     val sameTask = count == segmentCount &&
                         obj.optString("rootLo") == rootSessionIdLo.toString() &&
                         obj.optString("rootHi") == rootSessionIdHi.toString() &&
-                        obj.optString("rootSize") == rootOriginalSize.toString() &&
+                        obj.optString("compressedSize") == compressedSize.toString() &&
+                        obj.optString("decompressedSize") == decompressedSize.toString() &&
+                        obj.optInt("compression", -1) == compression &&
+                        obj.optString("crc32") == crc32.toString() &&
+                        obj.optBoolean("crc32Known", false) == crc32Known &&
                         obj.optString("rootSha256") == rootHashHex &&
                         obj.optString("name") == fileName
                     if (!sameTask) {
@@ -357,8 +392,8 @@ class SegmentAssembler private constructor(
                 try {
                     val obj = JSONObject(bm.readText())
                     val count = obj.getInt("count")
-                    val size = obj.getString("rootSize").toLong()
-                    if (count !in 1..MAX_SEGMENT_COUNT || size <= 0) return@mapNotNull null
+                    val compressedSize = obj.getString("compressedSize").toLong()
+                    if (count !in 1..MAX_SEGMENT_COUNT || compressedSize <= 0) return@mapNotNull null
                     val rootSha256 = obj.optString("rootSha256")
                     if (rootSha256.length != 64 ||
                         rootSha256.any { it !in '0'..'9' && it !in 'a'..'f' }
@@ -370,7 +405,8 @@ class SegmentAssembler private constructor(
                         rootSessionIdLo = obj.getString("rootLo").toLong(),
                         rootSessionIdHi = obj.getString("rootHi").toLong(),
                         fileName = obj.optString("name", "received_file"),
-                        rootOriginalSize = size,
+                        rootOriginalSize = obj.optString("decompressedSize").toLongOrNull()
+                            ?: compressedSize,
                         rootSha256 = rootSha256,
                         segmentCount = count,
                         receivedCount = receivedIndices.size,
@@ -398,21 +434,17 @@ class SegmentAssembler private constructor(
     }
 
     private fun canonicalLength(index: Int): Long {
-        val remaining = rootOriginalSize - canonicalOffset(index)
+        val remaining = compressedSize - canonicalOffset(index)
         return remaining.coerceAtMost(SEGMENT_RAW_BYTES)
     }
 
     private fun verifyPersistedSegment(index: Int, expectedHash: String): Boolean {
-        val source = when {
-            partialFile.isFile -> partialFile
-            File(dir, "transfer.complete").isFile -> File(dir, "transfer.complete")
-            else -> return false
-        }
+        if (!partialFile.isFile) return false
         val length = canonicalLength(index)
-        if (length <= 0 || source.length() != rootOriginalSize) return false
+        if (length <= 0 || partialFile.length() != compressedSize) return false
         return try {
             val md = MessageDigest.getInstance("SHA-256")
-            RandomAccessFile(source, "r").use { raf ->
+            RandomAccessFile(partialFile, "r").use { raf ->
                 raf.seek(canonicalOffset(index))
                 val buf = ByteArray(64 * 1024)
                 var left = length
@@ -427,19 +459,6 @@ class SegmentAssembler private constructor(
         } catch (_: Exception) {
             false
         }
-    }
-
-    private fun sha256Hex(file: File): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(256 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read <= 0) break
-                md.update(buffer, 0, read)
-            }
-        }
-        return md.digest().toHex()
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

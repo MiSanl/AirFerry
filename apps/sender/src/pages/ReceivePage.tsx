@@ -17,8 +17,9 @@ import { useState, useCallback, useRef, useEffect } from "react"
 import "@/assets/app.css"
 import "@/assets/receive.css"
 import iconUrl from "../../assets/icon128.png"
-import type { Recovered } from "@/receive/parse"
-import { ensureWasm, Sha256Wasm } from "@/wasm/loader"
+import { decompressAndVerify, MAX_DECOMPRESSED_BYTES } from "@/receive/decompress"
+import { parseRecovered, type Recovered } from "@/receive/parse"
+import { ensureWasm } from "@/wasm/loader"
 import {
   deleteStoredTask,
   listStoredTasks,
@@ -113,7 +114,10 @@ interface SaveFileHandleLike {
   createWritable(): Promise<WritableFileLike>
 }
 
-const SEGMENT_RAW_BYTES = 8 * 1024 * 1024
+// Compressed-stream segment size (mirrors Rust `SEGMENT_RAW_BYTES`).
+const MAX_OBJECT_BYTES = 32 * 1024 * 1024
+const MAX_SYMBOL_SIZE = 65_528
+const SEGMENT_RAW_BYTES = MAX_OBJECT_BYTES - MAX_SYMBOL_SIZE
 const FALLBACK_BLOB_MAX_BYTES = 64 * 1024 * 1024
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -128,7 +132,7 @@ async function readVerifiedStoredSegment(
   const offset = index * SEGMENT_RAW_BYTES
   const expectedLength = Math.min(
     SEGMENT_RAW_BYTES,
-    task.rootOriginalSize - offset
+    task.compressedSize - offset
   )
   if (expectedLength <= 0 || bytes.byteLength !== expectedLength) {
     throw new Error(`已存分段 ${index + 1} 长度不一致，请重新恢复该段`)
@@ -146,13 +150,33 @@ async function readVerifiedStoredSegment(
   return bytes
 }
 
-/** Save a completed durable task without first constructing a merged buffer. */
-async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
+/** Concatenate every stored compressed segment (in order) into the full stream. */
+async function readFullCompressedStream(task: StoredSegmentTask): Promise<Uint8Array> {
   const received = new Set(task.received)
+  const out = new Uint8Array(task.compressedSize)
+  let written = 0
+  for (let i = 0; i < task.segmentCount; i++) {
+    if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
+    const bytes = await readVerifiedStoredSegment(task, i)
+    out.set(bytes, written)
+    written += bytes.byteLength
+  }
+  if (written !== task.compressedSize) {
+    throw new Error(`拼接压缩流大小 ${written} 与声明的 ${task.compressedSize} 不一致`)
+  }
+  return out
+}
+
+/**
+ * Recover a completed durable task: concatenate the stored **compressed**
+ * segments, decompress exactly once, then verify length + SHA-256 + CRC32 and
+ * parse the result into text / bundle / single file.
+ */
+async function recoverStoredTask(task: StoredSegmentTask): Promise<Recovered> {
   if (
     task.state !== "complete" ||
     task.received.length !== task.segmentCount ||
-    received.size !== task.segmentCount ||
+    new Set(task.received).size !== task.segmentCount ||
     task.hashes.length !== task.segmentCount
   ) {
     throw new Error("任务尚未完整恢复")
@@ -160,82 +184,87 @@ async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
   if (!/^[0-9a-f]{64}$/.test(task.rootSha256)) {
     throw new Error("任务缺少整文件 SHA-256，不能安全导出")
   }
+  if (task.rootOriginalSize > MAX_DECOMPRESSED_BYTES) {
+    throw new Error(`原始大小超过接收上限，无法恢复`)
+  }
   await ensureWasm()
+  const compressedStream = await readFullCompressedStream(task)
+  const verify = await decompressAndVerify(
+    compressedStream,
+    task.compression,
+    task.rootOriginalSize,
+    task.crc32,
+    task.crc32Known
+  )
+  if (verify.crcKnown && !verify.crcOk) {
+    throw new Error("整文件 CRC32 校验失败，拒绝导出")
+  }
+  if (verify.bytes.length !== task.rootOriginalSize) {
+    throw new Error("解压后大小与原文件不一致，拒绝导出")
+  }
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", verify.bytes.slice().buffer as ArrayBuffer)
+  )
+  if (bytesToHex(digest) !== task.rootSha256) {
+    throw new Error("整文件 SHA-256 校验失败，拒绝导出")
+  }
+  return parseRecovered(verify.bytes, task.fileName)
+}
+
+/** Save a completed durable task: decompress once, then write file(s)/text. */
+async function saveStoredTask(task: StoredSegmentTask): Promise<void> {
+  const recovered = await recoverStoredTask(task)
+
+  if (recovered.kind === "text") {
+    // Text is displayed in the UI by the caller (see handleSave); nothing to
+    // download here. The caller decides whether to offer a file export.
+    return
+  }
+
+  if (recovered.kind === "bundle") {
+    // Bundle: save every file as an individual download (fallback), since the
+    // browser cannot stream multiple files into one picker.
+    for (const entry of recovered.entries) {
+      downloadBytes(entry.name || "file", entry.data)
+    }
+    return
+  }
+
+  const file = recovered
   const picker = (window as unknown as {
     showSaveFilePicker?: (options: {
       suggestedName: string
     }) => Promise<SaveFileHandleLike>
   }).showSaveFilePicker
-
   if (picker) {
-    const handle = await picker({
-      suggestedName: task.fileName || "received_file",
-    })
+    const handle = await picker({ suggestedName: file.name || "received_file" })
     const writable = await handle.createWritable()
-    const rootHasher = new Sha256Wasm()
     try {
-      let written = 0
-      for (let i = 0; i < task.segmentCount; i++) {
-        if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
-        const bytes = await readVerifiedStoredSegment(task, i)
-        rootHasher.update(bytes)
-        await writable.write(bytes)
-        written += bytes.byteLength
-      }
-      if (written !== task.rootOriginalSize) {
-        throw new Error(`已写入大小 ${written} 与原文件 ${task.rootOriginalSize} 不一致`)
-      }
-      if (bytesToHex(rootHasher.digest()) !== task.rootSha256) {
-        throw new Error("整文件 SHA-256 校验失败，已取消导出")
-      }
+      await writable.write(file.data)
       await writable.close()
     } catch (e) {
       await writable.abort?.().catch(() => undefined)
       throw e
-    } finally {
-      rootHasher.free()
     }
     return
   }
-
-  // Compatibility fallback for browsers without File System Access. It still
-  // avoids a second merged Uint8Array. Bound the fallback because Blob parts
-  // remain resident until the download starts; large tasks require a browser
-  // with showSaveFilePicker so export remains streaming and memory-bounded.
-  if (task.rootOriginalSize > FALLBACK_BLOB_MAX_BYTES) {
+  if (file.data.byteLength > FALLBACK_BLOB_MAX_BYTES) {
     throw new Error(
-      `当前浏览器不支持流式保存；${formatSize(task.rootOriginalSize)} 文件请使用 Chrome/Edge 桌面版导出`
+      `当前浏览器不支持流式保存；${formatSize(file.data.byteLength)} 文件请使用 Chrome/Edge 桌面版导出`
     )
   }
-  const parts: BlobPart[] = []
-  let total = 0
-  const rootHasher = new Sha256Wasm()
-  try {
-    for (let i = 0; i < task.segmentCount; i++) {
-      if (!received.has(i)) throw new Error(`恢复记录缺少分段 ${i + 1}`)
-      const bytes = await readVerifiedStoredSegment(task, i)
-      rootHasher.update(bytes)
-      total += bytes.byteLength
-      parts.push(
-        bytes.buffer.slice(
-          bytes.byteOffset,
-          bytes.byteOffset + bytes.byteLength
-        ) as ArrayBuffer
-      )
-    }
-    if (total !== task.rootOriginalSize) {
-      throw new Error(`已恢复大小 ${total} 与原文件 ${task.rootOriginalSize} 不一致`)
-    }
-    if (bytesToHex(rootHasher.digest()) !== task.rootSha256) {
-      throw new Error("整文件 SHA-256 校验失败，已取消导出")
-    }
-  } finally {
-    rootHasher.free()
-  }
-  const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }))
+  downloadBytes(file.name || "received_file", file.data)
+}
+
+/** Trigger a single-file download from bytes (fallback path). */
+function downloadBytes(name: string, data: Uint8Array): void {
+  const copy = data.slice()
+  const url = URL.createObjectURL(
+    new Blob([copy.buffer as ArrayBuffer], { type: "application/octet-stream" })
+  )
   const anchor = document.createElement("a")
   anchor.href = url
-  anchor.download = task.fileName || "received_file"
+  anchor.download = name
   anchor.click()
   setTimeout(() => URL.revokeObjectURL(url), 0)
 }
@@ -871,6 +900,31 @@ export function ReceivePage(): React.ReactElement {
         resumeCaptureRef.current()
         void refreshTasks()
         dbg(`[recv] segment ${d.index + 1}/${d.count} complete; awaiting rest`)
+      } else if (d.type === "segment-duplicate") {
+        // Early duplicate detection: this segment was already received. Don't
+        // make the user scan it again — immediately resume capture for the next
+        // segment and surface a hint. The worker has already dropped the session.
+        dbg(`[recv] segment ${d.index + 1} already received; skipping`)
+        setProgress((p) => ({
+          ...p,
+          complete: false,
+          receivedSymbols: 0,
+          totalSymbols: 0,
+          decodedSymbols: 0,
+          decodedBlocks: 0,
+          totalBlocks: 0,
+          decodedFraction: 0,
+          metaConfirmed: false,
+          progressPct: 0,
+          statusText: `第 ${d.index + 1} 段已接收过，请扫描下一段`,
+          segmentReceived: p.segmentReceived,
+          segmentCount: p.segmentCount,
+        }))
+        assemblingRef.current = false
+        stageRef.current = "scanning"
+        setStage("scanning")
+        resumeCaptureRef.current()
+        void refreshTasks()
       } else if (d.type === "stored-result") {
         const task = d.task as StoredSegmentTask
         targetRootRef.current = null

@@ -149,6 +149,127 @@ fn read_capped<R: std::io::Read>(r: R, max_output: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Streaming result of [`decompress_stream_to_file`].
+#[cfg(not(target_arch = "wasm32"))]
+pub struct DecompressStreamOutcome {
+    /// Number of decompressed bytes written to the output file.
+    pub output_size: u64,
+    /// Incremental CRC32 over the decompressed bytes.
+    pub crc32: u32,
+    /// Incremental SHA-256 over the decompressed bytes.
+    pub sha256: [u8; 32],
+}
+
+/// Stream a compressed stream from `input_path` to `output_path`, decompressing
+/// as it goes, while computing CRC32 + SHA-256 incrementally. Neither the
+/// compressed input nor the decompressed output is ever held wholly in memory,
+/// so a very large file can be recovered within bounded RAM.
+///
+/// `max_output` is a hard cap on the decompressed size (defends against a
+/// decompression bomb): the stream is rejected as soon as it would exceed it.
+/// On any failure (I/O, cap breach, decoder error) the partial output file is
+/// removed so a later retry never reads a truncated file as success.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decompress_stream_to_file(
+    input_path: &str,
+    output_path: &str,
+    compression: u8,
+    max_output: u64,
+) -> Result<DecompressStreamOutcome> {
+    use sha2::Digest;
+    use std::io::{BufWriter, Read, Write};
+
+    let mut in_file =
+        std::fs::File::open(input_path).map_err(|e| Error::Compress(format!("open input: {e}")))?;
+    let out_file = std::fs::File::create(output_path)
+        .map_err(|e| Error::Compress(format!("create output: {e}")))?;
+    let mut writer = BufWriter::with_capacity(1 << 20, out_file);
+
+    // Channel a capped decode into a closure that hashes + writes chunks.
+    let mut crc = crc32fast::Hasher::new();
+    let mut sha = sha2::Sha256::new();
+    let mut written: u64 = 0;
+    let mut over = false;
+
+    let mut decode = |reader: &mut dyn Read| -> Result<()> {
+        let mut reader = reader.take(max_output.saturating_add(1));
+        let mut buf = [0u8; 256 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| Error::Compress(format!("read: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            written = written.saturating_add(n as u64);
+            if written > max_output {
+                over = true;
+                break;
+            }
+            crc.update(&buf[..n]);
+            sha.update(&buf[..n]);
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| Error::Compress(format!("write: {e}")))?;
+        }
+        Ok(())
+    };
+
+    let result: Result<()> = match compression {
+        COMPRESSION_ZSTD => {
+            let mut dec = zstd::stream::read::Decoder::new(in_file)
+                .map_err(|e| Error::Compress(e.to_string()))?;
+            decode(&mut dec)
+        }
+        COMPRESSION_XZ => {
+            let stream = xz2::stream::Stream::new_stream_decoder(XZ_DECODER_MEMORY_LIMIT, 0)
+                .map_err(|e| Error::Compress(e.to_string()))?;
+            let mut dec = xz2::read::XzDecoder::new_stream(in_file, stream);
+            decode(&mut dec)
+        }
+        _ => {
+            // COMPRESSION_NONE (or unknown tag with empty input): the "stream"
+            // is already the original bytes — copy as-is.
+            if is_known_compression_tag(compression) || {
+                // An unknown tag with non-empty input is an error, mirroring
+                // `decompress_with_limit`.
+                match std::fs::metadata(input_path) {
+                    Ok(m) => m.len() == 0,
+                    Err(_) => false,
+                }
+            } {
+                decode(&mut in_file)
+            } else {
+                Err(Error::Compress(format!(
+                    "unknown compression algorithm tag {compression}"
+                )))
+            }
+        }
+    };
+
+    if let Err(e) = result {
+        drop(writer);
+        let _ = std::fs::remove_file(output_path);
+        return Err(e);
+    }
+    if over {
+        drop(writer);
+        let _ = std::fs::remove_file(output_path);
+        return Err(Error::Compress(
+            "decompressed output exceeds expected size".into(),
+        ));
+    }
+    writer
+        .flush()
+        .map_err(|e| Error::Compress(format!("flush: {e}")))?;
+    let digest = sha.finalize();
+    Ok(DecompressStreamOutcome {
+        output_size: written,
+        crc32: crc.finalize(),
+        sha256: digest.into(),
+    })
+}
+
 /// wasm32 decompress stub.
 ///
 /// The native zstd/xz C libraries do not compile under `wasm32-unknown-unknown`,
