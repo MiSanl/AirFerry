@@ -8,7 +8,14 @@
 - CMake 3.22.1（通过 SDK Manager 安装）
 - Rust + cargo-ndk + Android targets（见 [dev-setup.md](dev-setup.md)）
 
-## 构建 Rust JNI 库
+## 构建 Rust JNI 库（自动，无需手动）
+
+`assembleDebug` / `assembleRelease` 会自动在打包 JNI `.so` 前重编 Rust
+`transfer_engine` 库（Gradle `compileRustJni` task，是
+`merge*JniLibFolders` 的前置依赖）。因此**本地构建的 APK 永远不会打进旧的
+`.so`**——APK 内的原生库始终与工作区 `core/` 源码匹配。无需手动跑 `cargo ndk`。
+
+若确需手动单独重编（调试 native 代码 / 单独验证），等价命令：
 
 ```bash
 export ANDROID_HOME=/path/to/android-sdk
@@ -21,6 +28,12 @@ cargo ndk -t arm64-v8a \
 ```
 
 产物：`apps/scanner/app/src/main/jniLibs/arm64-v8a/libtransfer_engine.so`
+
+> **为什么必须自动重编（v1.2.0 修复）**：曾出现「设备上应用显示 1.2.0 /
+> versionCode 14，但 APK 内的 Rust JNI 库是旧版、缺少 v5 分段代码」，表现为
+> 安卓扫码 >32 MiB 一直「正在同步」（Web 用最新 WASM 不受影响）。两层防护：
+> ① Gradle 在打包 APK 前自动重编 Rust JNI；② 启动时做 native ABI/协议版本
+> 握手（`NativeBridge.nativeAbiVersion()`，见「启动期 JNI 版本握手」）。
 
 ## 构建 APK
 
@@ -42,6 +55,17 @@ EOF
 产物：
 - Debug：`app/build/outputs/apk/debug/app-debug.apk`
 - Release：`app/build/outputs/apk/release/app-release.apk`
+
+### 启动期 JNI 版本握手（v1.2.0）
+
+`ScanActivity` 启动自检在创建/销毁一个 receiver 之前，先调用
+`NativeBridge.nativeAbiVersion()` 并断言其 `>= NativeBridge.NATIVE_ABI_VERSION`
+（= `1`，对应 `AIRFERRY_NATIVE_ABI_VERSION`，描述支持 descriptor-v5 分段接收）。
+
+旧 `.so` 要么没有该符号（调用抛 `UnsatisfiedLinkError`）要么报更低版本——两种
+情况都会在加载相机前直接进入 `ErrorScreen`「原生库版本过旧」，而**不会**让
+`receiverCreate` 自检通过后静默地在 >32 MiB 传输上停在「正在同步」。这正是
+「旧 `.so` 不再伪装成可用版本」的兜底。
 
 ### 关于 APK 体积（R8 优化）
 

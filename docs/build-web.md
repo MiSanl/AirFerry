@@ -8,9 +8,11 @@
 - npm
 - **`apps/sender/wasm-pkg-simd/` 必须完整**（Rust WASM 现代产物，网页端复用它，不单独编译 Rust）
 
-## 构建 WASM 核心（一次性前置）
+## 构建 WASM 核心
 
-网页端复用浏览器扩展的 Rust WASM 产物。首次构建前需在 sender 下生成：
+网页端复用浏览器扩展的 Rust WASM 产物。**用 `build-all.sh web` / `release` 构建时无需手动前置**——v1.2.0 起 `build_web` 会自动 `npm run wasm` 重编 `wasm-pkg-simd/`，并调 `scripts/build-fastzxing.sh --use-cache` 重编 FAST ZXing-C++（`airferry_zxing.js/.wasm`），确保进包的都是最新源码产物而非旧中间产物。
+
+若直接在 `apps/web` 下跑 `npm run build`，则需先在 sender 下生成 WASM（首次或源码变更后）：
 
 ```bash
 cd apps/sender
@@ -21,6 +23,8 @@ npm run wasm           # 生成 legacy/simd 两个变体
 > 网页端明确使用现代/MV3 变体。`prepare-wasm.cjs` 每次都校验 sender 的 `wasm-pkg-simd`，持跨进程锁原子复制到 **web 自有**的 `apps/web/wasm-pkg/`；扩展构建切换自己的 MV2/MV3 包时不会改动 Vite 正在读取的文件。
 
 > 若 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}` 不完整，`predev`/`prebuild`/`prebuild:standalone` 会报错退出并提示先跑此步。
+
+> **FAST ZXing-C++（接收端加速后端）**：`build_web` 在 **emcc 可用时**通过 `scripts/build-fastzxing.sh --use-cache` 重编 `airferry_zxing.js/.wasm` 到 `apps/sender/src/fastzxing/`，再被 `prepare-wasm.cjs` 拷到 `public/`（此前 `build-all.sh` 从不调用它，本地发布可能带上一次遗留的旧快路径产物）。**emcc 缺失时 `build_web` 显式 `warn`（不静默）**，接收端回退 zxing-wasm 兼容后端，构建不中断；发布前请在带 Emscripten 的环境运行 `./scripts/build-fastzxing.sh` 以确保 FAST 快路径最新。
 
 ## 构建网页端
 

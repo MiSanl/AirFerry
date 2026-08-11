@@ -119,13 +119,8 @@ npm run dev                  # Plasmo HMR 开发模式
 ### 2.3 Android 扫码端（apps/scanner）
 
 ```bash
-# ① 先构建 Rust JNI 库（cargo-ndk，必须是 APK 构建的前置）
-cargo ndk -t arm64-v8a \
-  -o apps/scanner/app/src/main/jniLibs \
-  build -p transfer-engine --features jni --release
-#   产物: apps/scanner/app/src/main/jniLibs/arm64-v8a/libtransfer_engine.so
-
-# ② 构建 APK
+# ① 构建 APK（Gradle 的 compileRustJni task 会自动先用 cargo-ndk 重编 Rust JNI，
+#    无需手动前置 cargo ndk）
 cd apps/scanner
 ./gradlew :app:assembleDebug      # 调试 APK
 ./gradlew :app:assembleRelease    # 发布 APK（必须配置 keystore.properties；缺失即失败）
@@ -133,6 +128,18 @@ cd apps/scanner
 
 adb install app/build/outputs/apk/release/app-release.apk
 ```
+
+> **Rust JNI 自动重编（v1.2.0 防护 ①）**：`assembleDebug`/`assembleRelease` 的
+> `merge*JniLibFolders` 前置依赖 `compileRustJni`，后者先跑
+> `cargo ndk -t arm64-v8a -o apps/scanner/app/src/main/jniLibs build -p transfer-engine --features jni --release`
+> 再打包 → 本地构建的 APK 永远不打包旧 `.so`（修复：设备上显示 1.2.0/versionCode 14
+> 但 APK 内 JNI 库是旧版、缺 v5 分段代码 → 安卓扫码 >32 MiB 一直「正在同步」，
+> Web 用最新 WASM 不受影响）。
+> **Native ABI 版本握手（v1.2.0 防护 ②）**：`ScanActivity` 启动自检先调
+> `NativeBridge.nativeAbiVersion()` 并断言 `>= NATIVE_ABI_VERSION(1)`
+> （= jni.rs `AIRFERRY_NATIVE_ABI_VERSION`，对应 descriptor-v5 分段能力）。旧 `.so`
+> 缺符号抛 `UnsatisfiedLinkError` 或报更低版本 → 直接 `ErrorScreen`「原生库版本过旧」，
+> 不伪装可用。
 
 > ZXing-C++（`libairferry_zxing.so`）由 Gradle 的 CMake 任务在首次 APK 构建时从 GitHub 拉取 v3.0.2 自动编译（需网络；缓存后离线可用）。
 > **16 KiB 页对齐**：Android 15+ 的 16 KiB 页设备会拒绝 `dlopen` 仅 4 KiB 对齐的 `.so`（表现：所有 QR 解码静默失败）。`cpp/CMakeLists.txt` 用 `-Wl,-z,max-page-size=16384` 强制对齐；Rust `.so` 由 cargo-ndk 默认对齐。验证：`llvm-readelf -l lib*.so | grep LOAD`（Align 列应为 `0x4000`）。
@@ -188,7 +195,7 @@ npm run preview        # 本地预览构建产物
 |--------|------|---------------------|
 | `all`（默认） | `build_sender` + `build_web` + `build_scanner` | ✅（scanner） |
 | `sender` | 双 wasm 产物 + 扩展 4 目标 | — |
-| `web` | `npm run build`（apps/web，Vite 静态站点；自动跑 `prebuild`→prepare-wasm 校验 sender `wasm-pkg-simd/`、复制私有快照 + 拷 `wasm-zstd.wasm`） | — |
+| `web` | 先 `npm run wasm` 重编 WASM + `build-fastzxing.sh --use-cache` 重编 FAST ZXing-C++，再 `npm run build`（apps/web，Vite 静态站点；`prebuild`→prepare-wasm 复制私有快照 + 拷 `wasm-zstd.wasm`/`zxing_reader.wasm`/`airferry_zxing.*`） | ✅（wasm 自动） |
 | `scanner` | `cargo ndk` 编译 `.so` → `./gradlew assembleRelease` | ✅ |
 | `windows` | Rust C ABI DLL + 共享 ZXing-C++ DLL → `dotnet build`（须 Windows） | ✅ |
 | `wasm` | 仅 `npm run wasm`（= build-wasm.cjs，产 legacy + simd 两份） | — |
@@ -210,7 +217,7 @@ npm run preview        # 本地预览构建产物
 - **版本号**：从 `apps/sender/package.json` 的 `version` 读取（`read_version()`），与扩展 manifest 同源。改版本改这一处即可被脚本读取，但 APK/扩展本身的版本号仍需手动同步（见 §2.7）。
 - **`build_scanner` 自动跑 cargo-ndk**：在 `./gradlew assembleRelease` **之前**先用 `cargo ndk -t arm64-v8a ... build -p transfer-engine --features jni --release` 编译 `libtransfer_engine.so` 到 `jniLibs/`。这是为了避免打进过期 `.so`（AirFerry 重命名后旧符号 `com.easytransfer.*` 与 Kotlin 新包名对不上会 `UnsatisfiedLinkError` 闪退）。因此 `scanner`/`all`/`release` 子命令都自带这步，无需手动前置。
 - **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android 直接保留 v1.1.3 的 `scan_jni.cpp`，Windows 通过 `core/zxing-decoder/` 镜像同一解码选项与全帧/ROI 调度模式。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
-- **`build_web` 不编译 Rust**：`cd apps/web && npm run build`（Vite 静态站点），`prebuild` 会跑 `prepare-wasm.cjs` 校验 `apps/sender/wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`，持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` 到 `public/`。web 明确复用现代 WASM，**首次构建前须先 `cd apps/sender && npm run wasm`**。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
+- **`build_web` 先重编原生 lib 再构建**：v1.2.0 起 `build_web` **不再只是复制旧中间产物**，而是先 `build_wasm`（`npm run wasm` 重编 `wasm-pkg-simd/`）+ emcc 可用时调 `scripts/build-fastzxing.sh --use-cache`（重编 FAST ZXing-C++ `airferry_zxing.js/.wasm` 到 `apps/sender/src/fastzxing/`），再 `cd apps/web && npm run build`（Vite 静态站点）。`prebuild` 的 `prepare-wasm.cjs` 校验 `wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`、持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` + `zxing_reader.wasm` + `airferry_zxing.*` 到 `public/`。**emcc 缺失时显式 `warn`（不静默），接收端回退 zxing-wasm 兼容后端，构建不中断**——发布前请在带 Emscripten 的环境运行 `./scripts/build-fastzxing.sh` 以确保 FAST 快路径最新。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
 - **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥必须预先位于 `dist/airferry-extension.pem`；脚本核对固定公钥 SHA-256 后才签名，缺失/换钥直接失败，绝不自动生成新 ID。找不到 Chrome 二进制时跳过 crx、仅留 zip。
 - **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,receiver-web-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
 
@@ -292,7 +299,7 @@ npm run preview        # 本地预览构建产物
 ### ⚠️ 关键依赖顺序（最容易踩的坑）
 
 1. **WASM 双产物必须先于扩展构建**：`npm run build` 已内嵌 `build-wasm.cjs`（产 `wasm-pkg-legacy/` + `wasm-pkg-simd/`）再 `build-all.cjs`，故一条命令搞定。但**单独跑 `npm run build:chrome-mv3` 等单目标脚本不自动跑 wasm**——需先 `npm run wasm` 产出双产物，否则 `build-all.cjs` 的 `useWasmPkg()` 会因 `wasm-pkg-*/` 缺失报错退出。（`build-all.sh sender/release` 走 `npm run build`，不会踩坑。）
-2. **JNI `.so` 必须先于 APK 构建**：`cargo ndk ... build` 产出 `libtransfer_engine.so` 到 `jniLibs/` 后，`./gradlew` 才能打包进 APK。**`build-all.sh` 的 `scanner`/`all`/`release` 子命令会自动先跑 cargo-ndk**（见 §2.5），所以走脚本不会踩坑；但**若单独手动跑 `./gradlew`**（不经脚本），必须自己先跑 cargo-ndk，否则 APK 会带过期/缺失的 `.so`、扫码端运行时 `UnsatisfiedLinkError` 闪退。
+2. **JNI `.so` 必须先于 APK 构建（v1.2.0 起已由 Gradle 自动保证）**：Gradle 的 `compileRustJni` task（`merge*JniLibFolders` 的前置）会在打包 APK 前自动 `cargo ndk ... build` 产出最新 `libtransfer_engine.so` 到 `jniLibs/`——**手动 `./gradlew` 也不用再先跑 cargo-ndk**。`build-all.sh` 的 `scanner`/`all`/`release` 子命令仍额外先跑一次 cargo-ndk（双保险，见 §2.6）。历史坑（v1.2.0 之前）：手动 `./gradlew` 而未经脚本会打进过期 `.so` → 扫码端运行时 `UnsatisfiedLinkError` 或 >32 MiB 传输「正在同步」卡死。
 3. **两个 native DLL 都必须先于 C# 构建**：cargo 产出 `transfer_engine.dll`，CMake 产出 `airferry_zxing.dll`，二者放入 `runtime/` 后 `dotnet build` 才会打包到 exe 同目录。**`build-windows.ps1`/`build-all.sh windows` 会自动构建、测试并复制二者**（见 §2.5）；若只手动跑 `dotnet build`，运行时会在引擎或二维码解码的首个 P/Invoke 处抛 `DllNotFoundException`。
 4. **`dist` 子命令不重新构建**：它假设 `apps/sender/build/` 与 APK 已就绪（Windows zip 可选），只做复制/签名/打包。缺 sender/scanner 产物会 `error` 退出；缺 Windows 产物则 `warn` 跳过（因为 Windows 端只能在 Windows 上构建）。
 5. **版本号同步（发版必查）**：`build-all.sh` 的发布文件名版本取自 `apps/sender/package.json`；下列**全部**须同一版本号：
@@ -462,7 +469,8 @@ npm run preview        # 本地预览构建产物
 | **网页端启动报 transfer_engine.js 找不到** | `apps/sender/wasm-pkg-simd/` | web 从 sender 现代产物复制自有快照；首次构建前需 `cd apps/sender && npm run wasm`。`prepare-wasm.cjs` 会校验并报清晰错误 |
 | **`release`/`dist` 产物缺 web zip** | `apps/web/dist/` | `pack_dist` 用 warn 模式（非中断）：`apps/web/dist/` 缺失时跳过 web zip。先跑 `./scripts/build-all.sh web` 再 `dist`/`release` |
 | 扩展构建缺 WASM | `apps/sender/wasm-pkg-legacy/` 或 `wasm-pkg-simd/` | 单独跑 `npm run build:chrome-mv3` 等单目标脚本前忘了先 `npm run wasm`（双产物缺失） |
-| APK 缺 native 库 | `jniLibs/arm64-v8a/libtransfer_engine.so` | 手动跑 `./gradlew` 而未经 `build-all.sh`（后者已自动先跑 cargo-ndk） |
+| APK 缺 native 库 | `jniLibs/arm64-v8a/libtransfer_engine.so` | v1.2.0 起 Gradle `compileRustJni` 已自动前置，正常不会缺；若缺说明编译环境（cargo-ndk / NDK）有问题 |
+| 安卓 >32 MiB 一直「正在同步」/ JNI 版本过旧 | `core/transfer-engine/src/jni.rs` `AIRFERRY_NATIVE_ABI_VERSION` + `NativeBridge.nativeAbiVersion()` | APK 内 `.so` 是旧版（缺 v5 分段符号）。v1.2.0 双防护：Gradle 自动重编 + 启动 ABI 握手拒绝旧库。设备上旧 APK 需卸载重装最新版 |
 | Windows 端 DllNotFoundException | `apps/windows/AirFerry.Windows/runtime/{transfer_engine,airferry_zxing}.dll` | 手动跑 `dotnet build` 而未经 `build-windows.ps1`；后者会自动构建、测试并复制 Rust 引擎与 ZXing-C++ 两个 DLL |
 | Windows 端 EntryPointNotFoundException | `apps/windows/AirFerry.Windows/Native/NativeBridge.cs` | `[DllImport]` 缺 `EntryPoint`：P/Invoke 默认按 PascalCase C# 方法名查找，但 Rust `cffi.rs` 导出的是 snake_case `airferry_*`。**首个 native 调用即抛**（热路径 `ReceiverIngest` → 扫第一个码就崩），CI 协议层单测测不到。修复：每个声明钉死 `EntryPoint = "airferry_receiver_ingest"` 等 |
 | Windows 端设备打不开 | `DeviceEnumerator.cs` + `VideoCapture.cs` | 设备被其他程序独占；或 DirectShow 驱动问题（换 MSMF 后端或换设备） |

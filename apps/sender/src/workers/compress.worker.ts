@@ -70,6 +70,26 @@ import { buildBundle, MAX_ORIGINAL_BYTES } from "@/wasm/bundle"
 import { buildTextPayload, TEXT_DISPLAY_NAME } from "@/wasm/text"
 import { normalizeDraftFilename } from "@/storage/textDrafts"
 
+/**
+ * Single-file read ceiling for the browser sender.
+ *
+ * `file.arrayBuffer()` reads the whole file into one contiguous buffer. On a
+ * memory-constrained tab this either OOMs or silently returns a *shorter* buffer
+ * than the file (observed: a 5 GB file came back as ~1193 MB), which then ships
+ * a corrupt / truncated payload. Cap single-file reads here and reject oversized
+ * files up front with a clear error instead of encoding broken data.
+ * Segmentation happens *after* compression, so a single oversized input still
+ * has to fit in memory all at once.
+ */
+const MAX_SINGLE_READ_BYTES = 1 * 1024 * 1024 * 1024 // 1 GiB
+
+/** Human-readable byte count (mirrors ParamsPage.formatBytes). */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
 /** Decimal-string form of the 128-bit session id, clone-safe across threads. */
 export interface SessionIdDto {
   lo: string
@@ -290,8 +310,26 @@ async function processFiles(files: File[], jobId: number) {
       sessionId = deriveSessionId(namesJoined, BigInt(raw.length), BigInt(mtimeMax), fp)
     } else {
       const f = files[0]
+      // Reject oversized single files before reading: `file.arrayBuffer()`
+      // loads the whole file into one buffer and can OOM / silently truncate on
+      // very large inputs. Check size up front and give a clear error instead of
+      // shipping a corrupt payload.
+      if (f.size > MAX_SINGLE_READ_BYTES) {
+        throw new Error(
+          `文件过大（${formatBytes(f.size)}），当前发送端单文件上限为 ` +
+            `${MAX_SINGLE_READ_BYTES / (1024 * 1024)} MiB。请将文件拆分后分别发送。`
+        )
+      }
       raw = new Uint8Array(await f.arrayBuffer())
       if (!isCurrent(jobId)) return
+      // Defensive: the browser may still return a short buffer even under the
+      // cap. Never encode a truncated payload.
+      if (raw.length !== f.size) {
+        throw new Error(
+          `文件读取不完整（期望 ${formatBytes(f.size)}，实际 ${formatBytes(raw.length)}），` +
+            `请重试或拆分文件后发送。`
+        )
+      }
       displayName = f.name
       const fp = computeFingerprint(raw)
       sessionId = deriveSessionId(f.name, BigInt(f.size), BigInt(f.lastModified), fp)

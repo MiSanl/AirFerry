@@ -156,13 +156,34 @@ class ScanActivity : ComponentActivity() {
         // timeout automatically.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // JNI self-test
-        val jniOk = try {
-            val h = NativeBridge.receiverCreate(0L, 1L, 1, 100, 1024)
-            NativeBridge.receiverDestroy(h)
-            true
+        // JNI self-test + native ABI version handshake.
+        // The version check must come first: a stale `.so` from an older APK
+        // lacks the v5 segmented-receive symbol, so `nativeAbiVersion()` throws
+        // `UnsatisfiedLinkError` while the (older) `receiverCreate` still works —
+        // the old library would otherwise pass the create/destroy self-test and
+        // then stall forever at "正在同步" on >32 MiB segmented transfers.
+        var abiVersion = -1
+        val abiOk = try {
+            abiVersion = NativeBridge.nativeAbiVersion()
+            abiVersion >= NativeBridge.NATIVE_ABI_VERSION
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "JNI ABI version symbol missing (stale native lib)", e)
+            false
         } catch (e: Exception) {
-            Log.e(TAG, "JNI self-test FAILED", e); false
+            Log.e(TAG, "JNI ABI version query FAILED", e)
+            false
+        }
+
+        val jniOk = if (!abiOk) {
+            false
+        } else {
+            try {
+                val h = NativeBridge.receiverCreate(0L, 1L, 1, 100, 1024)
+                NativeBridge.receiverDestroy(h)
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "JNI self-test FAILED", e); false
+            }
         }
         updateUi {
             it.copy(
@@ -171,7 +192,16 @@ class ScanActivity : ComponentActivity() {
             )
         }
         if (!jniOk) {
-            setContent { ErrorScreen("原生库加载失败，请重新安装应用。") }
+            setContent {
+                ErrorScreen(
+                    if (abiOk) {
+                        "原生库加载失败，请重新安装应用。"
+                    } else {
+                        "原生库版本过旧（ABI v$abiVersion，需要 v${NativeBridge.NATIVE_ABI_VERSION}），" +
+                            "请卸载后重新安装最新版应用。"
+                    }
+                )
+            }
             return
         }
 

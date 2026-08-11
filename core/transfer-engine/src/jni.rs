@@ -15,6 +15,30 @@ use jni::sys::{jboolean, jint, jlong, jsize};
 use jni::JNIEnv;
 use qr_protocol::frame::SessionIdRaw;
 
+/// ABI / protocol capability version of this JNI library.
+///
+/// The outer QR frame format stays at protocol version 1 (`SessionId::derive_segment`
+/// demultiplexes large-file segments by session id); this counter is a
+/// *separate* Android-side capability marker that advances whenever the native
+/// library gains behaviour the Kotlin host depends on. It is bumped once (to
+/// `1`) for the descriptor-v5 segmented (large-file) receive path.
+///
+/// The host (`NativeBridge.nativeAbiVersion`) handshakes on startup: if the
+/// loaded `.so` predates this symbol (`UnsatisfiedLinkError`) or reports a
+/// lower version, the app refuses to run as a receiver instead of silently
+/// "staying synchronising" on >32 MiB transfers with a stale library.
+pub const AIRFERRY_NATIVE_ABI_VERSION: jint = 1;
+
+/// Report the native ABI / protocol capability version. Returns
+/// [`AIRFERRY_NATIVE_ABI_VERSION`].
+#[no_mangle]
+pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_nativeAbiVersion(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    AIRFERRY_NATIVE_ABI_VERSION
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverCreate(
     _env: JNIEnv,

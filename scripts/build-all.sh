@@ -139,10 +139,11 @@ build_scanner() {
   export ANDROID_HOME ANDROID_NDK_HOME
 
   # 先编译 Rust JNI 库 (libtransfer_engine.so) 到 jniLibs/。
-  # 这一步必须在 gradlew 之前：APK 打包时直接拷贝 jniLibs/ 里的 .so，
-  # 不会触发 cargo。若跳过这步，APK 里会带着过期的 .so（比如 EasyTransfer
-  # 重命名为 AirFerry 后，旧 .so 的 JNI 符号还是 com.easytransfer.*，
-  # 运行时 receiverCreate 抛 UnsatisfiedLinkError 直接闪退）。
+  # v1.2.0 起 Gradle 的 compileRustJni task（merge*JniLibFolders 的前置）已会在
+  # assembleRelease 时自动重编，此处的显式 cargo-ndk 作为双保险保留（手动单独
+  # 跑 ./gradlew 也不再需要先跑 cargo-ndk）。若跳过这步，APK 里可能带过期的
+  # .so（比如缺 v5 分段符号 → 安卓扫码 >32 MiB 一直「正在同步」，或旧 JNI 符号
+  # com.easytransfer.* → receiverCreate 抛 UnsatisfiedLinkError 闪退）。
   # 详见 docs/build-android.md。
   info "编译 Rust JNI 库 (core/transfer-engine --features jni → jniLibs/arm64-v8a/) ..."
   cargo ndk -t arm64-v8a -o "$ROOT/apps/scanner/app/src/main/jniLibs" \
@@ -203,10 +204,26 @@ build_windows() {
 
 build_web() {
   info "构建网页端 — 发送端 dist/ + 接收端 dist-receiver/（各自独立 zip）..."
+
+  # 保证 web 打包的每个原生 lib 都来自最新源码，而非复用旧的中间产物：
+  #  ① Rust WASM（transfer_engine_bg.wasm）— 重编 wasm-pkg-simd，避免单独跑
+  #     build_web 时 prepare-wasm.cjs 只复制 sender 的旧产物（它仅校验存在、不
+  #     校验 freshness）。cargo 增量使 all/release 流程中的重复编译开销极小。
+  #  ② FAST ZXing-C++（airferry_zxing.js/.wasm）— emcc 可用时重编，防止 build-all.sh
+  #     从不调用 build-fastzxing.sh 而把上一次遗留的旧 .wasm 打进接收端；emcc
+  #     缺失时**显式警告**（不静默），接收端回退 zxing-wasm 兼容后端，构建不中断。
+  build_wasm
+  if command -v emcc >/dev/null 2>&1; then
+    info "重编 FAST ZXing-C++ 快路径 (airferry_zxing.js/.wasm → apps/sender/src/fastzxing/) ..."
+    "$ROOT/scripts/build-fastzxing.sh" --use-cache
+  else
+    warn "未找到 emcc（Emscripten），跳过 FAST ZXing-C++ 重编。接收端将使用 apps/sender/src/fastzxing/ 现有产物，缺失则回退 zxing-wasm 兼容后端。发布前请在带 Emscripten 的环境运行: ./scripts/build-fastzxing.sh"
+  fi
+
   # npm run build 已内嵌 prebuild（prepare-wasm.cjs）：校验 sender 的现代
   # wasm-pkg-simd，持锁复制到 web 自有 wasm-pkg/，再拷 wasm-zstd.wasm +
-  # zxing_reader.wasm 到 public/。首次构建前须 cd apps/sender && npm run wasm；
-  # 产物缺失时脚本非零退出，npm run build 失败，set -e 中断。
+  # zxing_reader.wasm 到 public/。产物缺失时脚本非零退出，npm run build 失败，
+  # set -e 中断。
   cd "$ROOT/apps/web"
   # ① 发送端：vite.config.ts 单入口 index.html → dist/
   npm run build 2>&1 | grep -E 'built in|error|✖' | while read -r line; do info "$line"; done

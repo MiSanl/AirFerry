@@ -12,6 +12,20 @@ object NativeBridge {
         System.loadLibrary("transfer_engine")
     }
 
+    /**
+     * Native ABI / protocol capability version (see
+     * `AIRFERRY_NATIVE_ABI_VERSION` in `core/transfer-engine/src/jni.rs`).
+     * The current library ships version `1` (descriptor-v5 segmented /
+     * large-file receive path). A stale `.so` either lacks this symbol
+     * (calling it throws `UnsatisfiedLinkError`) or reports an older version —
+     * either way the host must refuse to run instead of silently "staying
+     * synchronising" on >32 MiB transfers.
+     */
+    const val NATIVE_ABI_VERSION = 1
+
+    /** Report the native ABI / protocol capability version. */
+    external fun nativeAbiVersion(): Int
+
     /** Create a receiver session. Returns an opaque pointer (Long). */
     external fun receiverCreate(
         sessionIdLo: Long,

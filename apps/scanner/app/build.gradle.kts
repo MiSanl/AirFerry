@@ -107,6 +107,43 @@ android {
     }
 }
 
+// ---- Native Rust JNI (libtransfer_engine.so) auto-rebuild ----
+// The APK ships a Rust cdylib (`transfer_engine`) compiled via cargo-ndk
+// straight into `src/main/jniLibs`. If that `.so` is stale (built from an
+// older core), the Kotlin segmented-receive path calls native symbols that
+// don't exist and the app hangs at "正在同步" on >32 MiB transfers — while the
+// Web receiver (latest WASM) keeps working. Rebuilding the Rust JNI library on
+// every APK build guarantees the packaged `.so` always matches the checked-in
+// core sources, so a locally-built APK can never ship a stale native lib again.
+val compileRustJni = tasks.register<Exec>("compileRustJni") {
+    group = "build"
+    description = "Compile the Rust transfer_engine JNI library (.so) via cargo-ndk."
+    workingDir = rootProject.file("../..") // AirFerry/ workspace root
+    // cargo-ndk discovers the NDK itself from ANDROID_NDK_HOME / ANDROID_HOME /
+    // ANDROID_SDK_ROOT (same as the manual `cargo ndk` invocation in
+    // scripts/build-all.sh). Pass through any already-exported vars so a
+    // bare `./gradlew` still finds the NDK without extra setup.
+    doFirst {
+        for (v in listOf("ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT")) {
+            val value = System.getenv(v)
+            if (!value.isNullOrBlank()) {
+                environment(v, value)
+            }
+        }
+    }
+    commandLine(
+        "cargo", "ndk", "-t", "arm64-v8a",
+        "-o", rootProject.file("app/src/main/jniLibs").absolutePath,
+        "build", "-p", "transfer-engine", "--features", "jni", "--release",
+    )
+}
+// Run before the JNI .so is merged into the APK for either variant.
+tasks.matching {
+    it.name.startsWith("merge") && it.name.endsWith("JniLibFolders")
+}.configureEach {
+    dependsOn(compileRustJni)
+}
+
 // A release artifact must never silently fall back to the public debug key.
 gradle.taskGraph.whenReady {
     val buildsRelease = allTasks.any { task ->
