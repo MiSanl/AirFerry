@@ -31,6 +31,27 @@
   font-size: 13px;
 }
 
+/* 原生端建议横幅：web 接收端因浏览器摄像头管道 + JS/WASM 解码，
+   性能结构性低于原生端（Android/Windows），提示用户优先用原生端。 */
+.receive-native-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: -8px 0 16px;
+  padding: 10px 12px;
+  background: var(--color-primary-light);
+  border: 1px solid var(--color-primary-ring);
+  border-left: 3px solid var(--color-primary);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.receive-native-hint .hint-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
 /* 相机区卡片：黑色画面底 + 统一圆角/边框，与发送端卡片观感一致 */
 .camera-area {
   position: relative;

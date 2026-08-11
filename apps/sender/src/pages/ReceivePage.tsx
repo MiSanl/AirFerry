@@ -1197,6 +1197,15 @@ export function ReceivePage(): React.ReactElement {
       </header>
 
       <main className="app-main">
+        <div className="receive-native-hint" role="note">
+          <span className="hint-icon" aria-hidden="true">
+            ⚠️
+          </span>
+          <span>
+            网页版接收端受浏览器摄像头与解码性能限制，速度明显低于原生端。
+            追求满速、稳定的大文件恢复，建议使用 Android 或 Windows 原生接收端。
+          </span>
+        </div>
         <div className="receive-stage">
           {(stage === "camera" || stage === "scanning" || stage === "recovering") && (
             <div className="camera-area">
