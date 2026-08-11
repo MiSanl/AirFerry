@@ -341,7 +341,7 @@ npm run preview        # 本地预览构建产物
 | QR 矩阵（动态最小版本） | `core/qr-protocol/src/qr_render.rs`（`encode` / `min_version_for`） | fast_qr；1464B(T=1400)→V27，1088B(T=1024)→V23，576B(T=512)→V16 |
 | **发送端帧流入口** | `core/transfer-engine/src/sender.rs`（`next_frame`） | 每16帧插描述符，首帧即描述符 |
 | 持续新鲜修复符号 | `core/transfer-engine/src/sender.rs`（`next_symbol_id`） | 源一遍→不重复修复；ESI 达 2²⁴ 时明确停止 |
-| **接收端摄入入口** | `core/transfer-engine/src/receiver.rs`（`pub fn ingest`） | 缓存引导→描述符确认 OTI→喂解码器；预描述符 `symbol_cache` 上限 `PRE_META_SYMBOL_CACHE_MAX=12000` |
+| **接收端摄入入口** | `core/transfer-engine/src/receiver.rs`（`pub fn ingest`） | 缓存引导→描述符确认 OTI→喂解码器；预描述符 `symbol_cache` 上限 `pre_meta_cache_max()` 动态缩放（下限 `PRE_META_SYMBOL_CACHE_MAX`=12000，预算 `MAX_OBJECT_BYTES`≈32 MiB） |
 | 描述符载荷解析 | `core/transfer-engine/src/descriptor.rs`（`parse_payload`） | v1/v2/v3 + v2/v3 消歧；v4 分段尾段（`build_segment_payload`/`parse_segment_payload`） |
 | 大文件分段（descriptor v4，压缩后分段） | `core/transfer-engine/src/segment.rs` + `assembler.rs` | 逻辑传输整段压缩一次后按**压缩字节流**切成段；固定 `SEGMENT_RAW_BYTES = MAX_OBJECT_BYTES − MAX_SYMBOL_SIZE ≈ 31.9 MiB`、`MAX_SEGMENT_COUNT=131072`。104B v4 尾部携带 `root_sha256`（解压后原文摘要）+ `raw_sha256`（本段压缩字节摘要），强制 child id / 压缩流大小 / 段数 / 规范偏移 / 压缩长度 ≤ 规范切片。接收端按序拼接压缩段后**只解压一次**，再校验长度 + CRC32 + 根摘要；原生端用 `qr_protocol::compress::decompress_stream_to_file` **流式解压写盘**（bounded RAM，>256 MiB 超大文件可收）。`TransferAssembler` 仅是便利内存实现；Web 用 IndexedDB，Android/Windows 用磁盘 `.partial` |
 | 进度快照 | `core/transfer-engine/src/progress.rs` | `Progress` / `Stats` |

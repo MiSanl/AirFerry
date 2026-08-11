@@ -2,15 +2,43 @@
 
 use crate::{progress::Progress, Error, Result};
 use qr_protocol::{frame::SessionIdRaw, Frame};
-use raptorq_core::{Decoder, ObjectMeta, Symbol, MAX_ORIGINAL_BYTES};
+use raptorq_core::{Decoder, ObjectMeta, Symbol, MAX_OBJECT_BYTES, MAX_ORIGINAL_BYTES};
 use std::collections::{HashMap, HashSet};
 use std::vec::Vec;
 
-/// Hard cap on pre-descriptor bootstrap symbols held in [`ReceiverSession`]'s
-/// replay cache. Fountain codes tolerate drops; bounding the cache prevents a
-/// CRC-valid hostile stream that never supplies a descriptor from OOM-killing
-/// the receiver process. At T≈1400 this is ~16 MiB of payload storage.
+/// Floor on the pre-descriptor bootstrap-symbol budget held in
+/// [`ReceiverSession`]'s replay cache. The effective cap is computed by
+/// [`pre_meta_cache_max`]: it scales with `pending_symbol_size` up to a ~32 MiB
+/// wire-payload budget ([`MAX_OBJECT_BYTES`]), floored at this value so tiny
+/// symbol sizes still get a reasonable buffer. Fountain codes tolerate drops;
+/// bounding the cache prevents a CRC-valid hostile stream that never supplies a
+/// descriptor from OOM-killing the receiver process.
 pub const PRE_META_SYMBOL_CACHE_MAX: usize = 12_000;
+
+/// Pre-descriptor bootstrap cache ceiling in *bytes* of wire payload. Bounded
+/// by [`MAX_OBJECT_BYTES`] — a single receiver session (whether a standalone
+/// object or one segment of a descriptor-v4 transfer) can hold at most that
+/// much payload, so allowing the replay cache to grow to the same budget cannot
+/// let a hostile stream allocate more RAM than the decoder itself is bounded to.
+const PRE_META_CACHE_BYTES_BUDGET: u64 = MAX_OBJECT_BYTES;
+
+/// Compute the current pre-descriptor bootstrap cache cap for the given
+/// `pending_symbol_size` (bytes per symbol from the frame header, 0 before any
+/// frame). This replaces the old *fixed* 12k-symbol cap: for a large object
+/// (T≈1400 → 12k symbols is only ~17 MiB) the fixed cap was hit *before* the
+/// descriptor arrived, pinning the "已识别符号" gauge at 12000 for several
+/// seconds until the descriptor replay resumed progress. Scaling by symbol size
+/// lets the cache absorb most of an object's symbols while waiting, while still
+/// bounding hostile-stream payload RAM to the same ~32 MiB budget the decoder
+/// itself is limited to.
+fn pre_meta_cache_max(pending_symbol_size: u32) -> usize {
+    if pending_symbol_size == 0 {
+        return PRE_META_SYMBOL_CACHE_MAX;
+    }
+    let budget_bytes = usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap_or(usize::MAX);
+    let by_size = budget_bytes.div_ceil(pending_symbol_size as usize);
+    by_size.max(PRE_META_SYMBOL_CACHE_MAX)
+}
 
 /// A receiver session.
 ///
@@ -290,7 +318,7 @@ impl ReceiverSession {
             if self.symbol_cache.contains_key(&key) {
                 // Duplicate while bootstrapping — keep the first copy.
                 self.progress.frames_duplicate += 1;
-            } else if self.symbol_cache.len() >= PRE_META_SYMBOL_CACHE_MAX {
+            } else if self.symbol_cache.len() >= pre_meta_cache_max(frame.header.symbol_size) {
                 // Cap reached: refuse new keys so RAM stays bounded. Count as
                 // corrupt so hosts can surface "waiting for descriptor / cache
                 // full" rather than silent progress.
@@ -923,46 +951,56 @@ mod tests {
         assert!(rx.progress().frames_corrupt > corrupt_before);
     }
 
-    /// Pre-descriptor bootstrap cache must refuse growth past
-    /// [`PRE_META_SYMBOL_CACHE_MAX`] so a hostile CRC-valid stream cannot OOM.
+    /// Pre-descriptor bootstrap cache must refuse growth past its (symbol-size
+    /// scaled) ceiling so a hostile CRC-valid stream cannot OOM. The ceiling
+    /// must also scale with `pending_symbol_size`, so a large object buffers
+    /// most of its symbols while waiting for the descriptor.
     #[test]
     fn pre_meta_symbol_cache_is_bounded() {
         let sid = SessionId::derive("cache-cap", 1, 0, &[]).into();
         let mut rx = ReceiverSession::new_pending(sid);
-        let payload = vec![0u8; 64];
-        // Fill to the hard cap with distinct (sbn, esi) keys.
-        for i in 0..PRE_META_SYMBOL_CACHE_MAX {
-            let f = Frame::build(sid, 0, 0, i as u32, 1, 1, 64, 1, 0, &payload);
+        let symbol_size: u32 = 64;
+        let payload = vec![0u8; symbol_size as usize];
+        let cap = pre_meta_cache_max(symbol_size);
+        // The dynamic cap must be *at least* the old fixed floor for small
+        // symbols, and scale upward as the symbol size shrinks.
+        assert!(cap >= PRE_META_SYMBOL_CACHE_MAX);
+        // Fill to the cap with distinct (sbn, esi) keys.
+        for i in 0..cap {
+            let f = Frame::build(sid, 0, 0, i as u32, 1, 1, symbol_size, 1, 0, &payload);
             let _ = rx.ingest(f).unwrap();
         }
-        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
-        assert_eq!(
-            rx.progress().received_symbols as usize,
-            PRE_META_SYMBOL_CACHE_MAX
-        );
+        assert_eq!(rx.symbol_cache.len(), cap);
+        assert_eq!(rx.progress().received_symbols as usize, cap);
         let corrupt_before = rx.progress().frames_corrupt;
         // One more distinct key must be dropped, not stored.
-        let overflow = Frame::build(
-            sid,
-            0,
-            0,
-            PRE_META_SYMBOL_CACHE_MAX as u32,
-            1,
-            1,
-            64,
-            1,
-            0,
-            &payload,
-        );
+        let overflow = Frame::build(sid, 0, 0, cap as u32, 1, 1, symbol_size, 1, 0, &payload);
         let _ = rx.ingest(overflow).unwrap();
-        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
+        assert_eq!(rx.symbol_cache.len(), cap);
         assert!(rx.progress().frames_corrupt > corrupt_before);
         // A duplicate of an already-cached key must not grow the cache either.
-        let dup = Frame::build(sid, 0, 0, 0, 1, 1, 64, 1, 0, &payload);
+        let dup = Frame::build(sid, 0, 0, 0, 1, 1, symbol_size, 1, 0, &payload);
         let dup_before = rx.progress().frames_duplicate;
         let _ = rx.ingest(dup).unwrap();
-        assert_eq!(rx.symbol_cache.len(), PRE_META_SYMBOL_CACHE_MAX);
+        assert_eq!(rx.symbol_cache.len(), cap);
         assert!(rx.progress().frames_duplicate > dup_before);
+    }
+
+    /// The pre-descriptor cache ceiling must scale with the frame's symbol size:
+    /// a large default (T≈1400) gets roughly the old fixed cap, while a tiny
+    /// symbol size gets a much larger ceiling (bounded by the ~32 MiB wire
+    /// budget), so "已识别符号" keeps climbing while waiting for the descriptor.
+    #[test]
+    fn pre_meta_cache_max_scales_with_symbol_size() {
+        // Default browser/core symbol size (T≈1400): 32 MiB / 1400 ≈ 23 960.
+        assert!(pre_meta_cache_max(1400) > PRE_META_SYMBOL_CACHE_MAX);
+        // Tiny symbols get a much larger ceiling, bounded by the wire budget.
+        assert_eq!(
+            pre_meta_cache_max(64),
+            usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap().div_ceil(64)
+        );
+        // 0 (before any frame) must still return the floor, never 0.
+        assert_eq!(pre_meta_cache_max(0), PRE_META_SYMBOL_CACHE_MAX);
     }
 
     #[test]

@@ -282,7 +282,7 @@ offset  size   field
 | 坐标守卫 | decoder 入参检查 + `ReceiverSession::ingest` | 拒绝 ESI≥2²⁴ / 载荷≠symbol_size |
 | 解压炸弹 | `compress.rs` + `receiver.rs` | XZ 解码器内存 128 MiB；**原始内容（解压后）**封顶 `MAX_ORIGINAL_BYTES`（256 MiB），**压缩对象（wire）**封顶 `MAX_OBJECT_BYTES`（32 MiB），并要求结果长度精确等于 `original_size`；两者独立约束——高度可压缩对象可 wire 小但原始大 |
 | 帧校验 | `Frame::from_bytes` | magic/version/双层 CRC |
-| 预描述符缓存封顶 | `receiver.rs` `PRE_META_SYMBOL_CACHE_MAX`（12000） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM |
+| 预描述符缓存封顶 | `receiver.rs` `pre_meta_cache_max()`（随 `pending_symbol_size` 动态缩放，下限 `PRE_META_SYMBOL_CACHE_MAX`=12000，预算 `MAX_OBJECT_BYTES`≈32 MiB） | 描述符确认前 bootstrap cache 按 (sbn,esi) 缓冲；满则丢弃新键并计 `frames_corrupt`，防 CRC 合法、无描述符的恶意码流 OOM；动态缩放避免大文件在描述符到达前"已识别符号"钉死在 12000 |
 | 描述符冻结 | `receiver.rs` `descriptor_seen` | 首个通过全部校验的 descriptor 确立 OTI、文件元数据与压缩算法；同 session 后续描述符只可完全一致，禁止中途替换解码参数 |
 | v4 分段坐标 | `segment.rs` `SegmentMeta::validate` | 校验 child id、段数上限与压缩流大小一致性、规范偏移、压缩长度 ≤ 规范切片；宿主落盘前再校验段 SHA-256，收齐后统一解压并校验长度 + CRC32 + 根 SHA-256 |
 | WASM symbol_size | `wasm.rs` `Config::new(symbol_size)` | 仅接受 64..=65528 的 8 字节倍数，禁止按字段构造绕过 |

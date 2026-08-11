@@ -528,6 +528,31 @@ class ScanActivity : ComponentActivity() {
         // stays cheap; the full progress is fetched only on the throttled UI tick.
         val status = session.ingest(payload) ?: return
 
+        // Duplicate-segment fast path (per-frame, not gated on the UI tick):
+        // once the descriptor confirms the segment metadata, if this segment is
+        // already stored in the active SegmentAssembler there is no point
+        // receiving the whole (~32 MiB) segment again — skip straight to the
+        // next one. Runs here (ingest lock) so the re-scan of a completed
+        // segment is rejected on the descriptor frame itself, before the UI
+        // even shows "receiving".
+        if (!status.complete && session.isInitialized && session.isSegmented()) {
+            val asm = segAssembler
+            val idx = session.segmentIndex()
+            if (asm != null &&
+                asm.rootSessionIdLo() == session.rootSessionIdLo() &&
+                asm.rootSessionIdHi() == session.rootSessionIdHi() &&
+                asm.hasSegment(idx)
+            ) {
+                val dupText = "第 ${idx + 1}/${session.segmentCount()} 段已接收过，自动跳过"
+                runOnUiThread {
+                    Toast.makeText(this, dupText, Toast.LENGTH_SHORT).show()
+                    updateUi { it.copy(statusText = dupText) }
+                }
+                swapReceiverForNextSegment()
+                return
+            }
+        }
+
         // UI refresh throttle: ~7 Hz is plenty for a progress bar, and keeps the
         // main thread free. Always let the final "complete" frame through.
         val now = System.currentTimeMillis()
@@ -553,27 +578,6 @@ class ScanActivity : ComponentActivity() {
         }
         val segIdx = if (segmented) session.segmentIndex() else 0
         val segCount = if (segmented) session.segmentCount() else 1
-
-        // Duplicate-segment fast path: once the descriptor is confirmed we know
-        // this segment's real index. If it is already stored in the active
-        // SegmentAssembler, there is no point receiving the whole (~32 MiB)
-        // segment again — skip straight to the next one.
-        if (progress.metaConfirmed && segmented && !status.complete) {
-            val asm = segAssembler
-            if (asm != null &&
-                asm.rootSessionIdLo() == session.rootSessionIdLo() &&
-                asm.rootSessionIdHi() == session.rootSessionIdHi() &&
-                asm.hasSegment(segIdx)
-            ) {
-                val dupText = "第 ${segIdx + 1}/$segCount 段已接收过，自动跳过"
-                runOnUiThread {
-                    Toast.makeText(this, dupText, Toast.LENGTH_SHORT).show()
-                    updateUi { it.copy(statusText = dupText) }
-                }
-                swapReceiverForNextSegment()
-                return
-            }
-        }
 
         val snapshot = FrameSnapshot(progress, fn, fs, cs, segIdx, segCount)
         if (status.complete) {
