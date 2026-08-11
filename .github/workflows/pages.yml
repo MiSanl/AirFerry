@@ -1,0 +1,92 @@
+# GitHub Pages 部署：web 发送端 + web 接收端
+#
+# 产物结构（单站点、相对 base，均可在子路径工作）：
+#   /                    → 发送端（index.html，来自 apps/web/dist）
+#   /receiver/           → 接收端（receiver.html 改名 index.html，来自 apps/web/dist-receiver）
+#
+# web 构建复用 sender 的 WASM 产物（wasm-pkg-simd），因此本 workflow 需先在
+# sender 下用 Rust/wasm-pack 编译 WASM，再构建 web 两端。
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/sender/**"
+      - "apps/web/**"
+      - "core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一 Pages 站点同一时刻只有一个部署在跑；新 push 会取消进行中的构建。
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/sender/package-lock.json
+            apps/web/package-lock.json
+
+      # sender 的 npm run wasm 需要 Rust + wasm32 目标 + wasm-pack
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Build sender WASM (wasm-pkg-simd)
+        working-directory: apps/sender
+        run: npm ci && npm run wasm
+
+      - name: Build web sender (dist/)
+        working-directory: apps/web
+        run: npm ci && npm run build
+
+      - name: Build web receiver (dist-receiver/)
+        working-directory: apps/web
+        run: npm run build:receiver
+
+      - name: Assemble GitHub Pages site
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site/receiver
+          # 发送端 → 站点根
+          cp -r apps/web/dist/. _site/
+          # 接收端 → /receiver/（receiver.html 作为该子路径的 index）
+          cp -r apps/web/dist-receiver/. _site/receiver/
+          mv _site/receiver/receiver.html _site/receiver/index.html
+          # 发送端产物不含 zxing_reader.wasm；接收端已带，无需从发送端清。
+          # 但发送端根目录可能混入接收端 wasm 的旧文件，确保干净：
+          rm -f _site/zxing_reader.wasm
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

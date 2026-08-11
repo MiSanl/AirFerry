@@ -6,8 +6,8 @@
 
 > 🤖 **AI 代理/新开发者**：先读 [AGENTS.md](AGENTS.md)（构建命令、代码导航、调试速查、文档与代码偏差清单）。跨端线格式的位级权威定义见 [docs/SPEC.md](docs/SPEC.md)。
 
-- **发送端**：浏览器扩展（Chrome / Edge / Firefox，支持 MV2 与 MV3）
-- **接收端**：Android 原生 App · Windows 桌面应用（WPF）
+- **发送端**：浏览器扩展（Chrome / Edge / Firefox，支持 MV2 与 MV3）· **网页端**（[在线版](#网页端-web-发送接收)）
+- **接收端**：Android 原生 App · Windows 桌面应用（WPF）· **网页接收端**（[在线版](#网页端-web-发送接收)）
 - **核心库**：Rust，同时编译为 **WebAssembly**（浏览器插件）、**Android Native Library**（JNI）、**Windows DLL**（C ABI，P/Invoke），保证三端编解码逻辑完全一致
 
 ## 数据流
@@ -44,6 +44,17 @@
 - ✅ 多浏览器支持（Chrome / Edge / Firefox，MV2 + MV3）
 - ✅ 多接收端：网页、Android App 与 Windows 应用复用同一 Rust 协议核心；Windows 支持摄像头 + USB/HDMI/SDI 采集卡
 
+## 网页端（Web 发送 / 接收）
+
+无需安装，浏览器直接打开（GitHub Pages 自动构建部署）：
+
+| 入口 | 地址 | 说明 |
+|------|------|------|
+| **网页发送端** | <https://UR-SillyB.github.io/AirFerry/> | 在浏览器里播放二维码视频流发送文件 |
+| **网页接收端** | <https://UR-SillyB.github.io/AirFerry/receiver/> | 用摄像头扫码恢复文件 |
+
+> ⚠️ **网页接收端**必须运行在 **HTTPS / localhost** 下才能访问摄像头（浏览器硬性安全限制）；GitHub Pages 天然是 HTTPS，直接可用。因浏览器摄像头管道 + JS/WASM 解码限制，**网页端速度低于原生端**，追求满速、稳定的大文件恢复请优先用 Android / Windows 原生接收端（见下方下载）。
+
 ## 下载安装
 
 最新版本发布在 [GitHub Release v1.2.0](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.0)。
@@ -56,13 +67,13 @@
 | `airferry-sender-chrome-mv2-v1.2.0.zip` | 同上解压加载版 |
 | `airferry-sender-firefox-mv3-v1.2.0.xpi` | Firefox 扩展，MV3（Firefox 116+） |
 | `airferry-sender-firefox-mv2-v1.2.0.xpi` | Firefox 91+ 的 MV2 兼容版 |
-| `airferry-sender-web-v1.2.0.zip` | 网页发送端静态站点，部署到任意静态托管 |
+| `airferry-sender-web-v1.2.0.zip` | 网页发送端静态站点，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
 | `airferry-sender-web-standalone-v1.2.0.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
-| `airferry-receiver-web-v1.2.0.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头 |
+| `airferry-receiver-web-v1.2.0.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
 | `airferry-receiver-android-arm64-v1.2.0.apk` | **Android 扫码端**：arm64-v8a，Android 10+，对准屏幕二维码即可接收 |
 | `airferry-receiver-windows-x64-v1.2.0.zip` | **Windows 扫码端**：x64，Windows 10+，支持摄像头 + USB/HDMI/SDI 采集卡 |
 
-> 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。
+> 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。web 发送端/接收端由 GitHub Actions `pages` workflow 自动构建并部署到 GitHub Pages（推送 `main` 即触发）。
 
 ### Android 接收端
 
