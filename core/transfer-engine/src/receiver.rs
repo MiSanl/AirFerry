@@ -997,7 +997,9 @@ mod tests {
         // Tiny symbols get a much larger ceiling, bounded by the wire budget.
         assert_eq!(
             pre_meta_cache_max(64),
-            usize::try_from(PRE_META_CACHE_BYTES_BUDGET).unwrap().div_ceil(64)
+            usize::try_from(PRE_META_CACHE_BYTES_BUDGET)
+                .unwrap()
+                .div_ceil(64)
         );
         // 0 (before any frame) must still return the floor, never 0.
         assert_eq!(pre_meta_cache_max(0), PRE_META_SYMBOL_CACHE_MAX);
