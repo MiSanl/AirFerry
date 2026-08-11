@@ -1192,7 +1192,6 @@ export function ReceivePage(): React.ReactElement {
         </div>
         <div className="app-title">
           <h1>AirFerry 接收端</h1>
-          <p className="subtitle">用摄像头对准发送端屏幕上的二维码视频流</p>
         </div>
       </header>
 
