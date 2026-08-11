@@ -56,9 +56,12 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
 
+      # sender 的 postinstall 含 patch-parcel-dev-server（仅扩展 dev server 的
+      # CORS 修复，对版本敏感）。CI 只需 wasm-pkg-simd，故 --ignore-scripts 跳过。
+      # build-wasm.cjs 只调 wasm-pack/cargo，不依赖 sender node_modules。
       - name: Build sender WASM (wasm-pkg-simd)
         working-directory: apps/sender
-        run: npm ci && npm run wasm
+        run: npm ci --ignore-scripts && npm run wasm
 
       - name: Build web sender (dist/)
         working-directory: apps/web
