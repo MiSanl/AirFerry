@@ -842,7 +842,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
                 crcUnknown: !crcKnown, kind: "file",
                 expectedSha256Hex: asm.RootSha256Hex,
-                expectedSize: rootSize);
+                expectedSize: (long)rootSize);
             result = new RecoveryResult(
                 SingleFilePath: put.Path,
                 SingleFileSize: rootSize,
@@ -889,12 +889,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             if (!ReferenceEquals(session, _session) || !ReferenceEquals(pool, _pool))
                 return;
-            pool.RunExclusive(() =>
+            pool.RunExclusive<bool>(() =>
             {
                 session.Destroy();
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
+                return true;
             });
         }
     }
@@ -908,12 +909,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 !ReferenceEquals(session, _session) ||
                 !ReferenceEquals(pool, _pool))
                 return false;
-            pool.RunExclusive(() =>
+            pool.RunExclusive<bool>(() =>
             {
                 session.Destroy();
                 _session = new ReceiverSession();
                 Interlocked.Exchange(ref _recoveryStarted, 0);
                 pool.IngestStopped = false;
+                return true;
             });
             return true;
         }
