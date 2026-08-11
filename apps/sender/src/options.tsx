@@ -721,7 +721,10 @@ export default function App() {
             originalSize={state.prepared.rootOriginalSize}
             compressedSize={
               state.prepared.needsSegmentation
-                ? (state.prepared.segments[0]?.compressed.length ?? 0)
+                ? state.prepared.segments.reduce(
+                    (sum, seg) => sum + seg.compressed.length,
+                    0
+                  )
                 : state.prepared.compressed.length
             }
             segmentCount={state.prepared.segmentCount}

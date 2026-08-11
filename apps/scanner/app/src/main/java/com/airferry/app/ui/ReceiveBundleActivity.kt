@@ -3,6 +3,7 @@ package com.airferry.app.ui
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -93,6 +94,8 @@ class ReceiveBundleActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep the screen lit after recovery (see ReceiveDetailActivity).
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val paths = intent.getStringArrayListExtra("FILE_PATHS") ?: arrayListOf()
         val names = intent.getStringArrayListExtra("FILE_NAMES") ?: arrayListOf()

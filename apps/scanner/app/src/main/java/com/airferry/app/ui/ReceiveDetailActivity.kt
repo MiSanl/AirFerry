@@ -3,6 +3,7 @@ package com.airferry.app.ui
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -55,6 +56,11 @@ class ReceiveDetailActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep the screen lit after recovery. ScanActivity forces the screen on
+        // with FLAG_KEEP_SCREEN_ON during scanning; without it here the system
+        // timeout resumes the instant we land on the result page, so the screen
+        // visibly dims/locks right at the moment of success.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val filePath = intent.getStringExtra("FILE_PATH")
         fileName = intent.getStringExtra("FILE_NAME") ?: "received_file"

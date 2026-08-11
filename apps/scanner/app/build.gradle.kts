@@ -61,7 +61,10 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 混淆 + 死代码消除：剥离 material-icons-extended 等依赖中
+            // 未被引用的代码（3.2 万图标类）与资源，显著减小 APK 体积。
+            isMinifyEnabled = true
+            isShrinkResources = true
             // Sign only with the dedicated release keystore. The task-graph
             // guard below rejects release builds without a complete config.
             signingConfig = if (releaseSigningReady) {

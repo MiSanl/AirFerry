@@ -43,6 +43,15 @@ EOF
 - Debug：`app/build/outputs/apk/debug/app-debug.apk`
 - Release：`app/build/outputs/apk/release/app-release.apk`
 
+### 关于 APK 体积（R8 优化）
+
+Release 构建开启 R8 混淆 + 资源裁剪（`isMinifyEnabled = true` / `isShrinkResources = true`）。这是 APK 体积的主要来源优化：
+
+- **效果**：Release APK 约 **6.1 MB**（未开 R8 时约 47 MB）。其中 `classes*.dex` 从 ~44.7 MB（3 个 dex、含 3.2 万个 `material-icons-extended` 图标类）降到 ~2.6 MB（1 个 dex、未用图标类被 R8 死代码消除全部剥离）；`lib/*.so`（Rust + ZXing-C++）约 2.6 MB 不变。
+- **代价**：混淆会重命名类/方法。JNI 边界（`NativeBridge`、`ZxingDecoder`）用 `-keep` 保留类名与 `external fun` 方法名（见 `proguard-rules.pro`），否则 `Java_com_airferry_app_*` 静态 JNI 符号无法绑定 → 解码失败。`org.json` 亦因反射保留。
+- **排错**：若 Release 出现 `UnsatisfiedLinkError` 或解码静默失败，先检查 `proguard-rules.pro` 的 keep 是否覆盖新增的 JNI 类；Debug 不受影响（不混淆）。
+- 改 `proguard-rules.pro` 后需 `./gradlew :app:assembleRelease --rerun-tasks` 才会重跑 R8。
+
 ### 关于 Release 签名
 
 Release 构建的签名配置由 `apps/scanner/keystore.properties`（git-ignored）驱动：
@@ -171,9 +180,9 @@ apps/scanner/
 │   │   └── FileNameUtil.kt       # 接收文件命名（去重 / 目录）
 │   └── ui/
 │       ├── ScanActivity.kt       # 扫描页（ImageAnalysis 1920×1080；FLAG_KEEP_SCREEN_ON 防长传息屏）
-│       ├── ReceiveDetailActivity.kt
-│       ├── ReceiveTextActivity.kt    # 文字/文本类复制页
-│       ├── ReceiveBundleActivity.kt  # 多文件；.txt 等可点开复制
+│       ├── ReceiveDetailActivity.kt  # 结果页同样 FLAG_KEEP_SCREEN_ON（防止恢复瞬间系统超时接管而变暗）
+│       ├── ReceiveTextActivity.kt    # 文字/文本类复制页（同上常亮）
+│       ├── ReceiveBundleActivity.kt  # 多文件；.txt 等可点开复制（同上常亮）
 │       ├── FileListActivity.kt
 │       └── SettingsActivity.kt
         ├── jniLibs/arm64-v8a/    # Rust .so（cargo-ndk 产物）
