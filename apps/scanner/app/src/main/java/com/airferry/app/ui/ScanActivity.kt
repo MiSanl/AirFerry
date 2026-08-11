@@ -538,12 +538,16 @@ class ScanActivity : ComponentActivity() {
         if (!status.complete && session.isInitialized && session.isSegmented()) {
             val asm = segAssembler
             val idx = session.segmentIndex()
-            if (asm != null &&
+            val cnt = session.segmentCount()
+            val dup = asm != null &&
                 asm.rootSessionIdLo() == session.rootSessionIdLo() &&
                 asm.rootSessionIdHi() == session.rootSessionIdHi() &&
                 asm.hasSegment(idx)
-            ) {
-                val dupText = "第 ${idx + 1}/${session.segmentCount()} 段已接收过，自动跳过"
+            Log.w(TAG, "dupSeg: segIdx=$idx cnt=$cnt asm=${asm != null} " +
+                "rootMatch=${asm != null && asm.rootSessionIdLo() == session.rootSessionIdLo() && asm.rootSessionIdHi() == session.rootSessionIdHi()} " +
+                "hasSeg=${asm?.hasSegment(idx) ?: false} => dup=$dup")
+            if (dup) {
+                val dupText = "第 ${idx + 1}/$cnt 段已接收过，自动跳过"
                 runOnUiThread {
                     Toast.makeText(this, dupText, Toast.LENGTH_SHORT).show()
                     updateUi { it.copy(statusText = dupText) }
