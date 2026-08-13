@@ -96,8 +96,10 @@ export default defineConfig({
     },
   },
   // Relative asset base: index.html emits `./assets/...` so the site works
-  // under any sub-path without rewriting URLs. Note the worker's runtime
-  // `new URL("wasm-zstd.wasm", self.location.href)` fetch also resolves
-  // relative to the page, so wasm-zstd.wasm stays fetchable in sub-paths too.
+  // under any sub-path without rewriting URLs. wasm-zstd.wasm (site root,
+  // from public/) is fetched on the MAIN THREAD via `document.baseURI`
+  // (preloadZstdBytes) and posted to the workers (`wasm-init`), so it stays
+  // correct in sub-paths too; the worker-side fallback fetch steps up one
+  // level from its assets/ script URL (`../wasm-zstd.wasm`).
   base: "./",
 })

@@ -60,7 +60,7 @@ npm run build:standalone  # 发送端单文件版 → dist-standalone/index.html
 ```
 apps/web/dist/                     # 发送端（airferry-sender-web-v{VER}.zip）
 ├── index.html                     # 发送端入口（资源用相对路径 ./assets/...）
-├── wasm-zstd.wasm                 # zstd 压缩 WASM（worker 运行时 fetch）
+├── wasm-zstd.wasm                 # zstd 压缩 WASM（主线程预加载后 post 给 worker；运行时 fetch 仅回退路径）
 └── assets/
     ├── index-*.js                 # 主应用（含复用的 sender 页面/组件）
     ├── index-*.css                # 样式
@@ -71,7 +71,7 @@ apps/web/dist/                     # 发送端（airferry-sender-web-v{VER}.zip�
 
 apps/web/dist-receiver/            # 接收端（airferry-receiver-web-v{VER}.zip）
 ├── receiver.html                  # 接收端入口
-├── wasm-zstd.wasm                 # zstd 解压 WASM
+├── wasm-zstd.wasm                 # zstd 解压 WASM（主线程预加载后经 `wasm-init` 传 receive worker）
 ├── zxing_reader.wasm              # QR 解码 worker 运行时 fetch
 └── assets/
     ├── receiver-*.js              # 接收端主应用（ReceivePage + worker 编排）
@@ -130,7 +130,7 @@ node scripts/serve-https.mjs dist-receiver .cert/selfsigned.crt .cert/selfsigned
 | 部署形态 | `.crx`/`.xpi`/`.zip` 扩展包 | 纯静态网站 |
 | 扩展 API | `chrome.runtime.getURL` 等 | `typeof chrome` 判断后走网页 fallback（`document.baseURI`） |
 
-两端共用同一份 `apps/sender/src/options.tsx`——其中的 zstd 预加载 IIFE 用 `typeof chrome !== "undefined"` 做环境自适应，扩展走 `chrome.runtime.getURL`，网页走 `new URL("wasm-zstd.wasm", document.baseURI)`，行为各自正确（见 `AGENTS.md` §5.8）。
+两端共用同一份 `apps/sender/src/options.tsx`——zstd 预加载走共享助手 `apps/sender/src/wasm/zstdPreload.ts` 的 `preloadZstdBytes()`：用 `typeof chrome !== "undefined"` 做环境自适应，扩展走 `chrome.runtime.getURL`，网页走 `new URL("wasm-zstd.wasm", document.baseURI)`，行为各自正确（见 `AGENTS.md` §5.8）。网页接收端的 receive worker 也由 `ReceivePage` 用同一助手**在 post `init` 前 `await` 预加载**并 post `wasm-init`（worker 消息 FIFO 保证先于 assemble；worker 内 `initZstdFromBytes` 安装）。`compress.ts` 的兜底 fetch 按执行环境分流：主线程（`document`）走 `document.baseURI` 同级路径（子路径部署正确），打包 worker（脚本在 `assets/` 下）走 `../wasm-zstd.wasm`——曾统一按 worker 自身 URL 相对 fetch 解析到 `assets/wasm-zstd.wasm` 404（文件在站点根），导致 zstd 压缩传输在接收完成时报错。
 
 ## 单文件版（双击运行，无需服务器）
 

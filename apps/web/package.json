@@ -1,6 +1,6 @@
 {
   "name": "@airferry/web",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "AirFerry web sender — static website that streams QR codes (reuses sender source).",
   "type": "module",
   "license": "MIT",

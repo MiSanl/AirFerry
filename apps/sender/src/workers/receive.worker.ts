@@ -5,6 +5,13 @@
  * only ingests the already-decoded frame byte arrays.
  *
  * ## Lifecycle
+ *  0. main posts `{type:"wasm-init", zstd:ArrayBuffer|null}` (BEFORE `init`;
+ *     worker messages are FIFO so it is processed first) → install the
+ *     preloaded zstd bytes via `initZstdFromBytes`, so decompression never
+ *     runtime-fetches `wasm-zstd.wasm` against this worker's own assets/ URL
+ *     (that resolves to `assets/wasm-zstd.wasm` → 404; the file is deployed
+ *     at the site root). Null means the main-thread preload failed/timed out
+ *     — zstd is then fetched lazily at use time (correctly resolved).
  *  1. main posts `{type:"init", jobId}` → load transfer_engine WASM, mark ready
  *  2. main posts `{type:"frames", frames:Uint8Array[], jobId}` → ingest batch
  *  3. when complete bit set, main posts `{type:"assemble", jobId}` → run
@@ -20,6 +27,7 @@
 
 /// <reference lib="webworker" />
 import { ensureWasm, ReceiverSessionWasm } from "@/wasm/loader"
+import { initZstdFromBytes } from "@/wasm/compress"
 import { decompressAndVerify, VerifyResult } from "@/receive/decompress"
 import {
   parseRecovered,
@@ -460,6 +468,19 @@ async function onMessage(e: MessageEvent): Promise<void> {
       post({ type: "ready", jobId })
     } catch (err) {
       post({ type: "error", message: `WASM 加载失败: ${String(err)}`, jobId })
+    }
+    return
+  }
+
+  // ── wasm-init (zstd bytes preloaded on the main thread) ──
+  if (data.type === "wasm-init") {
+    const zstd = (data as { type: "wasm-init"; zstd?: ArrayBuffer | null }).zstd
+    if (zstd instanceof ArrayBuffer && zstd.byteLength > 0) {
+      // Install the bytes as the zstd module source so ensureZstd() /
+      // zstdDecompress() does not need a second network request. Null bytes
+      // mean the main-thread preload failed or timed out; the zstd branch then
+      // lazily fetches via the context-aware worker URL (`../wasm-zstd.wasm`).
+      initZstdFromBytes(zstd)
     }
     return
   }

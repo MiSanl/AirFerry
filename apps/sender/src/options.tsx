@@ -26,7 +26,7 @@ import {
   type PendingItem,
   type TransferConfig,
 } from "@/types"
-import { base64ToBuffer } from "@/wasm/base64"
+import { preloadZstdBytes } from "@/wasm/zstdPreload"
 
 /**
  * The compress worker. Built by Parcel 2 into a separate bundle per target
@@ -71,36 +71,15 @@ function createCompressWorker(): Worker {
  * bytes here and passing them as a transferable, we guarantee the worker always
  * has the WASM binary available regardless of its execution context.
  *
- * Three environments, three ways to get the bytes:
- *  - **Standalone (single-file) build**: the wasm is inlined as base64 on
- *    `globalThis.__WASM_ZSTD__` (file:// can't fetch it). Decode directly.
- *  - **Browser extension**: `chrome.runtime.getURL` resolves the packed asset.
- *  - **Plain web page**: resolve relative to the document.
+ * The byte acquisition (standalone base64 / extension getURL / web document
+ * base) lives in the shared `preloadZstdBytes` helper — the web receiver's
+ * receive worker gets its zstd bytes the same way.
  *
  * Always posts `wasm-init` (with bytes or null) so the worker never parks
  * forever waiting for zstd — preparePayload already falls back to raw.
  */
 async function initializeCompressWorker(worker: Worker): Promise<void> {
-  let bytes: ArrayBuffer | null = null
-  try {
-    if (standaloneGlobals.__AIRFERRY_STANDALONE__ && standaloneGlobals.__WASM_ZSTD__) {
-      // Standalone build: decode the inlined base64 (file:// can't fetch).
-      // base64ToBuffer returns ArrayBuffer | undefined; coerce to null so the
-      // unified `bytes` slot (ArrayBuffer | null) stays consistent below.
-      const decoded = base64ToBuffer(standaloneGlobals.__WASM_ZSTD__)
-      if (decoded) bytes = decoded
-    } else {
-      const wasmUrl =
-        typeof chrome !== "undefined" && chrome.runtime?.getURL
-          ? chrome.runtime.getURL("wasm-zstd.wasm")
-          : new URL("wasm-zstd.wasm", document.baseURI).href
-      const resp = await fetch(wasmUrl, { credentials: "same-origin" })
-      if (resp.ok) bytes = await resp.arrayBuffer()
-      else console.warn("Failed to pre-load wasm-zstd.wasm:", resp.status)
-    }
-  } catch (e) {
-    console.warn("Failed to pre-load wasm-zstd.wasm:", e)
-  }
+  const bytes = await preloadZstdBytes()
   if (bytes) {
     worker.postMessage({ type: "wasm-init", zstd: bytes }, [bytes])
   } else {

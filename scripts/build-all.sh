@@ -10,6 +10,7 @@ set -euo pipefail
 #   ./scripts/build-all.sh windows      # 仅构建 Windows 端（须 Windows + .NET 8 SDK + CMake/VS C++）
 #   ./scripts/build-all.sh wasm         # 仅构建 Rust WASM
 #   ./scripts/build-all.sh dist         # 仅打包：把已构建的产物复制/签名到 dist/
+#   ./scripts/build-all.sh dist-upload-list  # 打印可安全上传到 Release 的产物清单（排除密钥）
 #   ./scripts/build-all.sh release      # 构建 + 打包到 dist/（发送 crx/xpi/zip + APK）
 #
 # 产物（dist/，均 git-ignored，通过 GitHub Release 分发）:
@@ -25,6 +26,11 @@ set -euo pipefail
 #   airferry-receiver-web-v<VER>.zip            网页接收端静态站点（receiver.html）
 #   airferry-sender-web-standalone-v<VER>.html  网页发送端单文件版（双击即用，file:// 可运行）
 #   airferry-extension.pem                      Chrome 签名私钥（须预先配置）
+#
+# ⚠️ 上传 Release 切勿用裸 `gh release upload ... dist/*`：dist/ 同时存放
+#   airferry-extension.pem 与 airferry-release.keystore，裸通配会把密钥一并
+#   上传造成外泄。始终用 `$(./scripts/build-all.sh dist-upload-list)` 取扩展名
+#   白名单清单（仅 .apk/.zip/.crx/.xpi/.html，物理上排除了密钥）。
 #
 # 版本号规范：
 #   • 唯一来源：apps/sender/package.json 的 version（read_version() 读取），
@@ -351,6 +357,18 @@ pack_dist() {
     warn "未找到接收端网页构建产物（${web_receiver_dist}）。如需打包，先运行: ./scripts/build-all.sh web"
   fi
 
+  # 发送端单文件版（自包含 HTML，双击 file:// 即用）。build_web 构建时已复制一份
+  # 到 dist/，但上方清旧产物把它删掉了——此处按 warn 模式重建（与 web zip 同理：
+  # 用户可能只发扩展+APK 不发网页端，缺失不中断）。否则单独跑 `dist` 子命令会
+  # 让单文件版从 dist/ 静默消失，dist-upload-list / Release 随之缺一个产物。
+  local standalone_html="$ROOT/apps/web/dist-standalone/index.html"
+  if [[ -f "$standalone_html" ]]; then
+    cp "$standalone_html" "$ROOT/dist/airferry-sender-web-standalone-v${VER}.html"
+    info "发送端单文件版 → dist/airferry-sender-web-standalone-v${VER}.html（双击即用）"
+  else
+    warn "未找到单文件版构建产物（${standalone_html}）。如需打包，先运行: ./scripts/build-all.sh web"
+  fi
+
   # 发送端：Chrome crx + zip，Firefox xpi（即 zip 改名）
   for target in chrome-mv3-prod chrome-mv2-prod firefox-mv3-prod firefox-mv2-prod; do
     local prod_dir="$target"
@@ -371,6 +389,31 @@ pack_dist() {
   done
 
   info "全部产物已打包到 dist/（版本 v${VER}）"
+
+  # 打印可安全上传到 GitHub Release 的产物清单（见 release_upload_list 的安全说明）。
+  info "可上传到 GitHub Release 的产物清单（已排除 *.pem / *.keystore 密钥）:"
+  release_upload_list | sed 's/^/    /'
+}
+
+# 列出 dist/ 中可安全上传到 GitHub Release 的当前版本产物。
+#
+# ⚠️ 安全要点（改动前务必理解）：dist/ 与产物同目录还存放两类签名密钥——
+#   • airferry-extension.pem     Chrome Cr24 签名私钥
+#   • airferry-release.keystore  Android 发布 keystore
+# 裸 `gh release upload ... dist/*` 的 shell 通配会把它们一并上传 → 密钥外泄。
+# 本函数用「当前版本号 airferry-*-v${VER}.* ＋ 扩展名白名单」双重过滤，物理上
+# 不可能命中 *.pem / *.keystore，也不会误带其它版本旧产物或 RELEASE_NOTES_*.md。
+# 上传命令（用命令替换取清单，勿用裸 dist/* 通配）：
+#   gh release upload v${VER} -R UR-SillyB/AirFerry \
+#     $(./scripts/build-all.sh dist-upload-list) --clobber
+release_upload_list() {
+  # dist/ 可能尚未创建（干净机器上未跑过任何构建）：打印空清单而非让 find
+  # 报错触发 set -e——调用方的命令替换拿到空串即可，语义一致。
+  [[ -d "$ROOT/dist" ]] || return 0
+  find "$ROOT/dist" -maxdepth 1 -type f \
+    -name "airferry-*-v${VER}.*" \
+    \( -name '*.apk' -o -name '*.zip' -o -name '*.crx' -o -name '*.xpi' -o -name '*.html' \) \
+    | sort
 }
 
 build_release() {
@@ -405,12 +448,18 @@ case "$TARGET" in
   dist)
     pack_dist
     ;;
+  dist-upload-list)
+    # 仅打印可安全上传的产物清单（不含密钥），供 gh release upload 命令替换使用。
+    release_upload_list
+    exit 0
+    ;;
   release)
     build_release
     ;;
   *)
-    echo "用法: $0 [all|sender|scanner|windows|web|wasm|dist|release]"
+    echo "用法: $0 [all|sender|scanner|windows|web|wasm|dist|dist-upload-list|release]"
     echo "  windows 子命令须在 Windows + .NET 8 SDK + CMake/VS C++ 下运行（或用 scripts/build-windows.ps1）"
+    echo "  dist-upload-list 打印可安全上传到 GitHub Release 的产物清单（排除 *.pem/*.keystore 密钥）"
     exit 1
     ;;
 esac

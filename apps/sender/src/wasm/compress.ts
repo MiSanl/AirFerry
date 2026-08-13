@@ -191,12 +191,23 @@ function loadWasm(): Promise<ZstdWasmModule> {
 }
 
 function fetchAndInstantiate(): Promise<ZstdWasmModule> {
-  // Fallback: fetch via chrome.runtime.getURL (works on main thread)
+  // Fallback fetch for when no preloaded bytes were installed
+  // (initZstdFromBytes). The correct base URL differs by execution context:
+  //  - Extension: chrome.runtime.getURL resolves the packed asset.
+  //  - Main thread (has `document`): resolve against document.baseURI — a
+  //    sibling of the page, correct for the dev server AND subpath
+  //    deployments (GitHub Pages) alike. This path is real: the web receive
+  //    page decompresses completed segmented tasks on the main thread when
+  //    the user clicks "保存文件".
+  //  - Bundled worker (no `document`): the worker script is emitted under
+  //    assets/ while the file is deployed at the site root, so step up one
+  //    level (same convention as qr-decode.worker's locateFile).
   const wasmUrl =
     typeof chrome !== "undefined" && chrome.runtime?.getURL
       ? chrome.runtime.getURL("wasm-zstd.wasm")
-      : // Worker fallback: resolve relative to worker location
-        new URL("wasm-zstd.wasm", self.location.href).href
+      : typeof document !== "undefined"
+        ? new URL("wasm-zstd.wasm", document.baseURI).href
+        : new URL("../wasm-zstd.wasm", self.location.href).href
 
   return fetch(wasmUrl, { credentials: "same-origin" })
     .then((resp) => {

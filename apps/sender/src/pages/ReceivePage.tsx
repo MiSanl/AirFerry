@@ -20,6 +20,7 @@ import iconUrl from "../../assets/icon128.png"
 import { decompressAndVerify, MAX_DECOMPRESSED_BYTES } from "@/receive/decompress"
 import { parseRecovered, type Recovered } from "@/receive/parse"
 import { ensureWasm } from "@/wasm/loader"
+import { preloadZstdBytes } from "@/wasm/zstdPreload"
 import {
   deleteStoredTask,
   listStoredTasks,
@@ -830,6 +831,21 @@ export function ReceivePage(): React.ReactElement {
     recv.addEventListener("messageerror", (ev) =>
       dbg(`[recv] MESSAGE ERROR: ${String(ev.data || "")}`)
     )
+
+    // Preload the zstd WASM bytes on the main thread and post them to the
+    // receive worker BEFORE `init`. Worker messages are FIFO, so `wasm-init`
+    // is guaranteed to be processed before any frames/assemble that follow —
+    // the worker installs the bytes (initZstdFromBytes) before getWasm() can
+    // ever start a fallback fetch. A fire-and-forget preload would race
+    // exactly this: on a slow network init/frames/assemble could arrive
+    // first, and once getWasm() has started a fetch, a late wasm-init only
+    // resets the NEXT call — the in-flight decompression still fails. That
+    // fetch also resolved "wasm-zstd.wasm" against the worker's own assets/
+    // URL (404; the file is deployed at the site root), which is how every
+    // zstd-compressed transfer failed at completion. Raw transfers never
+    // touch zstd, which is why small files were unaffected.
+    const zstdBytes = await preloadZstdBytes()
+    recv.postMessage({ type: "wasm-init", zstd: zstdBytes }, zstdBytes ? [zstdBytes] : [])
 
     jobIdRef.current += 1
     recv.postMessage({ type: "init", jobId: jobIdRef.current })

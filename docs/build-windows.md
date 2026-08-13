@@ -128,11 +128,11 @@ workflow_dispatch（手动输入已存在的 `release_tag`）且上述三 job �
        拷贝 airferry_zxing.dll → apps/windows/AirFerry.Windows/runtime/
        dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
        Compress-Archive → airferry-receiver-windows-x64-v${VER}.zip
-       gh release upload v${VER} … --clobber
+       gh release upload v${VER} airferry-receiver-windows-x64-v${VER}.zip --clobber
        （tag commit、package/manifest 版本与 release 任一不一致即失败）
 ```
 
-操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.0`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。
+操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.1`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。
 
 本地 Windows 仍可用 `.\scripts\build-windows.ps1 -Pack`（产物进 `dist/`）。
 

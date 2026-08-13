@@ -8,11 +8,12 @@
  *     into web's private `wasm-pkg/` import path. This prevents extension builds
  *     from switching the package while Vite is reading it.
  *
- *  2. `public/wasm-zstd.wasm` — the zstd compressor WASM, fetched at runtime by
- *     the compress worker's fallback path (`new URL("wasm-zstd.wasm",
- *     self.location.href)`). In the extension this file lives next to the page;
- *     on the web it must be served from the site root, so we copy it into
- *     `public/` where Vite serves static assets.
+ *  2. `public/wasm-zstd.wasm` — the zstd codec WASM. The MAIN THREAD fetches
+ *     it via `document.baseURI` (`wasm/zstdPreload.ts`) and posts the bytes to
+ *     the compress/receive workers (`wasm-init`); the worker-side fallback
+ *     fetch steps up from its assets/ script URL (`../wasm-zstd.wasm`). Both
+ *     resolve to the site root, so we copy it into `public/` where Vite
+ *     serves static assets.
  *
  * Run via `predev`/`prebuild`. Idempotent.
  */
@@ -50,7 +51,8 @@ try {
 }
 console.log("[prepare-wasm] copied wasm-pkg-simd into web-owned wasm-pkg")
 
-// (2) Copy wasm-zstd.wasm into public/ for the worker's runtime fetch.
+// (2) Copy wasm-zstd.wasm into public/ for the main-thread preload (and the
+// worker-side fallback fetch) — both resolve to the site root.
 const zstdSrc = path.join(webRoot, "node_modules", "@foxglove", "wasm-zstd", "dist", "wasm-zstd.wasm")
 const publicDir = path.join(webRoot, "public")
 const zstdDst = path.join(publicDir, "wasm-zstd.wasm")

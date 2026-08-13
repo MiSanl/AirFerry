@@ -199,13 +199,15 @@ npm run preview        # 本地预览构建产物
 | `scanner` | `cargo ndk` 编译 `.so` → `./gradlew assembleRelease` | ✅ |
 | `windows` | Rust C ABI DLL + 共享 ZXing-C++ DLL → `dotnet build`（须 Windows） | ✅ |
 | `wasm` | 仅 `npm run wasm`（= build-wasm.cjs，产 legacy + simd 两份） | — |
-| `dist` | **仅打包**：把已构建的 `build/` + APK + Windows zip + web zip 复制/签名到 `dist/`（不重新构建） | — |
+| `dist` | **仅打包**：把已构建的 `build/` + APK + Windows zip + web zip + 单文件版 html 复制/签名到 `dist/`（不重新构建） | — |
+| `dist-upload-list` | **仅打印**可安全上传到 GitHub Release 的当前版本产物清单（`airferry-*-v{VER}.` + 扩展名白名单，物理排除 `*.pem`/`*.keystore` 密钥）；不构建不打包，供 `gh release upload` 命令替换使用 | — |
 | `release` | `build_sender` → `build_web` → `build_scanner` → `pack_dist`（全量构建 + 打包） | ✅（scanner） |
 
 ```bash
 ./scripts/build-all.sh              # 构建 sender + web + scanner（不打包）
 ./scripts/build-all.sh release      # 全量构建 + 打包到 dist/（最常用）
 ./scripts/build-all.sh dist         # 仅打包（假设已构建好，不重新编译）
+./scripts/build-all.sh dist-upload-list  # 打印可安全上传 Release 的产物清单（排除密钥）
 ./scripts/build-all.sh sender       # 仅浏览器端（含 WASM）
 ./scripts/build-all.sh web          # 仅网页端（须先有 apps/sender/wasm-pkg-simd/）
 ./scripts/build-all.sh scanner      # 仅 APK
@@ -219,7 +221,7 @@ npm run preview        # 本地预览构建产物
 - **`build_windows` 自动构建两个 native 前置**：在 `dotnet build` **之前**先用 cargo 编译 `transfer_engine.dll`，再用 CMake/VS C++ 编译并测试 `airferry_zxing.dll`；二者都复制到 `runtime/`。Android 直接保留 v1.1.3 的 `scan_jni.cpp`，Windows 通过 `core/zxing-decoder/` 镜像同一解码选项与全帧/ROI 调度模式。**Windows 端只能在 Windows + .NET 8 SDK + CMake/VS C++ 下完整构建**，首选 `scripts/build-windows.ps1`。
 - **`build_web` 先重编原生 lib 再构建**：v1.2.0 起 `build_web` **不再只是复制旧中间产物**，而是先 `build_wasm`（`npm run wasm` 重编 `wasm-pkg-simd/`）+ emcc 可用时调 `scripts/build-fastzxing.sh --use-cache`（重编 FAST ZXing-C++ `airferry_zxing.js/.wasm` 到 `apps/sender/src/fastzxing/`），再 `cd apps/web && npm run build`（Vite 静态站点）。`prebuild` 的 `prepare-wasm.cjs` 校验 `wasm-pkg-simd/{transfer_engine.js,transfer_engine_bg.wasm}`、持共享构建锁原子复制到 web 自有 `apps/web/wasm-pkg/`，再拷 `wasm-zstd.wasm` + `zxing_reader.wasm` + `airferry_zxing.*` 到 `public/`。**emcc 缺失时显式 `warn`（不静默），接收端回退 zxing-wasm 兼容后端，构建不中断**——发布前请在带 Emscripten 的环境运行 `./scripts/build-fastzxing.sh` 以确保 FAST 快路径最新。`pack_dist` 用 warn（非 error）模式打包 web zip——产物缺失时跳过而非中断，因为用户可能只发扩展+APK 不发网页端。
 - **Chrome crx 签名**：调用 macOS Chrome 的 `--pack-extension` + `--pack-extension-key`。私钥必须预先位于 `dist/airferry-extension.pem`；脚本核对固定公钥 SHA-256 后才签名，缺失/换钥直接失败，绝不自动生成新 ID。找不到 Chrome 二进制时跳过 crx、仅留 zip。
-- **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,receiver-web-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。
+- **`pack_dist` 会清旧产物**：删 `dist/airferry-{receiver-android-*.apk,receiver-windows-*.zip,receiver-web-*.zip,sender-chrome-*.crx,sender-chrome-*.zip,sender-firefox-*.xpi,sender-web-*.zip}`，但**不动** `*.pem` 和 `*.keystore`。**⚠️ 正因密钥与产物同处 `dist/`，上传 Release 绝不要用裸 `dist/*` 通配（会把密钥一起上传外泄）**——始终用 `$(./scripts/build-all.sh dist-upload-list)` 取扩展名白名单清单（`.apk/.zip/.crx/.xpi/.html`，物理排除密钥；见下方「发布流程」与 `release_upload_list()`）。
 
 ### 2.7 构建目录布局
 
@@ -278,14 +280,19 @@ npm run preview        # 本地预览构建产物
    gh release create v{VER} -R UR-SillyB/AirFerry \
      --target <commit-sha> --title v{VER} \
      --notes-file docs/releases/v{VER}.md        # 创建（首次）
-   gh release upload v{VER} -R UR-SillyB/AirFerry dist/* --clobber   # 上传/覆盖 asset
+   # ⚠️ 绝不要用裸 dist/* 通配——dist/ 还存放 airferry-extension.pem（Chrome 签名
+   # 私钥）与 airferry-release.keystore（Android 发布 keystore），裸通配会把密钥
+   # 一起上传造成外泄。用脚本生成的扩展名白名单清单（仅产物，物理排除密钥）：
+   gh release upload v{VER} -R UR-SillyB/AirFerry \
+     $(./scripts/build-all.sh dist-upload-list) --clobber   # 上传/覆盖 asset
    ```
-   Windows asset 由 `windows.yml` 的 `windows-pack` job 自动 `gh release upload --clobber`。
+   Windows asset 由 `windows.yml` 的 `windows-pack` job 自动 `gh release upload --clobber`（仅传单个 Windows zip，CI 干净 checkout 无密钥）。
 3. **重新发布同一 tag（需改 notes / 重排 asset / 清 label 时）**：保留 tag 以维持下载链接稳定，只重建 release 记录：
    ```bash
    gh release delete v{VER} -R UR-SillyB/AirFerry --yes --cleanup-tag=false   # 删 release，保留 tag
    gh release create v{VER} -R UR-SillyB/AirFerry --target <tag-commit> --title v{VER} --notes-file docs/releases/v{VER}.md
-   gh release upload  v{VER} -R UR-SillyB/AirFerry dist/* --clobber            # 重新上传
+   gh release upload v{VER} -R UR-SillyB/AirFerry \
+     $(./scripts/build-all.sh dist-upload-list) --clobber   # 重新上传（仅产物，排除密钥）
    ```
    `gh release upload` **不写 label**（label 留空，按本节规范）。历史版本（v1.0.0–v1.1.3）文件名不含角色前缀，属历史命名，不回改。
 
@@ -301,7 +308,7 @@ npm run preview        # 本地预览构建产物
 1. **WASM 双产物必须先于扩展构建**：`npm run build` 已内嵌 `build-wasm.cjs`（产 `wasm-pkg-legacy/` + `wasm-pkg-simd/`）再 `build-all.cjs`，故一条命令搞定。但**单独跑 `npm run build:chrome-mv3` 等单目标脚本不自动跑 wasm**——需先 `npm run wasm` 产出双产物，否则 `build-all.cjs` 的 `useWasmPkg()` 会因 `wasm-pkg-*/` 缺失报错退出。（`build-all.sh sender/release` 走 `npm run build`，不会踩坑。）
 2. **JNI `.so` 必须先于 APK 构建（v1.2.0 起已由 Gradle 自动保证）**：Gradle 的 `compileRustJni` task（`merge*JniLibFolders` 的前置）会在打包 APK 前自动 `cargo ndk ... build` 产出最新 `libtransfer_engine.so` 到 `jniLibs/`——**手动 `./gradlew` 也不用再先跑 cargo-ndk**。`build-all.sh` 的 `scanner`/`all`/`release` 子命令仍额外先跑一次 cargo-ndk（双保险，见 §2.6）。历史坑（v1.2.0 之前）：手动 `./gradlew` 而未经脚本会打进过期 `.so` → 扫码端运行时 `UnsatisfiedLinkError` 或 >32 MiB 传输「正在同步」卡死。
 3. **两个 native DLL 都必须先于 C# 构建**：cargo 产出 `transfer_engine.dll`，CMake 产出 `airferry_zxing.dll`，二者放入 `runtime/` 后 `dotnet build` 才会打包到 exe 同目录。**`build-windows.ps1`/`build-all.sh windows` 会自动构建、测试并复制二者**（见 §2.5）；若只手动跑 `dotnet build`，运行时会在引擎或二维码解码的首个 P/Invoke 处抛 `DllNotFoundException`。
-4. **`dist` 子命令不重新构建**：它假设 `apps/sender/build/` 与 APK 已就绪（Windows zip 可选），只做复制/签名/打包。缺 sender/scanner 产物会 `error` 退出；缺 Windows 产物则 `warn` 跳过（因为 Windows 端只能在 Windows 上构建）。
+4. **`dist` 子命令不重新构建**：它假设 `apps/sender/build/` 与 APK 已就绪（Windows zip 可选），只做复制/签名/打包。缺 sender/scanner 产物会 `error` 退出；缺 Windows 产物则 `warn` 跳过（因为 Windows 端只能在 Windows 上构建）。web 三件套（发送端/接收端 zip + 单文件版 html）同样 `warn` 模式：中间产物（`apps/web/dist*/`）在则从源重建，不在则跳过——**注意 `pack_dist` 开头清旧产物会删掉 `dist/` 里旧的单文件版 html**，所以单独跑 `dist` 前须保证 `apps/web/dist-standalone/index.html` 存在，否则单文件版会从发布清单消失。
 5. **版本号同步（发版必查）**：`build-all.sh` 的发布文件名版本取自 `apps/sender/package.json`；下列**全部**须同一版本号：
    - `apps/sender/package.json` `version` + `manifest.version`（→ 扩展/打包文件名）
    - `apps/scanner/app/build.gradle.kts` `versionName`（+ 通常 `versionCode++`）（→ APK 内嵌）
@@ -325,7 +332,7 @@ npm run preview        # 本地预览构建产物
 
 1. 把上表代码版本改到目标版本，提交、创建 tag，并先创建对应 Release。
 2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`。
-3. GitHub → Actions → **windows** → **Run workflow**，输入该现有 tag（如 `v1.2.0`）；workflow 会核对 tag、checkout commit 与 package/manifest 版本。
+3. GitHub → Actions → **windows** → **Run workflow**，输入该现有 tag（如 `v1.2.1`）；workflow 会核对 tag、checkout commit 与 package/manifest 版本。
 4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset；asset 不设 label，见 §2.8）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
@@ -381,7 +388,7 @@ npm run preview        # 本地预览构建产物
 
 | manifest 前/后处理 | `prepare-plasmo-icon.cjs` + `fix-manifest.cjs` | 前者从 icon128 生成 git-ignored 的 `assets/icon.png`（clean build 必需）；后者写入各尺寸图标/MV2 CSP/Firefox id，并兜底删 `default_popup` |
 | **★网页接收端（v1.1.6 起）** | `apps/sender/src/pages/ReceivePage.tsx` | 浏览器无磁盘流式编解码器，恢复时在 **JS 内存**里整份解压并校验（根 SHA-256 + CRC32），上限 `MAX_DECOMPRESSED_BYTES`=256 MiB（见 §3.2「接收端解压 + 解析」行）；完成后经 `showSaveFilePicker` 一次性写盘（`writable.write(file.data)`），无该 API 时 Blob 下载回退硬限 64 MiB（`FALLBACK_BLOB_MAX_BYTES`），防止合并超大根文件耗尽内存。web 入口 `apps/web/src/receiver.tsx` + `apps/web/receiver.html` |
-| **接收端解压 + 解析** | `apps/sender/src/receive/{decompress,parse}.ts` | `decompressAndVerify`：NONE 原样/ZSTD 复用 sender 的 zstd Emscripten 单例（`zstdDecompress`）/XZ 用 `lzma-wasm`（**必须先 `await lzma.initWasm()` 再 `decompress`**，否则抛 `Please call initWasm()...`，曾漏掉），浏览器无磁盘流式编解码器，原始内容上限 `MAX_DECOMPRESSED_BYTES`=256 MiB（峰值约 `compressedSize + ~2× decompressedSize`，JS 内存约束；原生端流式解压不受此限，wire 上限仍为 `MAX_OBJECT_BYTES`=32 MiB）+ CRC32 校验。`parseRecovered`：ETTEXTv1→text / ETBUNDL1→bundle / 否则→单文件（字节级镜像 Android/Windows） |
+| **接收端解压 + 解析** | `apps/sender/src/receive/{decompress,parse}.ts` | `decompressAndVerify`：NONE 原样/ZSTD 复用 sender 的 zstd Emscripten 单例（`zstdDecompress`）/XZ 用 `lzma-wasm`（**必须先 `await lzma.initWasm()` 再 `decompress`**，否则抛 `Please call initWasm()...`，曾漏掉），浏览器无磁盘流式编解码器，原始内容上限 `MAX_DECOMPRESSED_BYTES`=256 MiB（峰值约 `compressedSize + ~2× decompressedSize`，JS 内存约束；原生端流式解压不受此限，wire 上限仍为 `MAX_OBJECT_BYTES`=32 MiB）+ CRC32 校验。**zstd 字节由主线程预加载**：`ReceivePage` 在 post `init` **之前** `await wasm/zstdPreload.ts` 的 `preloadZstdBytes()`（三环境：standalone base64 / 扩展 getURL / 网页 document.baseURI；fetch 带 5s `AbortController` 超时——挂起而非快速 404 的连接不会卡死启动，超时回 null 走懒加载兜底）并 post `wasm-init`——worker 消息 FIFO 保证它先于任何 frames/assemble 被处理（不可 fire-and-forget：慢网络下 assemble 会先让 `getWasm()` 启动兜底 fetch，晚到的 `wasm-init` 只重置下一次调用，在途解压仍失败），worker 内 `initZstdFromBytes` 安装。兜底 fetch 的基 URL **按执行环境分流**（`compress.ts` `fetchAndInstantiate`）：主线程（含 ReceivePage 保存已完成分段任务时的主线程解压）走 `document.baseURI` 同级路径（子路径部署正确）；打包 worker（脚本在 `assets/` 下）走 `../wasm-zstd.wasm` 上跳一级（与 qr-decode worker 的 locateFile 同约定）——曾统一按 worker 相对路径解析到 `assets/wasm-zstd.wasm` → 404（文件在站点根），导致所有 zstd 压缩传输完成时报错（raw 小文件不触发）。`parseRecovered`：ETTEXTv1→text / ETBUNDL1→bundle / 否则→单文件（字节级镜像 Android/Windows） |
 | **receive worker** | `apps/sender/src/workers/receive.worker.ts` | descriptor-v5 解压后强制 CRC32、`raw_sha256`、规范坐标并冻结跨段 `root_sha256`；`taskStore.ts` 同一 IDB 事务提交 Blob+账本，写前检查 storage estimate。普通结果用 transferable ArrayBuffer 回主线程，避免 structured clone 复制 |
 | **QR decode worker（池）** | `apps/sender/src/workers/qr-decode.worker.ts` + `ReceivePage` 池管理 | **双后端**：① **FAST（M3 快路径，默认）**：自编译 ZXing-C++→WASM（`fastzxing/airferry_zxing.js/.wasm`，Emscripten 3.1.64 + `-O3 -msimd128`），吃 **Y 灰度平面**（主线程 `extractYPlane` = **canvas drawImage + getImageData + RGBA→Y**，stride 严格 = width）。**⚠️ 不要用 `VideoFrame.copyTo(I420)` 取 Y**：I420 的 Y 平面按 coded-stride(≥width)/codedWidth(≥displayWidth) 布局，`subarray(0,w*h)` + `rowStride=width` 会行错位、WASM 解不出（曾因此「扫不出来」）。canvas RGBA→Y 布局确定，虽然多一次 RGBA 转换，但正确。worker `decodeFastY` 调 `airferry_wasm_decode_multi_y`（复用 `core/zxing-decoder/airferry_zxing_core.cpp` 纯 C++，与 Windows/Android 同源）。实测合成四码 598px **10.4ms**（vs zxing-wasm ~22ms，~2×+）。**⚠️ 编译必须 `-fexceptions` + `-s STACK_SIZE=1MiB` + 固定 64MiB 内存（`ALLOW_MEMORY_GROWTH=0`）**：ZXing-C++ 在 1080p 大帧上会抛 C++ 异常，emscripten 默认 `-fno-exceptions` 会让它 trap 成 JS 数字异常（`解码失败: 638680`）→ fast 后端崩 → 「扫不出来」。开异常支持 + 大栈让 `catch(...)` 优雅跳过坏帧。② **COMPAT（回退）**：`zxing-wasm/reader` 的 `readBarcodesFromImageData`（RGBA）。**自动探测**：worker `init` 先 `loadFastBackend()`，成功 `ready{fast:true}`（main 喂 Y），失败回退 zxing-wasm `ready{fast:false}`（main 喂 RGBA）。**默认全帧解码**（`maxNumberOfSymbols:4`，码任意位置可检出）。**算法提速**：① `tryInvert:false`；② 两级 tryHarder。decode 可选 `roiGrid`（`{cols:2,rows:2}`）保留代码但**默认不启用**——固定 ROI 把真实拍摄偏移/倾斜的码切半导致难扫，故主链路走全图；`cropRgba` 仅在显式 `roiGrid` 时用。**⚠️ 无自适应 ROI 跟踪**：曾参考 Android `decodeYRegionTracked` 实现 ROI 跟踪，但 Android 实测 ROI 不可靠已回退，Web 同理走全图最稳。**ReceivePage 持 `QR_WORKER_POOL=4` 个 qr worker 池**：captureLoop 每帧派发给第一个空闲 worker（`qrBusyRef`），无空闲才丢帧——多帧跨核并行解码，镜像 Android 线程池；每个 worker 独立 zxing WASM 实例，`decoded` 后标记空闲并把 payloads 喂给单例 receive worker（ingest 仍串行）。**⚠️ 捕获循环用 `scanningActiveRef` 守卫**：`teardown`/`reset` 置 false，`startScanning` 置 true，captureLoop 开头检查——否则上次会话残留的 RVFC/rAF 回调不停止（`requestVideoFrameCallback` 的 handle 无法用 `cancelAnimationFrame` 取消），再点「开始接收」会**双循环重叠**，表现为「第二次很难扫出来」。**FAST 后端的 CI 接入**：`pages.yml` 在 web 构建前跑 `mymindstorm/setup-emsdk@v14`（Emscripten 3.1.64）+ `scripts/build-fastzxing.sh` 生成 `apps/sender/src/fastzxing/airferry_zxing.{js,wasm}`（git-ignored），`prepare-wasm.cjs` 再拷到 `apps/web/public/`；worker 用 `new URL("../airferry_zxing.js", self.location.href)`（与 zxing_reader.wasm 同机制）加载。**生产 web 接收端经 CI 构建后默认启用 FAST**；本地未跑 build-fastzxing 或扩展发送端构建无此产物时，worker `loadFastBackend` 失败回退 zxing-wasm（接收端仍可用，只是慢） |
 
@@ -466,6 +473,7 @@ npm run preview        # 本地预览构建产物
 | 压缩总是走 raw（100%） | `compress.ts` `initZstdFromBytes` | worker 内 zstd WASM 未加载成功（主线程应仍 post `wasm-init`；缺 zstd 时允许 raw，不应卡死） |
 | 点发送后永久「正在准备」 | `compress.worker` `ready` + `options` `wasm-init` | 主线程未 post `wasm-init`（含失败时 `zstd: null`）；或 worker 仍硬等 zstd 成功才 ready |
 | **网页端压缩走 raw（100%）** | `apps/web/public/wasm-zstd.wasm` + `prepare-wasm.cjs` | `public/wasm-zstd.wasm` 缺失（未跑 `prebuild`），worker fetch 404 → 回退 raw。重新跑 `npm run build`（会触发 `prebuild`→prepare-wasm） |
+| **网页接收端传输完成时报 `Failed to fetch wasm-zstd.wasm: 404`（小文件不出现）** | `ReceivePage.tsx` 的 `wasm-init` 预加载 + `receive.worker.ts` 的 `initZstdFromBytes` | receive worker 未拿到主线程预加载的 zstd 字节，运行时按 worker 自身 `assets/` URL 相对 fetch → 404（文件在站点根）。raw/小文件不走 zstd 故不触发。确认 `ReceivePage` 在 post `init` 前 `await preloadZstdBytes()` 并发 `wasm-init`（FIFO 保证先于 assemble）；`compress.ts` 兜底 fetch 按环境分流（主线程 `document.baseURI` / worker `../`） |
 | **网页端启动报 transfer_engine.js 找不到** | `apps/sender/wasm-pkg-simd/` | web 从 sender 现代产物复制自有快照；首次构建前需 `cd apps/sender && npm run wasm`。`prepare-wasm.cjs` 会校验并报清晰错误 |
 | **`release`/`dist` 产物缺 web zip** | `apps/web/dist/` | `pack_dist` 用 warn 模式（非中断）：`apps/web/dist/` 缺失时跳过 web zip。先跑 `./scripts/build-all.sh web` 再 `dist`/`release` |
 | 扩展构建缺 WASM | `apps/sender/wasm-pkg-legacy/` 或 `wasm-pkg-simd/` | 单独跑 `npm run build:chrome-mv3` 等单目标脚本前忘了先 `npm run wasm`（双产物缺失） |
@@ -493,7 +501,7 @@ npm run preview        # 本地预览构建产物
    - **Rust 核心库**（`core/qr-protocol/src/compress.rs:23,52`）：Zstd **level 22**（`DEFAULT_LEVEL`，:23）、Xz **level 6 + EXTREME**（`XZ_PRESET`，:52）；`compress_with` 在 :75、`decompress_with_limit` 在 :106。
    - 两套编码默认值不同是**有意的**：浏览器发送端追求启动快（Zstd Lv1），Rust 原生压缩 API 追求压缩率（Zstd Lv22；XZ Lv6+EXTREME，见 `compress.rs:41-49`）。接收端按标准流解压，不依赖编码级别。引用压缩参数时**必须分清 TS 与 Rust 默认值**，不要合并描述。
 
-3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.0`**（versionCode=14）。正式版 1.2.0 承载 descriptor v5 分段协议（compress-then-segment）并修复发布审计发现的实质性缺陷（Android 流式解压 >256 MiB 钳制、Web/Android 重复分段完整 SHA 校验、Web QR worker 崩溃替换）。descriptor v5 取代撤回的早期 v1.2.0 预发布构建所用 v4（8 MiB 原文段 + 逐段压缩），接收端 fail-closed 拒绝旧 v4——预发布构建与正式版无法互传大文件分段。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
+3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.1`**（versionCode=15）。v1.2.1 修复网页接收端 zstd WASM 在 worker 相对路径下 404，并强化发布产物上传白名单；协议仍为 v1.2.0 引入的 descriptor v5（compress-then-segment）。descriptor v5 取代撤回的早期 v1.2.0 预发布构建所用 v4（8 MiB 原文段 + 逐段压缩），接收端 fail-closed 拒绝旧 v4——预发布构建与正式版无法互传大文件分段。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
 
 4. **`derive_meta_from_totals` 已废弃**：`receiver.rs` 内仍保留 JNI/ABI 兼容符号，**新代码勿调用**（其 OTI 构建在大文件上会 assert）。现代路径：从描述符帧拿权威 OTI。
 
