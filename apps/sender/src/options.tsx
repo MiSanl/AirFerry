@@ -655,6 +655,18 @@ export default function App() {
     []
   )
 
+  /** Stop the render loop and release the encoder while keeping prepared data. */
+  const stopPlayback = useCallback(() => {
+    releaseOwnedSession()
+    setState((s) => ({
+      ...s,
+      session: null,
+      page: s.prepared ? "params" : "select",
+      initializing: false,
+      error: null,
+    }))
+  }, [releaseOwnedSession])
+
   return (
     <div className="app">
       <header className="app-header">
@@ -730,6 +742,7 @@ export default function App() {
             segmentCount={state.prepared.segmentCount}
             segmentIndex={state.activeSegmentIndex}
             onSegmentChange={switchSegment}
+            onStop={stopPlayback}
           />
         )}
         {state.page === "stats" && state.session && state.prepared && (

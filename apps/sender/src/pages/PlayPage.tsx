@@ -16,6 +16,8 @@ interface Props {
   segmentIndex?: number
   /** Advance to another segment (only for segmented transfers). */
   onSegmentChange?: (nextIndex: number) => void
+  /** Stop rendering and return to the transfer parameters. */
+  onStop: () => void
 }
 
 function hex(lo: bigint, hi: bigint): string {
@@ -42,7 +44,8 @@ export function PlayPage({
   totalBytes,
   segmentCount = 1,
   segmentIndex = 0,
-  onSegmentChange
+  onSegmentChange,
+  onStop
 }: Props) {
   const [stats, setStats] = useState<QrStreamStats | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -135,6 +138,7 @@ export function PlayPage({
         autoOptimize={config.autoOptimize}
         multiQr={config.multiQr}
         ditherJitter={config.ditherJitter}
+        onStop={onStop}
         onStats={setStats}
         onError={(e) => setError(e.message)}
       />

@@ -132,7 +132,7 @@ workflow_dispatch（手动输入已存在的 `release_tag`）且上述三 job �
        （tag commit、package/manifest 版本与 release 任一不一致即失败）
 ```
 
-操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.1`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。
+操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.2`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。手动发布与 push 质量门按事件/tag 分组，不会互相取消。
 
 本地 Windows 仍可用 `.\scripts\build-windows.ps1 -Pack`（产物进 `dist/`）。
 

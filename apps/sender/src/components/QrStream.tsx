@@ -33,6 +33,8 @@ interface Props {
   multiQr: number
   /** Sub-pixel dithering to break moiré patterns. */
   ditherJitter: boolean
+  /** Stop playback, release the sender session, and return to configuration. */
+  onStop: () => void
   onStats?: (s: QrStreamStats) => void
   onError?: (e: Error) => void
 }
@@ -44,6 +46,7 @@ export function QrStream({
   autoOptimize,
   multiQr,
   ditherJitter,
+  onStop,
   onStats,
   onError
 }: Props) {
@@ -52,6 +55,7 @@ export function QrStream({
   const lastTickRef = useRef<number>(0)
   const lastPxRef = useRef<number>(0)
   const statsTimerRef = useRef<number>(0)
+  const stoppedRef = useRef(false)
   const [fullscreen, setFullscreen] = useState(false)
 
   const onStatsRef = useRef(onStats)
@@ -70,6 +74,9 @@ export function QrStream({
   activeSessionRef.current = session
 
   const render = useCallback(() => {
+    // The stop button releases the WASM session in the parent. Guard before
+    // touching it so a queued animation callback cannot race that release.
+    if (stoppedRef.current) return
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext("2d", { alpha: false })
@@ -175,12 +182,13 @@ export function QrStream({
 
   useEffect(() => {
     let cancelled = false
+    stoppedRef.current = false
 
     // Throttled mode: rAF with interval gating.
     const interval = fps === 0 ? 0 : 1000 / Math.max(1, Math.min(240, fps))
 
     const loop = (ts: number) => {
-      if (cancelled) return
+      if (cancelled || stoppedRef.current) return
       const delta = ts - lastTickRef.current
       if (interval === 0 || delta >= interval) {
         lastTickRef.current = interval === 0 || delta > interval * 3
@@ -193,6 +201,7 @@ export function QrStream({
     rafRef.current = requestAnimationFrame(loop)
     return () => {
       cancelled = true
+      stoppedRef.current = true
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
     }
   }, [render, fps])
@@ -211,19 +220,35 @@ export function QrStream({
     setFullscreen((f) => !f)
   }, [])
 
+  const stopPlayback = useCallback(() => {
+    // Cancel locally before notifying the parent: onStop frees the WASM
+    // session and unmounts this component.
+    stoppedRef.current = true
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    setFullscreen(false)
+    onStop()
+  }, [onStop])
+
   return (
     <div className="qr-stream">
       <div className={`qr-canvas-wrap${fullscreen ? " qr-fullscreen--active" : ""}`}>
         <canvas ref={canvasRef} className="qr-canvas" />
         {fullscreen && (
-          <button onClick={toggleFullscreen} className="btn qr-fullscreen-exit">
-            退出全屏
-          </button>
+          <div className="qr-fullscreen-actions">
+            <button onClick={toggleFullscreen} className="btn">退出全屏</button>
+            <button onClick={stopPlayback} className="btn danger">停止播放</button>
+          </div>
         )}
       </div>
       <div className="qr-actions">
         <button onClick={toggleFullscreen} className="btn secondary">
           {fullscreen ? "退出全屏" : "全屏播放"}
+        </button>
+        <button onClick={stopPlayback} className="btn danger">
+          停止播放
         </button>
       </div>
     </div>

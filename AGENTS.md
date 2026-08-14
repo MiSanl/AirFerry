@@ -332,7 +332,7 @@ npm run preview        # 本地预览构建产物
 
 1. 把上表代码版本改到目标版本，提交、创建 tag，并先创建对应 Release。
 2. 本地（或其它 CI）先打好 sender/APK/web 并创建/上传 GitHub Release tag `v{VER}`。
-3. GitHub → Actions → **windows** → **Run workflow**，输入该现有 tag（如 `v1.2.1`）；workflow 会核对 tag、checkout commit 与 package/manifest 版本。
+3. GitHub → Actions → **windows** → **Run workflow**，输入该现有 tag（如 `v1.2.2`）；workflow 会核对 tag、checkout commit 与 package/manifest 版本。手动发布与 push 质量门使用不同 concurrency group，不会互相取消。
 4. 跑完后 Release 上应有 `airferry-receiver-windows-x64-v{VER}.zip`（`--clobber` 可覆盖同名 asset；asset 不设 label，见 §2.8）。
 
 本地 Windows 机仍可用 `.\scripts\build-windows.ps1 -Pack` 等价打包到 `dist/`，但**默认发布路径是 workflow**。
@@ -501,7 +501,7 @@ npm run preview        # 本地预览构建产物
    - **Rust 核心库**（`core/qr-protocol/src/compress.rs:23,52`）：Zstd **level 22**（`DEFAULT_LEVEL`，:23）、Xz **level 6 + EXTREME**（`XZ_PRESET`，:52）；`compress_with` 在 :75、`decompress_with_limit` 在 :106。
    - 两套编码默认值不同是**有意的**：浏览器发送端追求启动快（Zstd Lv1），Rust 原生压缩 API 追求压缩率（Zstd Lv22；XZ Lv6+EXTREME，见 `compress.rs:41-49`）。接收端按标准流解压，不依赖编码级别。引用压缩参数时**必须分清 TS 与 Rust 默认值**，不要合并描述。
 
-3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.1`**（versionCode=15）。v1.2.1 修复网页接收端 zstd WASM 在 worker 相对路径下 404，并强化发布产物上传白名单；协议仍为 v1.2.0 引入的 descriptor v5（compress-then-segment）。descriptor v5 取代撤回的早期 v1.2.0 预发布构建所用 v4（8 MiB 原文段 + 逐段压缩），接收端 fail-closed 拒绝旧 v4——预发布构建与正式版无法互传大文件分段。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
+3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.2`**（versionCode=16）。v1.2.2 为发送端普通/全屏播放增加「停止播放」，停止时先取消渲染循环、再释放 WASM 会话并返回参数页；同时分离 Windows push 质量门与手动 tag 发布的 concurrency group，避免互相取消。协议仍为 v1.2.0 引入的 descriptor v5（compress-then-segment）。descriptor v5 取代撤回的早期 v1.2.0 预发布构建所用 v4（8 MiB 原文段 + 逐段压缩），接收端 fail-closed 拒绝旧 v4——预发布构建与正式版无法互传大文件分段。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
 
 4. **`derive_meta_from_totals` 已废弃**：`receiver.rs` 内仍保留 JNI/ABI 兼容符号，**新代码勿调用**（其 OTI 构建在大文件上会 assert）。现代路径：从描述符帧拿权威 OTI。
 

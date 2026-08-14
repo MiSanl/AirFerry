@@ -15,13 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing release tag to build (for example v1.2.1)'
+        description: 'Existing release tag to build (for example v1.2.2)'
         required: true
         type: string
 
-# Cancel superseded runs on the same ref.
+# Cancel only superseded runs of the same trigger/tag. A manual release build
+# must not cancel the push quality gate that created the release commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
   cancel-in-progress: true
 
 jobs:

@@ -279,6 +279,17 @@ code {
   color: var(--color-primary);
 }
 
+.btn.danger {
+  background: var(--color-error-light);
+  border-color: var(--color-error-border);
+  color: var(--color-error);
+}
+.btn.danger:hover {
+  background: var(--color-error);
+  border-color: var(--color-error);
+  color: #fff;
+}
+
 .btn-sm { padding: 6px 14px; font-size: 13px; flex-shrink: 0; }
 
 .btn-link {
@@ -666,11 +677,13 @@ code {
   border: none;
   box-shadow: none;
 }
-.qr-fullscreen-exit {
+.qr-fullscreen-actions {
   position: fixed;
   top: 12px;
   right: 12px;
   z-index: 10000;
+  display: flex;
+  gap: 8px;
 }
 
 .qr-actions { display: flex; justify-content: center; gap: 10px; margin-top: 4px; }
