@@ -13,6 +13,10 @@
     <AssemblyName>AirFerry</AssemblyName>
     <RootNamespace>AirFerry.Windows</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Exe/taskbar/Alt-Tab icon (multi-size 16–128, generated from
+         apps/sender/assets/icon*.png — see AGENTS.md §3.4 for the regen
+         command). WPF SDK auto-includes .ico as a Resource for XAML use. -->
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>

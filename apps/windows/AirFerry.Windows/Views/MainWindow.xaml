@@ -2,12 +2,14 @@
                  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:ctrl="clr-namespace:AirFerry.Windows.Controls"
                  Title="AirFerry"
                  Width="780" Height="760"
                  MinWidth="680" MinHeight="640"
                  WindowStartupLocation="CenterScreen"
                  ExtendsContentIntoTitleBar="True"
-                 WindowBackdropType="None">
+                 WindowBackdropType="None"
+                 Icon="pack://application:,,,/Assets/app.ico">
     <!-- WPF-UI 4.x: FluentWindow has no TitleBar property element; the TitleBar
          is the first child of the window content. Below it, the Frame hosts the
          page flow — Pages navigate via Page.NavigationService, which resolves
@@ -20,7 +22,10 @@
         </Grid.RowDefinitions>
         <ui:TitleBar Grid.Row="0" Title="AirFerry">
             <ui:TitleBar.Icon>
-                <ui:SymbolIcon Symbol="Send24" Filled="True" />
+                <!-- WPF-UI 4.3.0 has no built-in raster icon for the TitleBar
+                     (Symbol/Font glyphs only); Controls/ImageIcon.cs fills the
+                     gap with the AirFerry logo. -->
+                <ctrl:ImageIcon Source="pack://application:,,,/Assets/app.ico" />
             </ui:TitleBar.Icon>
         </ui:TitleBar>
         <Frame Grid.Row="1"
