@@ -40,6 +40,13 @@ internal static class ScreenNative
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct BITMAPINFOHEADER
     {
         public uint biSize;
@@ -103,6 +110,17 @@ internal static class ScreenNative
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    /// <summary>Cursor position in physical virtual-screen coordinates.</summary>
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    /// <summary>Current window rect; zero rect when the query fails.</summary>
+    public static RECT GetWindowRectNow(IntPtr hwnd)
+    {
+        _ = GetWindowRect(hwnd, out RECT r);
+        return r;
+    }
 
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);

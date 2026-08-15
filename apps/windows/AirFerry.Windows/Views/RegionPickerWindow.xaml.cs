@@ -34,6 +34,15 @@ internal partial class RegionPickerWindow : Window
     private readonly RegionPickerSession _session;
     private readonly ScreenNative.RECT _monitor;
     private double _pxPerDip = 1.0;
+    /// <summary>
+    /// Actual physical origin of this overlay on the virtual screen, read back
+    /// from the OS after pinning/layout settles (and on every DPI change). The
+    /// WPF Left/Top assignment in PinToMonitor may land the window slightly —
+    /// or, on mixed-DPI setups, grossly — off the monitor rect we requested;
+    /// rendered coordinates must anchor to where the window REALLY is.
+    /// </summary>
+    private int _originX;
+    private int _originY;
     private int _dragStartX;
     private int _dragStartY;
     private bool _dragging;
@@ -46,8 +55,9 @@ internal partial class RegionPickerWindow : Window
 
         SourceInitialized += (_, _) => PinToMonitor();
         // Paint the initial full-screen dim before any mouse event arrives
-        // (the dim borders start life at size 0).
-        Loaded += (_, _) => RenderSession();
+        // (the dim borders start life at size 0). Loaded fires after the WPF
+        // layout pass, so the origin readback sees the final window position.
+        Loaded += (_, _) => { SyncOrigin(); RenderSession(); };
         PreviewMouseLeftButtonDown += OnDown;
         PreviewMouseMove += OnMove;
         PreviewMouseLeftButtonUp += OnUp;
@@ -85,6 +95,8 @@ internal partial class RegionPickerWindow : Window
     {
         base.OnDpiChanged(oldDpi, newDpi);
         _pxPerDip = newDpi.PixelsPerDip;
+        // A DPI change may re-layout the window; re-anchor before painting.
+        SyncOrigin();
         RenderSession();
     }
 
@@ -95,13 +107,32 @@ internal partial class RegionPickerWindow : Window
         base.OnClosing(e);
     }
 
-    /// <summary>Window-local DIP → physical virtual-screen point.</summary>
-    private Point ToPhysical(Point dip) =>
-        new(_monitor.Left + dip.X * _pxPerDip, _monitor.Top + dip.Y * _pxPerDip);
+    /// <summary>
+    /// Cursor position in physical virtual-screen coordinates, straight from
+    /// the OS. Replaces e.GetPosition(this) + DIP conversion for ALL picker
+    /// input: with mouse capture a drag legitimately crosses monitor and DPI
+    /// boundaries, and extrapolating window-local DIPs across them is exactly
+    /// the bug that broke cross-screen dragging. The global cursor position
+    /// needs no conversion at all.
+    /// </summary>
+    private static Point CursorPhysical()
+    {
+        _ = ScreenNative.GetCursorPos(out ScreenNative.POINT p);
+        return new Point(p.X, p.Y);
+    }
+
+    /// <summary>Re-anchor the physical origin from the window's real rect.</summary>
+    private void SyncOrigin()
+    {
+        ScreenNative.RECT r = ScreenNative.GetWindowRectNow(
+            new WindowInteropHelper(this).Handle);
+        _originX = r.Left;
+        _originY = r.Top;
+    }
 
     private void OnDown(object sender, MouseButtonEventArgs e)
     {
-        Point p = ToPhysical(e.GetPosition(this));
+        Point p = CursorPhysical();
         _dragStartX = (int)p.X;
         _dragStartY = (int)p.Y;
         _dragging = true;
@@ -112,7 +143,7 @@ internal partial class RegionPickerWindow : Window
 
     private void OnMove(object sender, MouseEventArgs e)
     {
-        Point p = ToPhysical(e.GetPosition(this));
+        Point p = CursorPhysical();
         if (_dragging)
         {
             (int x, int y, int w, int h) = ScreenRectUtil.Normalize(
@@ -143,7 +174,7 @@ internal partial class RegionPickerWindow : Window
         }
         _dragging = false;
         ReleaseMouseCapture();
-        Point p = ToPhysical(e.GetPosition(this));
+        Point p = CursorPhysical();
 
         if (ScreenRectUtil.IsClick((int)p.X - _dragStartX, (int)p.Y - _dragStartY))
         {
@@ -288,10 +319,10 @@ internal partial class RegionPickerWindow : Window
             return;
         }
 
-        double left = Math.Clamp((selection.Value.Left - _monitor.Left) / _pxPerDip, 0, width);
-        double top = Math.Clamp((selection.Value.Top - _monitor.Top) / _pxPerDip, 0, height);
-        double right = Math.Clamp((selection.Value.Right - _monitor.Left) / _pxPerDip, 0, width);
-        double bottom = Math.Clamp((selection.Value.Bottom - _monitor.Top) / _pxPerDip, 0, height);
+        double left = Math.Clamp((selection.Value.Left - _originX) / _pxPerDip, 0, width);
+        double top = Math.Clamp((selection.Value.Top - _originY) / _pxPerDip, 0, height);
+        double right = Math.Clamp((selection.Value.Right - _originX) / _pxPerDip, 0, width);
+        double bottom = Math.Clamp((selection.Value.Bottom - _originY) / _pxPerDip, 0, height);
         double selWidth = Math.Max(0, right - left);
         double selHeight = Math.Max(0, bottom - top);
 

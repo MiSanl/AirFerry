@@ -97,12 +97,20 @@ public partial class ReceiveDetailView : Page
             File.Copy(src, dlg.FileName, overwrite: true);
             // ContentStore is idempotent when src is already a canonical blob.
             ScanViewModel.ArchiveSingleFile(src, displayName);
-            await UiMessages.InfoAsync("已保存");
+            // Inline confirmation on the button itself — a modal "已保存"
+            // dialog interrupts the post-receive flow for no reason.
+            SaveButton.Content = "已保存 ✓";
+            SaveButton.IsEnabled = false;
         }
         catch (Exception ex)
         {
             await UiMessages.ErrorAsync($"保存失败: {ex.Message}");
         }
+    }
+
+    private void Back_Click(object sender, RoutedEventArgs e)
+    {
+        NavigationService?.GoBack();
     }
 
     private async void Share_Click(object sender, RoutedEventArgs e)

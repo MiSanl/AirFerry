@@ -85,12 +85,20 @@ public partial class ReceiveTextView : Page
         try
         {
             File.WriteAllText(dlg.FileName, _result.Text ?? "", new UTF8Encoding(false));
-            await UiMessages.InfoAsync("已保存");
+            // Inline confirmation on the button itself — a modal "已保存"
+            // dialog interrupts the post-receive flow for no reason.
+            SaveButton.Content = "已保存 ✓";
+            SaveButton.IsEnabled = false;
         }
         catch (Exception ex)
         {
             await UiMessages.ErrorAsync($"保存失败: {ex.Message}");
         }
+    }
+
+    private void Back_Click(object sender, RoutedEventArgs e)
+    {
+        NavigationService?.GoBack();
     }
 
     private void Rescan_Click(object sender, RoutedEventArgs e)

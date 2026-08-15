@@ -110,4 +110,11 @@ public partial class DeviceSelectView : Page
     {
         NavigationService?.Navigate(new SettingsView());
     }
+
+    /// <summary>History/received files — reachable from the landing page, not
+    /// only through the scan page.</summary>
+    private void Files_Click(object sender, RoutedEventArgs e)
+    {
+        NavigationService?.Navigate(new FileListView());
+    }
 }

@@ -18,15 +18,17 @@ object TextLike {
     /**
      * Soft cap for opening a recovered file in the text (copy) UI.
      *
-     * Larger text-like files fall back to the generic file screen so we do not
-     * load a huge log/JSON into a single String (UTF-16 ~2x the UTF-8 size) on
-     * the UI thread. The cap is deliberately high enough to cover realistic
-     * text transfers (e.g. a self-contained single-file web page ~2MB, source
-     * dumps) yet still bound the in-memory decode: an 8 MiB file becomes at
-     * most ~16 MiB of String, which is safe on the app's largeHeap while still
-     * keeping multi-tens-of-MB dumps out of the text screen.
+     * Larger text-like files fall back to the generic file screen: they are
+     * archived as ordinary files and open in the detail page instead. The cap
+     * must stay small — the text screen loads the whole file into one String
+     * on the main thread and renders it in a single Compose Text, so a
+     * multi-MB HTML/log (UTF-16 ~2x the UTF-8 size) reliably OOMs/ANRs the
+     * app, and Android's ~1 MB Binder transaction cap would also break
+     * clipboard copy. 256 KiB keeps realistic notes/source files inline while
+     * routing "large text-like documents" (user-visible: larger HTML files)
+     * to the file path. Mirrors Windows `FileNameUtil.MaxTextUiBytes`.
      */
-    const val MAX_TEXT_UI_BYTES: Int = 8 * 1024 * 1024
+    const val MAX_TEXT_UI_BYTES: Int = 256 * 1024
 
     private val EXTENSIONS = setOf(
         // documents / notes

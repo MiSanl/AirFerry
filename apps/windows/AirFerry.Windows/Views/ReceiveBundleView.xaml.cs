@@ -198,6 +198,8 @@ public partial class ReceiveBundleView : Page
 
     private void Rescan_Click(object sender, RoutedEventArgs e) => NavigationService?.GoBack();
 
+    private void Back_Click(object sender, RoutedEventArgs e) => NavigationService?.GoBack();
+
     private static string FormatSize(ulong bytes) => bytes switch
     {
         < 1024 => $"{bytes} B",
