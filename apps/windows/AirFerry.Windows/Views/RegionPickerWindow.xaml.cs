@@ -61,7 +61,9 @@ internal partial class RegionPickerWindow : Window
         PreviewMouseLeftButtonDown += OnDown;
         PreviewMouseMove += OnMove;
         PreviewMouseLeftButtonUp += OnUp;
-        PreviewMouseRightButtonDown += SwallowMouseButton;
+        // Right-button down is only swallowed (the pick happens on right-UP,
+        // letting a right-press be cancelled by moving before release).
+        PreviewMouseRightButtonDown += (_, e) => e.Handled = true;
         PreviewMouseRightButtonUp += OnRightUp;
         // WPF has discrete preview events ONLY for Left/Right; middle and the
         // X buttons arrive on the generic routed pair (see ChangedButton) —
