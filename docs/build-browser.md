@@ -184,5 +184,5 @@ apps/sender/
 │       └── app.css
 ├── wasm-pkg-legacy/            # MV2：标量 + wasm-bindgen 0.2.92
 ├── wasm-pkg-simd/              # MV3：SIMD + 0.2.125
-└── assets/                     # 图标 icon{16,32,48,64,128}.png
+└── assets/                     # 发送端 icon{16,32,48,64,128,512}.png + 接收端 receiver-icon*.png
 ```

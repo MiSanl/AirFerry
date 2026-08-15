@@ -60,6 +60,7 @@ npm run build:standalone  # 发送端单文件版 → dist-standalone/index.html
 ```
 apps/web/dist/                     # 发送端（airferry-sender-web-v{VER}.zip）
 ├── index.html                     # 发送端入口（资源用相对路径 ./assets/...）
+├── favicon-sender.png             # 发送端标签页图标
 ├── wasm-zstd.wasm                 # zstd 压缩 WASM（主线程预加载后 post 给 worker；运行时 fetch 仅回退路径）
 └── assets/
     ├── index-*.js                 # 主应用（含复用的 sender 页面/组件）
@@ -71,6 +72,7 @@ apps/web/dist/                     # 发送端（airferry-sender-web-v{VER}.zip�
 
 apps/web/dist-receiver/            # 接收端（airferry-receiver-web-v{VER}.zip）
 ├── receiver.html                  # 接收端入口
+├── favicon-receiver.png           # 接收端标签页图标
 ├── wasm-zstd.wasm                 # zstd 解压 WASM（主线程预加载后经 `wasm-init` 传 receive worker）
 ├── zxing_reader.wasm              # QR 解码 worker 运行时 fetch
 └── assets/
@@ -80,7 +82,8 @@ apps/web/dist-receiver/            # 接收端（airferry-receiver-web-v{VER}.zi
     ├── receive.worker-*.js        # 串行 ingest worker
     ├── airferry_zxing-*.js/.wasm  # fastzxing 快路径（Y 平面解码）
     ├── transfer_engine_bg-*.wasm  # Rust 核心引擎
-    └── lzma_wasm_bg-*.wasm        # xz 解压 WASM
+    ├── lzma_wasm_bg-*.wasm        # xz 解压 WASM
+    └── receiver-icon128-*.png     # 接收端页面品牌图标
 ```
 
 ## 部署

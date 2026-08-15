@@ -16,7 +16,7 @@
 import { useState, useCallback, useRef, useEffect } from "react"
 import "@/assets/app.css"
 import "@/assets/receive.css"
-import iconUrl from "../../assets/icon128.png"
+import iconUrl from "../../assets/receiver-icon128.png"
 import { decompressAndVerify, MAX_DECOMPRESSED_BYTES } from "@/receive/decompress"
 import { parseRecovered, type Recovered } from "@/receive/parse"
 import { ensureWasm } from "@/wasm/loader"

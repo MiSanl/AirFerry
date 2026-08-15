@@ -11,7 +11,8 @@
  *   wasm-zstd.wasm                 — zstd WASM (kept as a file; we base64 it)
  *
  * Output (dist-standalone/index.html):
- *   A single HTML file. Before the main bundle runs, three globals are defined
+ *   A single HTML file whose sender favicon is embedded as a data URL. Before
+ *   the main bundle runs, three globals are defined
  *   so the shared sender source picks the file://-safe code paths:
  *     globalThis.__AIRFERRY_STANDALONE__ = true   (gate flag)
  *     globalThis.__WORKER_CODE__          = "..."  (worker source as a string;
@@ -37,8 +38,9 @@ const outDir = path.join(root, "dist-standalone")
 const mainJs = path.join(outDir, "index.js")
 const cssFile = path.join(outDir, "web.css")
 const zstdWasm = path.join(outDir, "wasm-zstd.wasm")
+const senderFavicon = path.join(root, "public", "favicon-sender.png")
 
-for (const f of [mainJs, cssFile, zstdWasm]) {
+for (const f of [mainJs, cssFile, zstdWasm, senderFavicon]) {
   if (!fs.existsSync(f)) {
     console.error(`\n✖ Missing build artifact: ${path.relative(root, f)}\n  Run "vite build --config vite.standalone.config.ts" first.\n`)
     process.exit(1)
@@ -56,6 +58,7 @@ const workerPath = path.join(assetsDir, workerFile)
 
 const mainJsCode = fs.readFileSync(mainJs, "utf8")
 const cssCode = fs.readFileSync(cssFile, "utf8")
+const senderFaviconB64 = fs.readFileSync(senderFavicon).toString("base64")
 // The worker chunk is ES-formatted and contains `import.meta.url` inside the
 // lzma-wasm wasm-bindgen glue's fetch-fallback path. Under file:// we load the
 // worker from a Blob URL as a CLASSIC worker (best cross-browser support), so
@@ -110,6 +113,7 @@ const html = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="description" content="通过屏幕二维码视频流，无网传输文件到手机。单文件版，双击即可运行。">
+<link rel="icon" type="image/png" href="data:image/png;base64,${senderFaviconB64}">
 <title>AirFerry · 无网文件传输</title>
 <style>
 ${cssCode}
@@ -143,7 +147,13 @@ for (const f of [mainJs, cssFile, zstdWasm]) {
   }
 }
 // Files copied from public/ that the single-file build does not need.
-for (const f of ["airferry_zxing.js", "airferry_zxing.wasm", "zxing_reader.wasm"]) {
+for (const f of [
+  "airferry_zxing.js",
+  "airferry_zxing.wasm",
+  "zxing_reader.wasm",
+  "favicon-sender.png",
+  "favicon-receiver.png",
+]) {
   try {
     fs.unlinkSync(path.join(outDir, f))
   } catch (_) {

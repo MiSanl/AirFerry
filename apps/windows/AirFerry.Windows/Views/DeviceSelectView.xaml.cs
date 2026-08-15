@@ -7,14 +7,14 @@ using AirFerry.Windows.Services;
 namespace AirFerry.Windows.Views;
 
 /// <summary>
-/// The landing page — device selection (webcams + capture cards). Mirrors the
-/// user's explicit ask ("添加设备选择功能，可以选择摄像头或采集卡"): enumerate every
-/// DirectShow video-input device, let the user pick one, then navigate to the
-/// scan view bound to that device index.
+/// The landing page — mutually-exclusive scan-source selection. DirectShow
+/// cameras/capture cards and the screen picker are peers in one list; the only
+/// start button dispatches the selected source, so screen capture cannot be
+/// triggered accidentally alongside a hardware source.
 /// </summary>
 public partial class DeviceSelectView : Page
 {
-    private IReadOnlyList<DeviceInfo> _devices = Array.Empty<DeviceInfo>();
+    private IReadOnlyList<ScanSourceOption> _sources = Array.Empty<ScanSourceOption>();
     private readonly string? _resumeRootId;
 
     public DeviceSelectView() : this(null)
@@ -29,29 +29,23 @@ public partial class DeviceSelectView : Page
         {
             ResumeBar.Message = $"继续任务 {_resumeRootId[..8]}…：扫码时会忽略其他文件";
             ResumeBar.Visibility = Visibility.Visible;
-            StartButton.Content = "继续恢复";
         }
         Loaded += (_, _) => RefreshDevices();
     }
 
     private void RefreshDevices()
     {
-        DeviceList.Items.Clear();
-        _devices = DeviceEnumerator.Enumerate();
-        if (_devices.Count == 0)
-        {
-            EmptyStateBar.Visibility = Visibility.Visible;
-            SelectedInfo.Text = "";
-            StartButton.IsEnabled = false;
-            return;
-        }
-        EmptyStateBar.Visibility = Visibility.Collapsed;
-        foreach (DeviceInfo d in _devices)
-        {
-            DeviceList.Items.Add(d);
-        }
-        SelectedInfo.Text = $"共 {_devices.Count} 个设备";
-        // Pre-select the first device for quick start.
+        IReadOnlyList<DeviceInfo> devices = DeviceEnumerator.Enumerate();
+        _sources = ScanSourceOption.Build(devices);
+        DeviceList.ItemsSource = _sources;
+        EmptyStateBar.Visibility = devices.Count == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        SelectedInfo.Text = devices.Count == 0
+            ? "屏幕捕获可用"
+            : $"{devices.Count} 个视频设备 + 屏幕捕获";
+        // Keep quick start for hardware; when none exists, screen capture is
+        // the sole source and is selected explicitly in the same list.
         DeviceList.SelectedIndex = 0;
     }
 
@@ -59,41 +53,31 @@ public partial class DeviceSelectView : Page
 
     private void DeviceList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (DeviceList.SelectedIndex < 0 || DeviceList.SelectedIndex >= _devices.Count)
+        if (DeviceList.SelectedItem is not ScanSourceOption source)
         {
             StartButton.IsEnabled = false;
             return;
         }
-        DeviceInfo d = _devices[DeviceList.SelectedIndex];
         StartButton.IsEnabled = true;
-        SelectedInfo.Text = d.IsCaptureCard
-            ? $"已选择采集卡: {d.FriendlyName}"
-            : $"已选择摄像头: {d.FriendlyName}";
+        SelectedInfo.Text = $"已选择：{source.FriendlyName}";
+        StartButton.Content = source.IsScreenCapture
+            ? (_resumeRootId is null ? "选择屏幕并开始扫码" : "选择屏幕并继续恢复")
+            : (_resumeRootId is null ? "开始扫码" : "继续恢复");
     }
 
-    private void StartScan_Click(object sender, RoutedEventArgs e)
+    private async void StartScan_Click(object sender, RoutedEventArgs e)
     {
-        if (DeviceList.SelectedIndex < 0 || DeviceList.SelectedIndex >= _devices.Count)
+        if (DeviceList.SelectedItem is not ScanSourceOption selected)
         {
             return;
         }
-        DeviceInfo selected = _devices[DeviceList.SelectedIndex];
-        NavigationService?.Navigate(
-            new ScanView(new DeviceSource(selected.Index, selected.FriendlyName), _resumeRootId));
-    }
-
-    /// <summary>
-    /// Screenshot-style picker: drag = screen region, click = window, Esc =
-    /// cancel. Navigates to the scan page with the chosen source.
-    /// </summary>
-    private async void ScreenCapture_Click(object sender, RoutedEventArgs e)
-    {
-        // async void: any exception escaping here (PickAsync teardown rethrow,
-        // navigation failure, …) becomes an unhandled UI exception and kills
-        // the process — same containment as ReceiveBundleView.SaveAll_Click.
+        StartButton.IsEnabled = false;
+        DeviceList.IsEnabled = false;
         try
         {
-            ScanSource? source = await RegionPicker.PickAsync();
+            ScanSource? source = selected.IsScreenCapture
+                ? await RegionPicker.PickAsync()
+                : selected.CreateImmediateSource();
             if (source is null)
             {
                 return;
@@ -102,7 +86,12 @@ public partial class DeviceSelectView : Page
         }
         catch (Exception ex)
         {
-            await UiMessages.ErrorAsync($"屏幕捕获启动失败：{ex.Message}", "屏幕捕获");
+            await UiMessages.ErrorAsync($"扫描来源启动失败：{ex.Message}", "开始扫码");
+        }
+        finally
+        {
+            DeviceList.IsEnabled = true;
+            StartButton.IsEnabled = DeviceList.SelectedItem is ScanSourceOption;
         }
     }
 

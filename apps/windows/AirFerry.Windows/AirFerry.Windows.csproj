@@ -13,8 +13,8 @@
     <AssemblyName>AirFerry</AssemblyName>
     <RootNamespace>AirFerry.Windows</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <!-- Exe/taskbar/Alt-Tab icon (multi-size 16–128, generated from
-         apps/sender/assets/icon*.png — see AGENTS.md §3.4 for the regen
+    <!-- Exe/taskbar/Alt-Tab receiver icon (multi-size 16–128, generated from
+         apps/sender/assets/receiver-icon*.png — see AGENTS.md §3.4 for the regen
          command). Note: ApplicationIcon sets the Win32 exe icon; XAML use via
          pack:// URI requires the explicit <Resource Include="Assets\app.ico" /> below. -->
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
