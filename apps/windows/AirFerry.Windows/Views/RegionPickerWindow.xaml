@@ -1,0 +1,50 @@
+<Window x:Class="AirFerry.Windows.Views.RegionPickerWindow"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AirFerry - 选择捕获区域"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="True"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        Cursor="Cross"
+        Focusable="True">
+    <Grid>
+        <!-- Four dim borders leave the selection/hover area undimmed;
+             positioned programmatically in code-behind (physical → DIP). -->
+        <Canvas x:Name="OverlayCanvas">
+            <Border x:Name="DimTop" Background="#66000000" />
+            <Border x:Name="DimLeft" Background="#66000000" />
+            <Border x:Name="DimRight" Background="#66000000" />
+            <Border x:Name="DimBottom" Background="#66000000" />
+            <Border x:Name="SelBorder"
+                    BorderBrush="#2563EB"
+                    BorderThickness="2"
+                    Background="Transparent">
+                <TextBlock x:Name="SelLabel"
+                           Text="0 × 0"
+                           Foreground="White"
+                           FontSize="13"
+                           HorizontalAlignment="Right"
+                           VerticalAlignment="Bottom"
+                           Margin="0,0,8,5"
+                           Visibility="Collapsed" />
+            </Border>
+        </Canvas>
+        <Border Background="#CC1E293B"
+                CornerRadius="8"
+                Padding="16,8"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Top"
+                Margin="0,24,0,0"
+                IsHitTestVisible="False">
+            <TextBlock Text="拖动选择屏幕区域 · 单击选择窗口 · Esc 取消"
+                       Foreground="White"
+                       FontSize="14" />
+        </Border>
+    </Grid>
+</Window>

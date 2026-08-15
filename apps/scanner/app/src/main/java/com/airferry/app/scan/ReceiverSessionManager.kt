@@ -258,7 +258,7 @@ class ReceiverSessionManager {
     fun rootOriginalSize(): Long =
         if (initialized) NativeBridge.receiverRootOriginalSize(handle) else 0L
 
-    /** Original (uncompressed) offset of this segment in the root file (0 if not segmented). */
+    /** Offset of this segment within the **compressed** stream (index × SEGMENT_RAW_BYTES; 0 if not segmented). */
     fun originalOffset(): Long =
         if (initialized) NativeBridge.receiverOriginalOffset(handle) else 0L
 

@@ -38,9 +38,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      # actions 一律 pin commit SHA（与 windows.yml 同策略），注释保留版本号便于升级
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -49,12 +50,13 @@ jobs:
             apps/web/package-lock.json
 
       # sender 的 npm run wasm 需要 Rust + wasm32 目标 + wasm-pack
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable（与 windows.yml 同 pin）
         with:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
+        # 钉住版本：未锁版本时 crates.io 发新版会静默改变 WASM 产物/toolchain 行为
+        run: cargo install wasm-pack --locked --version 0.15.0
 
       # sender 的 postinstall 含 patch-parcel-dev-server（仅扩展 dev server 的
       # CORS 修复，对版本敏感）。CI 只需 wasm-pkg-simd，故 --ignore-scripts 跳过。
@@ -69,7 +71,7 @@ jobs:
       # same Emscripten version as core/zxing-decoder/link-wasm.sh. ZXing-C++ is
       # fetched at the pinned immutable commit (first run needs network).
       - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+        uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
         with:
           version: 3.1.64
 
@@ -98,11 +100,11 @@ jobs:
           # 但发送端根目录可能混入接收端 wasm 的旧文件，确保干净：
           rm -f _site/zxing_reader.wasm
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: _site
 
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

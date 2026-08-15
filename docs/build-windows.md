@@ -1,6 +1,6 @@
 # Windows 端构建指南
 
-> Windows 扫码接收端（C# WPF + Rust 引擎 DLL + ZXing-C++ DLL），支持**设备选择**（摄像头或采集卡）。相机解码镜像 Android v1.1.3 模式。
+> Windows 扫码接收端（C# WPF + Rust 引擎 DLL + ZXing-C++ DLL），支持**设备选择**（摄像头或采集卡）与**屏幕区域/窗口捕获**。相机解码镜像 Android v1.1.3 模式。
 
 ---
 
@@ -8,9 +8,10 @@
 
 | 层 | 技术 | 说明 |
 |----|------|------|
-| UI | WPF (.NET 8, C#) | 对标 Android Compose UI |
+| UI | WPF (.NET 8, C#) + **WPF-UI 4.3.0**（lepo.co Fluent 主题库） | 对标 Android Compose UI；浅色/深色/跟随系统三主题，`ui:FluentWindow` 单窗口 + Frame 页面流导航，细节见 §7.4 |
 | 相机/采集卡 | OpenCvSharp4 (DirectShow 后端) | 单句柄读取；Gray 送解码、池化 BGR24 快照送预览 |
 | 设备枚举 | DirectShowLib (DsDevice) | `FilterCategory.VideoInputDevice` 同时覆盖摄像头+采集卡 |
+| 屏幕区域/窗口捕获 | GDI（`BitBlt`/`PrintWindow`/`GetDIBits`，P/Invoke） | 零新增 NuGet 依赖；`ScreenCapture.cs` 实现 `IFrameSource`，与设备源同管线（详见 §7.1） |
 | QR 解码 | ZXing-C++（全帧/ROI 均 TryHarder + TryInvert） | `core/zxing-decoder/` + Windows 薄 C ABI，选项与 Android v1.1.3 相同 |
 | 核心引擎 | Rust `transfer-engine` (C ABI, `--features cffi`) | 编解码逻辑与 Android/WASM 共享，编译为 `transfer_engine.dll` |
 | MVVM | CommunityToolkit.Mvvm | ObservableObject / RelayCommand 源生成器 |
@@ -132,22 +133,34 @@ workflow_dispatch（手动输入已存在的 `release_tag`）且上述三 job �
        （tag commit、package/manifest 版本与 release 任一不一致即失败）
 ```
 
-操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.2`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。手动发布与 push 质量门按事件/tag 分组，不会互相取消。
+操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.3`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。手动发布与 push 质量门按事件/tag 分组，不会互相取消。
 
 本地 Windows 仍可用 `.\scripts\build-windows.ps1 -Pack`（产物进 `dist/`）。
 
 ---
 
-## 7. 设备选择（摄像头 / 采集卡）
+## 7. 设备选择（摄像头 / 采集卡 / 屏幕捕获）
 
 Windows 端的核心新增功能。启动后进入**设备选择页**：
 
 - 自动枚举所有 DirectShow 视频输入设备（`FilterCategory.VideoInputDevice`）
 - 摄像头（USB 摄像头、内置摄像头）与采集卡（USB HDMI 采集卡、专业 SDI 采集卡）在 DirectShow API 下是**同类设备**，统一列出
 - 通过设备名启发式标注（含 "capture"/"采集"/"HDMI"/"Magewell"/"Elgato" 等关键字 → 标为「采集卡」，仅显示用，行为无差别）
-- 下拉选择 + 刷新按钮，确认后点「开始扫码」进入扫码页
+- 列表选择 + 刷新按钮，确认后点「开始扫码」进入扫码页
+- 「🖥 屏幕捕获」按钮打开**截图式选择器**（`RegionPicker`）：每显示器一个半透明覆盖层，**拖动**=自定义矩形区域、**单击**=选中悬停高亮的窗口（EnumWindows 按 Z 序解析，跳过本进程/工具窗/cloaked/过小窗口）、**Esc** 取消；选定后直接进入扫码页
+- 适用场景：同机浏览器播放二维码做端到端测试（无需摄像头对屏）、虚拟机/远程桌面窗口、无摄像头的机器
 
-### 7.1 单采集源与停止生命周期
+### 7.1 屏幕区域/窗口捕获（GDI 实现）
+
+- **源抽象**：`Models/ScanSource.cs`（`DeviceSource`/`ScreenRegionSource`/`WindowSource`）从设备选择页贯穿到 `ScanViewModel.StartScan(ScanSource)`；`Scan/IFrameSource.cs` 是拉模式帧源契约（`IsOpen`/`ReadGray()`/`SnapshotBgr()`/`Dispose`），`FrameSourceFactory` 按类型分派，生产线程对源类型无感知
+- **区域模式**：每帧 `GetDC(NULL)` → `BitBlt`（虚拟屏幕物理像素，PerMonitorV2 下无需 DPI 换算；负坐标覆盖左侧/上方副屏）
+- **窗口模式**：`PrintWindow(PW_RENDERFULLCONTENT)` 优先（被遮挡时多数应用含 Chrome 仍可捕获），失败回退 `BitBlt` 屏幕区域（需窗口可见）；每帧重取 `GetWindowRect`，捕获跟随窗口移动/缩放
+- **帧处理**：`GetDIBits`（`biHeight` 负值 = top-down）直写复用的 BGRA Mat → `BGRA2GRAY` 一步到灰度；预览按 15Hz 惰性转 BGR24。MSDN 要求 `GetDIBits` 期间 bitmap 不得选入 DC——用 DC 原始 stock bitmap 换入换出。⚠️ 兼容位图必须对**屏幕 DC** 创建（`CreateCompatibleBitmap(GetDC(NULL), …)`）：内存 DC 默认选着 1×1 单色 stock bitmap，对内存 DC 调 CreateCompatibleBitmap 会得到 1-bit 单色位图，GetDIBits 下来就不是 BGRA32，预览和二维码解码都会退化
+- **节流**：GDI 无阻塞，`ReadGray` 内部按 60fps Stopwatch 节流（Sleep(1)+自旋），避免生产线程 CPU 空转
+- **终止语义**：窗口销毁或连续 30 帧失败 → `IsOpen=false`；生产线程检测后经 `Task.Run(StopScan)` 停止并提示「视频源已关闭」（不能在 producer 线程同步调 `StopScan`——会自 join 死锁）
+- **已知限制**：少数 DirectX 独占全屏/UWP 窗口 `PrintWindow` 渲染黑屏（回退 BitBlt 需窗口可见）；4K 全屏大区域 BitBlt 可能达不到 60fps（二维码流典型窗口尺寸无碍）
+
+### 7.2 单采集源与停止生命周期
 
 - 解码和预览共用一个 DirectShow 句柄；生产线程每次读取只向池化 Gray 缓冲复制一次，并按最高 15fps 发布 BGR24 预览快照，避免独占型驱动因双开设备导致黑屏。
 - 2–6 个 worker 调用 Windows 的 ZXing-C++ 核心，队列容量为 `worker+2`，每个 worker 最多累积 4 个符号后进入串行摄入；全帧/ROI 与 miss 计数状态机镜像 Android v1.1.3。
@@ -156,11 +169,20 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 - 停止会先作废旧会话的排队 UI 回调，并启动唯一的有序清理任务：等待生产者、完成后的组装/落盘任务及全部解码 worker 真正结束后，才释放 native handle/camera。前台最多等待 2 秒；慢摄像头超时后资源由后台任务继续持有并安全释放，期间禁止重启扫描，因此既不冻结 WPF Dispatcher，也不会并发 free/Dispose。
 - 状态卡以约 7Hz 一致快照显示 3 秒窗口解码速率、有效吞吐、采集/丢帧/已解码计数和源文件/传输大小；不显示容易误判的逐二维码 active/paused 状态。
 
-### 7.2 技术栈取舍
+### 7.3 技术栈取舍
 
 当前阶段保留 WPF，不把一次稳定性改造与 UI 框架迁移绑在一起。WPF 本身只支持 Windows，因此这里的“跨平台”边界是 Rust 协议核心、内容模型和可测试的纯 C# 协议层；WPF 仅作为 Windows 外壳。
 
 若后续确实需要桌面端同时覆盖 macOS/Linux，建议先把扫描编排、文件库和接收结果抽为不依赖 WPF 的 .NET 类库，再用 Avalonia 替换视图层。不要在现有 WPF 上继续叠 MAUI/Electron：这会保留 OpenCV、ZXing、Rust FFI 的全部复杂度，同时再增加一套运行时和打包链。
+
+### 7.4 UI 架构（WPF-UI Fluent 主题）
+
+视图层基于 lepo.co **WPF-UI 4.3.0**（csproj 中唯一 UI 库 PackageReference；纯托管 + 资源字典，PublishSingleFile 无特殊处理；Win10 兼容——不用 Mica 背景，`WindowBackdropType=None`）。结构与约定：
+
+- **窗口壳**：`Views/MainWindow.xaml` 是 `ui:FluentWindow`，内容 Grid 首行放 `ui:TitleBar`、第二行内嵌 `Frame`（`NavigationUIVisibility=Hidden`）——WPF-UI 4.x 没有 `FluentWindow.TitleBar` 属性元素写法，TitleBar 必须是窗口内容的首个子元素。7 个视图仍是 Page，导航调用（`NavigationService.Navigate/GoBack`）不变。`App.OnStartup` 手动创建并 Show MainWindow。
+- **主题**：`App.xaml` 合并 `ui:ThemesDictionary` + `ui:ControlsDictionary` + 自有语义 token 字典（`Themes/DesignTokens.{Light,Dark}.xaml`：`SuccessBrush`/`ErrorBrush`/`WarningBrush`/`PreviewBackdropBrush`）。`Services/ThemeService.cs` 按 `settings.json` 的 `theme` 键（`light`/`dark`/`system`，设置页可改）应用主题：跟随系统模式用 `SystemThemeWatcher.Watch` 监听 OS 切换；之后统一应用品牌主色 `#2563EB`。设置读写由 `Services/AppSettings.cs` 独占（手写 JSON，与 Android 端格式对齐）。**主题画刷一律 `DynamicResource` 引用**。
+- **控件约定**：`ui:Card` 卡片（继承 ContentControl、无 `Padding` 属性，内边距写到子元素 `Margin`；要填满行高须显式 `VerticalAlignment="Stretch"`）、`ui:Button Appearance=Primary/Secondary/Transparent`（**图标必须显式 `<ui:Button.Icon><ui:SymbolIcon …/></ui:Button.Icon>`，`Icon="…24"` 简写不渲染；满宽按钮须显式 `HorizontalAlignment="Stretch"`**，WPF-UI Button 样式默认左对齐）、`ui:InfoBar` 状态条、`ui:SymbolIcon` 图标；**`ComboBox`/`Slider` 没有 `ui:` 包装类**，直接用标准控件（ControlsDictionary 隐式样式接管）。弹窗统一 `Services/UiMessages.cs`（`ui:MessageBox`，调用方必须 `await`，勿同步阻塞 dispatcher）。
+- **RegionPickerWindow 例外**：全屏透明覆盖层与 FluentWindow 不兼容，保持普通 Window，配色固定（主题无关）。
 
 ---
 
@@ -191,6 +213,8 @@ dotnet test
 - `ProgressSnapshotTests`：进度 JSON 解析
 - `PreviewFrameTests`：池化预览缓冲的所有权与幂等释放
 - `ZxingDecoderTests`：共享 native packed 结果的长度、bbox、畸形输入及尾部字节拒绝
+- `ScanSourceTests`：视频源 record 的 DisplayName 与相等性（设备/屏幕区域/窗口三源）
+- `ScreenRectUtilTests`：选择器几何（任意方向拖动归一化、负坐标副屏、click 阈值、最小区域尺寸）
 
 共享 C++ 核心另有原生 CTest（几何校验与 packed 布局）：
 
@@ -209,6 +233,7 @@ ctest --test-dir apps/windows/native/build -C Release --output-on-failure
 | UI | Compose | WPF XAML |
 | 相机 | CameraX (Y plane) | OpenCvSharp VideoCapture (BGR→Gray) |
 | 设备枚举 | CameraX 自动 | DirectShow DsDevice（★新增设备选择） |
+| 屏幕捕获 | （无） | ★GDI BitBlt/PrintWindow：屏幕区域 + 独立窗口作为视频源（`ScreenCapture.cs` + 截图式 `RegionPicker`） |
 | QR 解码 | ZXing-C++ v1.1.3 路径（JNI） | 等价 ZXing-C++ 模式（C ABI/P/Invoke） |
 | 核心引擎 | Rust `jni.rs` (JNI) | Rust `cffi.rs` (C ABI) |
 | 并行解码 | 2–6 workers + v1.1.3 调度/4 符号批摄入 | 同 worker/队列/批量/miss 状态机 + ingestLock |

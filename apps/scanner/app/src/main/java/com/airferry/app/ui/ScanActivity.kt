@@ -523,6 +523,9 @@ class ScanActivity : ComponentActivity() {
     }
 
     private var lastUiUpdate = 0L
+    /** Written on the main thread AND from ioExecutor (recovery failure /
+     *  re-archive paths), read on the main thread (onResume) → must be volatile. */
+    @Volatile
     private var completedHandled = false
     /** Once recovery completes, stop feeding the native receiver so the
      *  main-thread assemble() (a `&` borrow) can't race a worker ingest (`&mut`). */
@@ -558,14 +561,20 @@ class ScanActivity : ComponentActivity() {
         // stays cheap; the full progress is fetched only on the throttled UI tick.
         val status = session.ingest(payload) ?: return
 
-        // Duplicate-segment fast path (per-frame, not gated on the UI tick):
-        // once the descriptor confirms the segment metadata, if this segment is
-        // already stored in the active SegmentAssembler there is no point
-        // receiving the whole (~32 MiB) segment again — skip straight to the
-        // next one. Runs here (ingest lock) so the re-scan of a completed
-        // segment is rejected on the descriptor frame itself, before the UI
-        // even shows "receiving".
-        if (!status.complete && session.isInitialized && session.isSegmented()) {
+        // Duplicate-segment fast path — evaluated on DESCRIPTOR frames only
+        // (the sender re-sends the descriptor every 17 frames, so this still
+        // fires promptly). The old implementation ran per data symbol, doing a
+        // disk-ledger read + JSON parse (+ a full ~32 MiB SHA-256 in
+        // hasStoredSegment) and an unconditional Log.w for EVERY ingested
+        // symbol. Once the descriptor confirms the segment metadata, if this
+        // segment is already stored there is no point receiving the whole
+        // (~32 MiB) segment again — skip straight to the next one. Runs here
+        // (ingest lock) so the re-scan of a completed segment is rejected on
+        // the descriptor frame itself, before the UI even shows "receiving".
+        if (!status.complete && session.isInitialized && session.isSegmented() &&
+            payload.size > 3 &&
+            (payload[3].toInt() and 0xFF and ReceiverSessionManager.FLAG_DESCRIPTOR) != 0
+        ) {
             val idx = session.segmentIndex()
             val cnt = session.segmentCount()
             val lo = session.rootSessionIdLo()
@@ -577,9 +586,25 @@ class ScanActivity : ComponentActivity() {
             val inMem = asm != null && asm.rootSessionIdLo() == lo && asm.rootSessionIdHi() == hi
             val dup = if (inMem) asm!!.hasSegment(idx)
                 else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)
-            Log.w(TAG, "dupSeg: segIdx=$idx cnt=$cnt inMem=$inMem " +
-                "hasSeg=${if (inMem) asm!!.hasSegment(idx) else com.airferry.app.scan.SegmentAssembler.hasStoredSegment(com.airferry.app.scan.ContentStore.root(this), lo, hi, idx)} => dup=$dup")
             if (dup) {
+                val rootHex = rootSessionIdHex(lo, hi)
+                // H2: before skipping, check whether the ledger is ALREADY
+                // complete. If the promotion into ContentStore was interrupted
+                // (asm.finish() failed on a full disk, or the process died
+                // between finish() and putFile), blindly swapping to the next
+                // segment makes the crash-recovery archive branch in
+                // handleSegmentedTransfer unreachable — the data would stay
+                // locked in .partial forever. A complete ledger must re-run the
+                // idempotent archive instead of skipping.
+                val ledgerComplete = if (inMem) asm!!.isComplete()
+                else com.airferry.app.scan.SegmentAssembler.listTasks(
+                    com.airferry.app.scan.ContentStore.root(this)
+                ).any { it.rootSessionIdHex == rootHex && it.receivedCount >= it.segmentCount }
+                if (ledgerComplete && (resumeRootId == null || resumeRootId == rootHex)) {
+                    enqueueSegmentedReArchive(if (inMem) asm else null)
+                    return
+                }
+                Log.i(TAG, "dupSeg: segIdx=$idx cnt=$cnt inMem=$inMem => skip to next segment")
                 val dupText = "第 ${idx + 1}/$cnt 段已接收过，自动跳过"
                 runOnUiThread { updateUi { it.copy(statusText = dupText) } }
                 swapReceiverForNextSegment()
@@ -1129,6 +1154,100 @@ class ScanActivity : ComponentActivity() {
         return archiveSegmentedTransfer(asm, displayName, decompressedSize)
     }
 
+    /**
+     * Re-run the (idempotent) promotion of a fully-received segmented transfer
+     * into ContentStore. Triggered from the duplicate-segment fast path when
+     * the ledger turns out to be COMPLETE — i.e. every segment is durable but
+     * the original archive was interrupted (disk-full during `asm.finish()`,
+     * or the process dying between `finish()` and `putFile`). Skipping to the
+     * next segment instead would strand the data in `.partial` forever, because
+     * the archive branch inside [handleSegmentedTransfer] is only reachable
+     * via a segment's normal completion, which a dup-swap never reaches.
+     *
+     * Scheduling mirrors the completion path in [applySnapshot]: the heavy work
+     * (open ledger → stream-decompress → putFile) is posted to [ioExecutor]
+     * and runs under the *captured* pool's ingest lock — never on the decode
+     * worker that detected it (which already holds the lock), never on the
+     * main thread.
+     *
+     * @param active the in-memory assembler when it already matches this root
+     *        and is complete; null → the durable ledger is re-opened from disk
+     *        using the descriptor snapshot (which re-verifies every stored
+     *        segment's SHA-256 before declaring completeness).
+     */
+    private fun enqueueSegmentedReArchive(active: com.airferry.app.scan.SegmentAssembler?) {
+        // Snapshot every descriptor field the re-open needs BEFORE leaving the
+        // ingest lock — the session may be reset/destroyed by the time the
+        // task runs, and reading it then would be a use-after-free.
+        val lo = session.rootSessionIdLo()
+        val hi = session.rootSessionIdHi()
+        val count = session.segmentCount()
+        val compressedSize = session.rootOriginalSize()
+        val decompressedSize = session.originalSize()
+        val compression = session.compression()
+        val crc32Val = session.crc32()
+        val crc32Known = session.crc32Known()
+        val rootSha256 = session.rootSha256()
+        val fileName = session.fileName()
+        // Block any further ingest: this segment is already durable so the
+        // remaining symbols are useless, and stragglers in the same batched
+        // flush must not re-run the dup check and enqueue a second archive.
+        ingestStopped.set(true)
+        updateRecoveryStage("检测到已完成的分段任务，正在入库…")
+        val poolAtEnqueue = decodePool
+        ioExecutor.execute {
+            try {
+                var intent: Intent? = null
+                val work = fun() {
+                    val sha = requireNotNull(rootSha256) { "分段描述符缺少整文件 SHA-256" }
+                    require(sha.size == 32) { "分段描述符 SHA-256 长度无效" }
+                    val asm = active ?: com.airferry.app.scan.SegmentAssembler.open(
+                        com.airferry.app.scan.ContentStore.root(this),
+                        lo, hi, count, compressedSize, decompressedSize, compression,
+                        crc32Val, crc32Known, sha, fileName,
+                    ).also { segAssembler = it }
+                    if (!asm.isComplete()) {
+                        // The cheap ledger check was a false positive (open()'s
+                        // per-segment re-verification rejected bitmap entries —
+                        // e.g. .partial corrupted in place). Keep the verified
+                        // segments and go back to scanning the missing ones.
+                        Log.i(TAG, "reArchive: ledger not actually complete — resume scanning")
+                        swapReceiverForNextSegment()
+                        clearRecoveryStage()
+                        return
+                    }
+                    intent = archiveSegmentedTransfer(asm, fileName, decompressedSize)
+                }
+                // Always serialize via the captured pool (same reasoning as the
+                // completion path in applySnapshot — see the long comment there).
+                poolAtEnqueue?.runExclusive(work)
+                intent?.let {
+                    runOnUiThread {
+                        completedHandled = true
+                        startActivity(it)
+                    }
+                }
+            } catch (e: Exception) {
+                clearRecoveryStage()
+                resetReceiverAfterRecoveryFailure()
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        e.message ?: "保存接收内容失败",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            } catch (e: OutOfMemoryError) {
+                Log.e(TAG, "segmented re-archive OOM", e)
+                clearRecoveryStage()
+                resetReceiverAfterRecoveryFailure()
+                runOnUiThread {
+                    Toast.makeText(this, "文件过大，接收内存不足", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     private fun archiveSegmentedTransfer(
         asm: com.airferry.app.scan.SegmentAssembler,
         displayName: String,
@@ -1354,16 +1473,38 @@ class ScanActivity : ComponentActivity() {
         "继续恢复任务 ${it.take(8)}… — 对准对应分段二维码"
     } ?: "就绪 — 对准二维码…"
 
+    /**
+     * Reset the native receiver on a background thread, under the pool's ingest
+     * lock. Main-thread callers (重扫 button, onResume) must NEVER block on that
+     * lock directly: an in-flight archive (recoverAndStage → asm.finish() 解压 +
+     * CRC + SHA → putFile, executed on ioExecutor via runExclusive) can hold it
+     * for tens of seconds on large transfers — a lock acquire without timeout
+     * on the main thread is a guaranteed ANR (H3). The swap is posted to the
+     * single-threaded [ioExecutor] so it also stays ordered behind any queued
+     * archive work.
+     */
+    private fun resetReceiverAsync() {
+        val poolAtEnqueue = decodePool
+        ioExecutor.execute {
+            val swap = {
+                session.destroy()
+                session = ReceiverSessionManager()
+                ingestStopped.set(false)
+            }
+            try {
+                poolAtEnqueue?.runExclusive(swap) ?: swap()
+            } catch (resetError: Exception) {
+                Log.e(TAG, "failed to reset receiver", resetError)
+            }
+        }
+    }
+
     private fun resetSession() {
         segAssembler = null
         // Swap the receiver under the pool's ingest lock so no worker is mid-ingest
-        // while we destroy the old native handle.
-        val swap = {
-            session.destroy()
-            session = ReceiverSessionManager()
-            ingestStopped.set(false)
-        }
-        decodePool?.runExclusive(swap) ?: swap()
+        // while we destroy the old native handle — asynchronously (see
+        // [resetReceiverAsync]); the UI-visible counters below reset immediately.
+        resetReceiverAsync()
         completedHandled = false
         lastUiUpdate = 0
         rateSamples.clear()
@@ -1400,12 +1541,10 @@ class ScanActivity : ComponentActivity() {
         super.onResume()
         // If returning from ReceiveDetailActivity after completion, reset for next scan.
         if (completedHandled) {
-            val swap = {
-                session.destroy()
-                session = ReceiverSessionManager()
-                ingestStopped.set(false)
-            }
-            decodePool?.runExclusive(swap) ?: swap()
+            // Never wait on the ingest lock on the main thread — an in-flight
+            // archive may hold it for tens of seconds (H3). Post the swap to
+            // ioExecutor; reset the UI-visible counters immediately.
+            resetReceiverAsync()
             completedHandled = false
             lastUiUpdate = 0
             rateSamples.clear()
@@ -1493,14 +1632,33 @@ class ScanActivity : ComponentActivity() {
             // (0..=0xFFFFFFFF) so it compares correctly with the JNI-supplied
             // expected CRC (also a Long). Using Int would sign-flip high-bit
             // values and break equality.
-            var crc = 0xFFFFFFFF.toInt()
-            for (b in data) {
-                crc = crc xor (b.toInt() and 0xFF)
-                repeat(8) {
-                    crc = if (crc and 1 != 0) (crc ushr 1) xor 0xEDB88320.toInt() else crc ushr 1
+            // java.util.zip.CRC32 is the table-driven JVM implementation — the
+            // previous bit-by-bit software loop was ~50× slower and sat on the
+            // recovery hot path (multi-MB payloads) and the file-list open path.
+            val crc = java.util.zip.CRC32()
+            crc.update(data)
+            return crc.value
+        }
+
+        /**
+         * Streaming CRC32 over a file (64 KiB buffer) — O(1) memory regardless
+         * of file size. Replaces the old `crc32OfBytes(file.readBytes())`
+         * pattern in the file list, which whole-loaded blobs of hundreds of MiB
+         * and OOM-crashed (an Error the surrounding `catch (Exception)` could
+         * not intercept). Returns the same unsigned 32-bit Long as
+         * [crc32OfBytes]; throws on I/O failure (caller decides the fallback).
+         */
+        fun crc32OfFile(file: java.io.File): Long {
+            val crc = java.util.zip.CRC32()
+            java.io.FileInputStream(file).use { ins ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    crc.update(buf, 0, n)
                 }
             }
-            return (crc xor 0xFFFFFFFF.toInt()).toLong() and 0xFFFFFFFFL
+            return crc.value
         }
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@airferry/sender",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "AirFerry sender — Chrome/Edge/Firefox extension that streams QR codes.",
   "type": "module",
   "license": "MIT",
@@ -15,6 +15,7 @@
     "build:firefox-mv3": "node scripts/extract-lzma-wasm.cjs && node scripts/prepare-plasmo-icon.cjs && node scripts/build-all.cjs firefox-mv3",
     "build:firefox-mv2": "node scripts/extract-lzma-wasm.cjs && node scripts/prepare-plasmo-icon.cjs && node scripts/build-all.cjs firefox-mv2",
     "package": "plasmo package",
+    "test": "node scripts/test-receive-guard.mjs",
     "wasm": "node scripts/build-wasm.cjs",
     "wasm:legacy": "node scripts/build-wasm.cjs legacy",
     "wasm:simd": "node scripts/build-wasm.cjs simd"
@@ -44,7 +45,7 @@
   "manifest": {
     "name": "AirFerry - 无网文件传输",
     "description": "通过屏幕二维码视频流，无网传输文件到手机。无需网络、蓝牙、USB。",
-    "version": "1.2.2",
+    "version": "1.2.3",
     "permissions": [],
     "content_security_policy": {
       "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"

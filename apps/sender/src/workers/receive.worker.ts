@@ -39,6 +39,11 @@ import {
   storeVerifiedSegment,
   type StoredSegmentTask,
 } from "@/receive/taskStore"
+import {
+  isCacheBootstrapProbe,
+  isDescriptorCandidate,
+  shouldDropMismatchedSession,
+} from "@/receive/sessionGuard"
 
 /** ingest packed-status bit layout (mirror ingest_status.rs). */
 const STATUS_COMPLETE = 0x1n
@@ -88,6 +93,13 @@ let session: ReceiverSessionWasm | null = null
 let activeJobId = 0
 let ready = false
 let lastMetaSent = false
+/**
+ * True once this bootstrap's ingest has accepted/buffered any frame (the
+ * packed status `accepted` bit). Mirrors Android/Windows `everAccepted`:
+ * a session that already made progress is never dropped by the mismatch
+ * relock below. Reset together with the session in `dropSession()`.
+ */
+let everAccepted = false
 
 /**
  * wasm-bindgen `free()` is not idempotent: a second call can dereference an
@@ -123,11 +135,12 @@ function recoveredTransferables(recovered: Recovered): Transferable[] {
   return [...buffers]
 }
 
-/** Drop the current session (if any); called on a new job / reset. */
+/** Drop the current session (if any); called on a new job / reset / relock. */
 function dropSession(): void {
   freeSession(session)
   session = null
   lastMetaSent = false
+  everAccepted = false
 }
 
 function readMeta(s: ReceiverSessionWasm): MetaInfo {
@@ -221,7 +234,7 @@ function ingestBatch(frames: Uint8Array[], jobId: number): IngestBatchResult {
     // data frames and confirms OTI as soon as a descriptor arrives. So scanning
     // any code can begin buffering; the transfer establishes on the next
     // descriptor tick.
-    const descIdx = frames.findIndex((f) => f.length >= 64 && (f[3] & 0x01) !== 0)
+    const descIdx = frames.findIndex(isDescriptorCandidate)
     if (descIdx >= 0) {
       try {
         session = ReceiverSessionWasm.from_descriptor(frames[descIdx])
@@ -241,8 +254,13 @@ function ingestBatch(frames: Uint8Array[], jobId: number): IngestBatchResult {
       // consumed by from_descriptor).
       frames = frames.slice(descIdx + 1)
     } else {
-      // Cache-only bootstrap from any valid data frame's session id.
-      const probe = frames.find((f) => f.length >= 64 && (f[3] & 0x01) === 0)
+      // Cache-only bootstrap from any valid data frame's session id. The probe
+      // MUST validate magic/version (isCacheBootstrapProbe) — the raw length +
+      // flag check used before let any environmental QR code (URL, payment
+      // code, …) supply a garbage session id, locking the worker out of every
+      // real frame (see the mismatch relock below for the CRC-passing
+      // mis-decode case).
+      const probe = frames.find(isCacheBootstrapProbe)
       if (!probe) return result
       try {
         // Frame session_id is a big-endian 128-bit at header[4..20]:
@@ -267,11 +285,43 @@ function ingestBatch(frames: Uint8Array[], jobId: number): IngestBatchResult {
       continue // frame rejected (bad CRC / length)
     }
     received = Number((status >> 32n) & 0xffffffffn)
-    if (status & 0x2n) result.acceptedCount++
+    if (status & 0x2n) {
+      result.acceptedCount++
+      everAccepted = true
+    }
     result.mismatchStreak = Number((status >> 8n) & 0xffffn)
     if (status & STATUS_COMPLETE) {
       result.complete = true
       result.receivedSymbols = received
+      break
+    }
+    // --- Session-mismatch relock (mirrors Android ReceiverSessionManager /
+    // Windows ReceiverSession: `mismatchStreak >= 3 && !everAccepted`) ---
+    // Rust never re-locks by itself: a cache-bootstrap onto a wrong session
+    // id (mis-decode that still passed the magic/version probe) rejects
+    // every real frame — including descriptors — with SessionMismatch
+    // forever, and the UI is stuck at "接收中 0". When nothing was ever
+    // accepted and the descriptor never confirmed, drop the session; the
+    // next batch re-bootstraps (from a descriptor, or a fresh probe). This
+    // also recovers the handleSegmentComplete residue case: a new session
+    // bootstrapped from stale frames of an already-stored segment locks
+    // onto the old child id, the new segment's frames mismatch → relock →
+    // wait for the correct descriptor. After meta is confirmed the session
+    // came from a validated descriptor and is never garbage — no relock.
+    if (
+      jobId === activeJobId && // same stale-job guard as maybePostMeta
+      shouldDropMismatchedSession({
+        metaConfirmed: session.meta_confirmed(),
+        everAccepted,
+        mismatchStreak: result.mismatchStreak,
+      })
+    ) {
+      post({
+        type: "warn",
+        message: "会话不匹配，已重置接收会话，等待新的二维码建立传输",
+        jobId,
+      })
+      dropSession()
       break
     }
   }
@@ -279,17 +329,20 @@ function ingestBatch(frames: Uint8Array[], jobId: number): IngestBatchResult {
   // Refresh meta post-confirm if not yet sent.
   maybePostMeta(jobId)
   // Rich progress snapshot for the UI (rates, decoded/total symbols, sizes).
-  try {
-    result.snapshot = parseProgress(session)
-    // Before meta is confirmed, progress_json reports total_symbols = 0; estimate
-    // it from the frame header so the first codes show moving progress instead of
-    // a stuck 0% (mirrors Android's estimatedTotalSymbols).
-    if (result.snapshot && result.snapshot.totalSymbols === 0) {
-      const est = estimateTotalSymbols(frames)
-      if (est > 0) result.snapshot.totalSymbols = est
+  // The mismatch relock above may have dropped the session mid-batch.
+  if (session) {
+    try {
+      result.snapshot = parseProgress(session)
+      // Before meta is confirmed, progress_json reports total_symbols = 0; estimate
+      // it from the frame header so the first codes show moving progress instead of
+      // a stuck 0% (mirrors Android's estimatedTotalSymbols).
+      if (result.snapshot && result.snapshot.totalSymbols === 0) {
+        const est = estimateTotalSymbols(frames)
+        if (est > 0) result.snapshot.totalSymbols = est
+      }
+    } catch {
+      /* progress_json parse failure is non-fatal */
     }
-  } catch {
-    /* progress_json parse failure is non-fatal */
   }
   return result
 }

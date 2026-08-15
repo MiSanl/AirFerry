@@ -1,18 +1,19 @@
 <Page x:Class="AirFerry.Windows.Views.DeviceSelectView"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
       Title="AirFerry - 选择设备"
-      Background="{StaticResource BgDark}"
-      MinWidth="640" MinHeight="560">
-    <Grid Margin="32">
+      Background="{DynamicResource ApplicationBackgroundBrush}">
+    <Grid Margin="32,24,32,32">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Top bar: title + settings. -->
+        <!-- Header: app identity + settings. -->
         <Grid Grid.Row="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
@@ -20,69 +21,132 @@
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0">
                 <TextBlock Text="AirFerry"
-                           FontSize="28" FontWeight="Bold"
-                           Foreground="{StaticResource TextPrimary}" />
+                           FontSize="26" FontWeight="Bold"
+                           Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
                 <TextBlock Text="光学文件传输 · 选择视频设备"
                            FontSize="14"
-                           Foreground="{StaticResource TextSecondary}"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                            Margin="0,4,0,0" />
             </StackPanel>
-            <Button Grid.Column="1"
-                    Style="{StaticResource OutlinedButton}"
-                    Content="⚙ 设置"
-                    Click="Settings_Click"
-                    VerticalAlignment="Top" />
+            <ui:Button Grid.Column="1"
+                       Appearance="Transparent"
+                       Content="设置"
+                       Click="Settings_Click"
+                       VerticalAlignment="Top">
+                <ui:Button.Icon>
+                    <ui:SymbolIcon Symbol="Settings24" />
+                </ui:Button.Icon>
+            </ui:Button>
         </Grid>
 
+        <!-- Resume banner (visible only when continuing a segmented task). -->
+        <ui:InfoBar Grid.Row="1"
+                    x:Name="ResumeBar"
+                    Severity="Informational"
+                    Title="继续恢复任务"
+                    IsClosable="False"
+                    Visibility="Collapsed"
+                    Margin="0,12,0,0" />
+
         <!-- Device list: webcams + capture cards together. -->
-        <Border Grid.Row="1"
-                Background="{StaticResource CardBg}"
-                CornerRadius="12"
-                Padding="20"
-                Margin="0,24,0,0">
-            <Grid>
+        <ui:Card Grid.Row="2" Margin="0,16,0,0" VerticalAlignment="Stretch">
+            <Grid Margin="20">
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
-                <TextBlock Grid.Row="0"
-                           Text="可用设备"
-                           FontSize="14"
-                           Foreground="{StaticResource TextSecondary}"
-                           Margin="0,0,0,12" />
-                <ListBox Grid.Row="1"
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0"
+                               Text="可用设备"
+                               FontSize="15" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock Grid.Column="1"
+                               x:Name="SelectedInfo"
+                               FontSize="12"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               VerticalAlignment="Center" />
+                </Grid>
+                <ui:InfoBar Grid.Row="1"
+                            x:Name="EmptyStateBar"
+                            Severity="Warning"
+                            Title="未检测到视频设备"
+                            Message="请连接摄像头或采集卡后点击刷新"
+                            IsClosable="False"
+                            Visibility="Collapsed"
+                            Margin="0,12,0,0" />
+                <ListBox Grid.Row="2"
                          x:Name="DeviceList"
                          Background="Transparent"
                          BorderThickness="0"
-                         Foreground="{StaticResource TextPrimary}"
                          FontSize="15"
-                         SelectionChanged="DeviceList_SelectionChanged" />
+                         Margin="-8,8,-8,-8"
+                         SelectionChanged="DeviceList_SelectionChanged">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="4,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <ui:SymbolIcon x:Name="DeviceIcon"
+                                               Symbol="Camera24"
+                                               FontSize="20"
+                                               VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1"
+                                           Text="{Binding FriendlyName}"
+                                           VerticalAlignment="Center"
+                                           TextTrimming="CharacterEllipsis"
+                                           Margin="12,0,0,0" />
+                            </Grid>
+                            <DataTemplate.Triggers>
+                                <DataTrigger Binding="{Binding IsCaptureCard}" Value="True">
+                                    <Setter TargetName="DeviceIcon" Property="Symbol" Value="Video24" />
+                                </DataTrigger>
+                            </DataTemplate.Triggers>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
             </Grid>
-        </Border>
+        </ui:Card>
 
-        <!-- Selected device info / refresh. -->
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,16,0,0">
-            <Button Style="{StaticResource OutlinedButton}"
-                    Content="🔄 刷新设备列表"
-                    Click="Refresh_Click" />
-            <StackPanel Margin="16,0,0,0" VerticalAlignment="Center">
-                <TextBlock x:Name="SelectedInfo"
-                           Foreground="{StaticResource TextSecondary}"
-                           FontSize="13" />
-                <TextBlock x:Name="ResumeHint"
-                           Visibility="Collapsed"
-                           Foreground="{StaticResource Accent}"
-                           FontSize="12" Margin="0,3,0,0" />
-            </StackPanel>
+        <!-- Secondary actions. -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,16,0,0">
+            <ui:Button Appearance="Secondary"
+                       Content="刷新设备列表"
+                       Click="Refresh_Click">
+                <ui:Button.Icon>
+                    <ui:SymbolIcon Symbol="ArrowClockwise24" />
+                </ui:Button.Icon>
+            </ui:Button>
+            <ui:Button Appearance="Secondary"
+                       Content="屏幕捕获"
+                       Click="ScreenCapture_Click"
+                       Margin="12,0,0,0">
+                <ui:Button.Icon>
+                    <ui:SymbolIcon Symbol="Desktop24" />
+                </ui:Button.Icon>
+            </ui:Button>
         </StackPanel>
 
-        <!-- Start scan button. -->
-        <Button Grid.Row="3"
-                Style="{StaticResource PrimaryButton}"
-                Content="▶ 开始扫码"
-                Click="StartScan_Click"
-                Margin="0,16,0,0"
-                IsEnabled="False"
-                x:Name="StartButton" />
+        <!-- Primary action. -->
+        <ui:Button Grid.Row="4"
+                   x:Name="StartButton"
+                   Appearance="Primary"
+                   Content="开始扫码"
+                   Click="StartScan_Click"
+                   Margin="0,20,0,0"
+                   FontSize="15"
+                   Padding="0,10"
+                   HorizontalAlignment="Stretch"
+                   IsEnabled="False">
+            <ui:Button.Icon>
+                <ui:SymbolIcon Symbol="Play24" />
+            </ui:Button.Icon>
+        </ui:Button>
     </Grid>
 </Page>

@@ -2,7 +2,7 @@
 
 ## 概述
 
-AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览器扩展或网页）将文件/文字编码为二维码视频流在屏幕上连续播放；接收端（网页 / Android App / Windows 桌面）用摄像头或采集卡实时扫描并恢复内容。编解码共享同一套 Rust 核心库，分别编译为 WebAssembly、Android JNI `.so`、Windows C ABI DLL，确保数学一致。
+AirFerry 是一个完全离线的光学文件传输系统。发送端（浏览器扩展或网页）将文件/文字编码为二维码视频流在屏幕上连续播放；接收端（网页 / Android App / Windows 桌面）用摄像头、采集卡或（Windows 端）屏幕区域/窗口捕获实时扫描并恢复内容。编解码共享同一套 Rust 核心库，分别编译为 WebAssembly、Android JNI `.so`、Windows C ABI DLL，确保数学一致。
 
 ## 架构图
 
@@ -87,7 +87,7 @@ core/
 ### 接收端
 
 ```
-摄像头 / 采集卡视频流 (~60fps)
+摄像头 / 采集卡 / [Windows] 屏幕区域·窗口捕获 (~60fps)
   │
   ├─ 生产者将 Gray 池化拷贝一次入队 → 2–6 worker 并行 ZXing-C++
   ├─ Android：v1.1.3 调度/JNI；Windows：等价 C#/C ABI 模式

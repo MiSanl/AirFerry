@@ -1,22 +1,21 @@
-using System.IO;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using AirFerry.Windows.Services;
 
 namespace AirFerry.Windows.Views;
 
 /// <summary>
 /// Settings page — mirrors Android's <c>SettingsActivity</c>: a "default
-/// redundancy" slider persisted to %AppData%\AirFerry\settings.json (the .NET
-/// analogue of SharedPreferences), plus the version read from the assembly (the
-/// single source of truth — the csproj <c>&lt;Version&gt;</c>).
+/// redundancy" slider and an appearance selector (light / dark / follow
+/// system), both persisted via <see cref="AppSettings"/>
+/// (%AppData%\AirFerry\settings.json, the .NET analogue of SharedPreferences),
+/// plus the version read from the assembly (the single source of truth — the
+/// csproj <c>&lt;Version&gt;</c>).
 /// </summary>
 public partial class SettingsView : Page
 {
-    private const int DefaultRedundancy = 5;
-    private static readonly string SettingsPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "AirFerry", "settings.json");
+    private bool _populating;
 
     public SettingsView()
     {
@@ -26,64 +25,55 @@ public partial class SettingsView : Page
 
     private void Populate()
     {
-        int redundancy = LoadRedundancy();
-        RedundancySlider.Value = redundancy;
-        RedundancyText.Text = $"{redundancy}%";
+        _populating = true;
+        try
+        {
+            int redundancy = AppSettings.Redundancy;
+            RedundancySlider.Value = redundancy;
+            RedundancyText.Text = $"{redundancy}%";
 
-        // Read version from the assembly (the csproj <Version>).
-        Version? ver = Assembly.GetExecutingAssembly().GetName().Version;
-        VersionText.Text = ver is not null ? $"版本 {ver.Major}.{ver.Minor}.{ver.Build}" : "版本 ?";
+            ThemeComboBox.SelectedIndex = AppSettings.Theme switch
+            {
+                AppSettings.ThemeLight => 1,
+                AppSettings.ThemeDark => 2,
+                _ => 0,
+            };
+
+            // Read version from the assembly (the csproj <Version>).
+            Version? ver = Assembly.GetExecutingAssembly().GetName().Version;
+            VersionText.Text = ver is not null ? $"版本 {ver.Major}.{ver.Minor}.{ver.Build}" : "版本 ?";
+        }
+        finally
+        {
+            _populating = false;
+        }
     }
 
     private void Redundancy_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         int value = (int)Math.Round(e.NewValue);
         RedundancyText.Text = $"{value}%";
-        SaveRedundancy(value);
+        if (_populating)
+        {
+            return;
+        }
+        AppSettings.SetRedundancy(value);
     }
 
-    private static int LoadRedundancy()
+    private void Theme_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        try
+        if (_populating)
         {
-            if (File.Exists(SettingsPath))
-            {
-                string json = File.ReadAllText(SettingsPath);
-                // Minimal hand-rolled parse — avoids a System.Text.Json dep here.
-                int idx = json.IndexOf("\"default_redundancy\"");
-                if (idx >= 0)
-                {
-                    int colon = json.IndexOf(':', idx);
-                    if (colon >= 0)
-                    {
-                        int start = colon + 1;
-                        while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) start++;
-                        int end = start;
-                        while (end < json.Length && char.IsDigit(json[end])) end++;
-                        if (int.TryParse(json.AsSpan(start, end - start), out int v))
-                        {
-                            return Math.Clamp(v, 5, 50);
-                        }
-                    }
-                }
-            }
+            return;
         }
-        catch { /* fall through to default */ }
-        return DefaultRedundancy;
-    }
-
-    private static void SaveRedundancy(int value)
-    {
-        try
+        string theme = ThemeComboBox.SelectedIndex switch
         {
-            string? dir = Path.GetDirectoryName(SettingsPath);
-            if (dir is not null)
-            {
-                Directory.CreateDirectory(dir);
-            }
-            File.WriteAllText(SettingsPath, $"{{\"default_redundancy\":{value}}}");
-        }
-        catch { /* settings are best-effort; never block the UI */ }
+            1 => AppSettings.ThemeLight,
+            2 => AppSettings.ThemeDark,
+            _ => AppSettings.ThemeSystem,
+        };
+        AppSettings.SetTheme(theme);
+        ThemeService.ApplyPreference(theme, Window.GetWindow(this));
     }
 
     private void Back_Click(object sender, RoutedEventArgs e) => NavigationService?.GoBack();

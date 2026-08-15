@@ -69,6 +69,13 @@ class ReceiveBundleActivity : ComponentActivity() {
     /** Index of the file we are currently saving in the sequential save-all flow. */
     private var pendingSaveIndex = 0
 
+    /**
+     * Background thread for the SAF save copies (M6): whole-streaming a blob of
+     * up to hundreds of MiB on the main thread (the activity-result callback)
+     * is a guaranteed ANR. Single thread keeps concurrent "save" taps ordered.
+     */
+    private val saveExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     private val saveOne = registerForActivityResult(
         CreateNamedDocument()
     ) { uri: Uri? ->
@@ -111,6 +118,11 @@ class ReceiveBundleActivity : ComponentActivity() {
         crcUnknown = intent.getBooleanExtra("CRC32_UNKNOWN", true)
 
         setContent { BundleDetailScreen() }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        saveExecutor.shutdown()
     }
 
     @Composable
@@ -309,14 +321,16 @@ class ReceiveBundleActivity : ComponentActivity() {
                 return
             }
             val bytes = src.readBytes()
-            val text = TextLike.decodeUtf8Strict(bytes)
-            if (text == null) {
+            if (TextLike.decodeUtf8Strict(bytes) == null) {
                 Toast.makeText(this, "该文件不是有效的 UTF-8 文本", Toast.LENGTH_SHORT).show()
                 return
             }
             startActivity(
                 Intent(this, ReceiveTextActivity::class.java).apply {
-                    putExtra("TEXT", text)
+                    // M5: 只传 FILE_PATH — ReceiveTextActivity 从落盘文件加载
+                    // 文字（其类注释明确设计为从 staged file 加载以避开 Binder
+                    // 事务限制）。文本上限 8 MiB，作为 Intent extra 传输必撞
+                    // TransactionTooLargeException 直接崩溃。
                     putExtra("FILE_PATH", info.filePath)
                     putExtra("FILE_NAME", info.name)
                     putExtra("CRC32_UNKNOWN", true)
@@ -354,13 +368,28 @@ class ReceiveBundleActivity : ComponentActivity() {
 
     private fun saveToUri(uri: Uri, info: FileInfo?) {
         val src = info?.let { File(it.filePath) } ?: return
-        try {
-            contentResolver.openOutputStream(uri)?.use { out ->
-                src.inputStream().use { it.copyTo(out) }
+        // M6: the full stream copy runs on the background executor; the
+        // completion toast hops back to the main thread. The sequential
+        // save-all flow is unaffected — the next SAF dialog is launched from
+        // advanceSaveAll() independent of this copy, and copies serialize on
+        // the single-thread executor.
+        Toast.makeText(this, "保存中…", Toast.LENGTH_SHORT).show()
+        saveExecutor.execute {
+            val error: String? = try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    src.inputStream().use { it.copyTo(out) }
+                }
+                null
+            } catch (e: Exception) {
+                e.message
             }
-            Toast.makeText(this, "已保存 ${info.name}", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "保存失败: ${e.message}", Toast.LENGTH_LONG).show()
+            runOnUiThread {
+                if (error == null) {
+                    Toast.makeText(this, "已保存 ${info.name}", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "保存失败: $error", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 

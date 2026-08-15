@@ -371,6 +371,7 @@ class SegmentAssembler private constructor(
             )
             // Resume from a persisted bitmap if present.
             if (bm.exists()) {
+                var ledgerCorrected = false
                 try {
                     val obj = JSONObject(bm.readText())
                     val count = obj.optInt("count")
@@ -404,13 +405,35 @@ class SegmentAssembler private constructor(
                                 asm.received[i] = valid
                                 asm.hashes[i] = if (valid) hash else null
                                 if (valid) asm.receivedCount++
+                                if (on && !valid) ledgerCorrected = true
                             }
                         }
                     }
                 } catch (e: IllegalArgumentException) {
                     throw e
                 } catch (_: Exception) {
-                    // Corrupt bitmap → start fresh (overwrite below).
+                    // Corrupt bitmap → start fresh (the fresh ledger is
+                    // persisted below).
+                    ledgerCorrected = true
+                }
+                // Persist the corrected/fresh bitmap so the on-disk ledger
+                // matches verified reality. Without this the cheap ledger
+                // readers (listTasks / ScanActivity's re-archive gate) keep
+                // seeing the stale phantom-complete task and re-trigger the
+                // full per-segment re-hash on every descriptor frame — a
+                // sustained CPU/IO spin until the sender cycles to the
+                // damaged segment. Best-effort: a failed write keeps the old
+                // (stale) ledger and resume still proceeds from memory.
+                if (ledgerCorrected) {
+                    try {
+                        asm.persistBitmap()
+                    } catch (e: Exception) {
+                        android.util.Log.w(
+                            "SegmentAssembler",
+                            "ledger correction persist failed; stale bitmap kept",
+                            e
+                        )
+                    }
                 }
             }
             return asm

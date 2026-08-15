@@ -22,6 +22,8 @@
        by linking them in directly, so the tests verify the protocol math
        (IngestStatus bits, FrameHeader parsing, BundleParser) everywhere. -->
   <ItemGroup>
+    <Compile Include="..\AirFerry.Windows\Models\ScanSource.cs" Link="Models\ScanSource.cs" />
+    <Compile Include="..\AirFerry.Windows\Scan\ScreenRectUtil.cs" Link="Scan\ScreenRectUtil.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\IngestStatus.cs" Link="Scan\IngestStatus.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\FrameHeader.cs" Link="Scan\FrameHeader.cs" />
     <Compile Include="..\AirFerry.Windows\Scan\Crc32.cs" Link="Scan\Crc32.cs" />

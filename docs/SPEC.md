@@ -100,7 +100,7 @@ child_session_id = FNV1a_128(
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
 | 0 | 1 | magic | `0xD5` |
-| 1 | 1 | version | 普通对象 `3`；分段对象 `4`；2/1 为旧版 |
+| 1 | 1 | version | 普通对象 `3`；分段对象 `5`；2/1 为旧版；`4` 为撤回的预发布分段版（接收端 fail-closed 拒绝） |
 | 2 | 2 | num_blocks | u16 BE |
 | 4 | 8 | transfer_length | u64 BE（RaptorQ 对象字节数，含填充） |
 | 12 | 4 | symbol_size | u32 BE |
@@ -141,7 +141,7 @@ child_session_id = FNV1a_128(
 | R+40 | 32 | root_sha256 | 完整解压后原文的 SHA-256；每段必须一致 |
 | R+72 | 32 | raw_sha256 | 当前段压缩字节的 SHA-256 |
 
-非分段对象仍写 version 3；分段对象必须写 version 4 且携带完整 104 字节尾段。接收端在分配或定位写入前同时验证 child id、压缩流大小推导出的精确段数、索引、规范偏移、当前段压缩长度 ≤ 规范切片、逐段 SHA-256 与跨段不变的根 SHA-256；全部段齐后拼接压缩流、解压一次，再校验解压后长度 + CRC32 + 根 SHA-256，防止混合两个文件修订版中“各自合法”的分段。
+非分段对象仍写 version 3；分段对象必须写 version 5 且携带完整 104 字节尾段。接收端在分配或定位写入前同时验证 child id、压缩流大小推导出的精确段数、索引、规范偏移、当前段压缩长度 ≤ 规范切片、逐段 SHA-256 与跨段不变的根 SHA-256；全部段齐后拼接压缩流、解压一次，再校验解压后长度 + CRC32 + 根 SHA-256，防止混合两个文件修订版中“各自合法”的分段。
 
 ### v2/v3 消歧规则（关键，易踩坑）
 
@@ -158,7 +158,7 @@ child_session_id = FNV1a_128(
 | 端 | 源 |
 |----|-----|
 | Rust 构/析 | `core/transfer-engine/src/descriptor.rs`：`build_payload` / `parse_payload` |
-| 常量 | `descriptor.rs:95-102`：`DESC_MAGIC=0xD5`、`DESC_VERSION=3`、固定开销 28/13/9 |
+| 常量 | `descriptor.rs:120-125`：`DESC_MAGIC=0xD5`、`DESC_VERSION=5`（分段）、`DESC_V3_VERSION=3`（v4 为撤回预发布版，fail-closed 拒绝）、固定开销 28/13/9 |
 
 ---
 
@@ -235,14 +235,15 @@ offset  size   field
 
 ### 解压（接收端）
 
-按描述符 `compression` 标签解压。**炸弹防护**：`core/qr-protocol/src/compress.rs:107 decompress_with_limit` 把输出上限封顶到描述符 `original_size`，超限即判失败，防 OOM。
+按描述符 `compression` 标签解压。**炸弹防护**：`core/qr-protocol/src/compress.rs:170 decompress_with_limit` 把输出上限封顶到描述符 `original_size`，超限即判失败，防 OOM。**zstd 窗口钳制（线级互操作约束）**：所有 native 解码路径统一经 `zstd_decoder()`（`compress.rs:87`）设 `ZSTD_d_windowLogMax=23`（`ZSTD_WINDOW_LOG_MAX`，`compress.rs:81`）——恶意 CRC-valid 帧头声明 windowLog 27 会在产出任何输出前强制 ~128 MiB 窗口分配（独立于输出上限的输入侧漏洞），一律拒绝；native 编码端 `compress()`（`compress.rs:105`）同步把编码窗口封顶 23，保证自产流按构造可解。浏览器 TS 发送端 zstd level 1 的 windowLog 表值 ≤ 19，天然在钳制内。第三方产出的 windowLog > 23 的 zstd 流会被本接收端拒绝。
 
 ### 权威源
 
 | 端 | 源 |
 |----|-----|
-| Rust 分发 | `core/qr-protocol/src/compress.rs:76` `compress_with` / `decompress_with` / `:107` `decompress_with_limit` |
+| Rust 分发 | `core/qr-protocol/src/compress.rs:139` `compress_with` / `decompress_with` / `:170` `decompress_with_limit` |
 | 标签常量 | `compress.rs:27-29`：`COMPRESSION_NONE=0`/`ZSTD=1`/`XZ=2` |
+| zstd 窗口钳制 | `compress.rs:81` `ZSTD_WINDOW_LOG_MAX=23`（编码封顶 + 解码拒绝 >23，见「解压」节） |
 | 浏览器 (TS) | `apps/sender/src/wasm/compress.ts:49` `CompressionAlgorithm` 枚举（镜像） |
 
 ---
@@ -400,8 +401,8 @@ offset  size   field
 | 帧版本 | `1` | `frame.rs:14` |
 | 帧头/尾 | 60 / 4 字节 | `frame.rs:16,17` |
 | `FLAG_DESCRIPTOR` | `0x01` | `frame.rs:22` |
-| 描述符 magic | `0xD5` | `descriptor.rs:95` |
-| 描述符版本 | 普通对象 `3` / 分段对象 `4` | `descriptor.rs` `DESC_V3_VERSION` / `DESC_VERSION` |
+| 描述符 magic | `0xD5` | `descriptor.rs:120` |
+| 描述符版本 | 普通对象 `3` / 分段对象 `5`（v4 为撤回的预发布版，fail-closed 拒绝） | `descriptor.rs` `DESC_V3_VERSION` / `DESC_VERSION` |
 | 描述符固定开销 | 28 + 16×B（块表）+ 13（v2）+ filename_len + 9（v3）+ 分段时 104（v5） | `descriptor.rs` |
 | SEGMENT_RAW_BYTES / MAX_SEGMENT_COUNT | `MAX_OBJECT_BYTES − MAX_SYMBOL_SIZE` ≈ 31.9 MiB / 131072 | `transfer-engine/src/segment.rs` |
 | 压缩 None/Zstd/XZ | `0` / `1` / `2` | `compress.rs:27-29` |

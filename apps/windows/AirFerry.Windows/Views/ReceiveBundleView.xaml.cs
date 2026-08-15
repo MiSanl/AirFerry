@@ -4,11 +4,12 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Media;
 using AirFerry.Windows.Bundle;
 using AirFerry.Windows.Models;
+using AirFerry.Windows.Services;
 using AirFerry.Windows.ViewModels;
 using Microsoft.Win32;
+using Wpf.Ui.Controls;
 
 namespace AirFerry.Windows.Views;
 
@@ -53,17 +54,21 @@ public partial class ReceiveBundleView : Page
         }
         if (!_result.Crc32Known)
         {
-            CrcStatusText.Text = $"共 {_result.Bundle.Count} 个文件 · 未提供校验码";
+            CrcInfoBar.Severity = InfoBarSeverity.Informational;
+            CrcInfoBar.Title = $"共 {_result.Bundle.Count} 个文件";
+            CrcInfoBar.Message = "未提供校验码";
         }
         else if (_result.ExpectedCrc32 == _result.ReceivedCrc32)
         {
-            CrcStatusText.Text = $"共 {_result.Bundle.Count} 个文件 · ✓ 校验通过";
-            CrcStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x22, 0xC5, 0x5E));
+            CrcInfoBar.Severity = InfoBarSeverity.Success;
+            CrcInfoBar.Title = $"共 {_result.Bundle.Count} 个文件";
+            CrcInfoBar.Message = "CRC32 校验通过";
         }
         else
         {
-            CrcStatusText.Text = $"共 {_result.Bundle.Count} 个文件 · ✗ 校验失败";
-            CrcStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0xEF, 0x44, 0x44));
+            CrcInfoBar.Severity = InfoBarSeverity.Error;
+            CrcInfoBar.Title = $"共 {_result.Bundle.Count} 个文件";
+            CrcInfoBar.Message = "CRC32 校验失败";
         }
     }
 
@@ -84,7 +89,7 @@ public partial class ReceiveBundleView : Page
         }
     }
 
-    private void OpenTextIfPossible(string name)
+    private async void OpenTextIfPossible(string name)
     {
         if (!FileNameUtil.IsTextLikeName(name) || _result.Bundle is null)
         {
@@ -105,15 +110,13 @@ public partial class ReceiveBundleView : Page
         }
         if (!FileNameUtil.FitsTextUi(match.Data.LongLength))
         {
-            MessageBox.Show("文件过大，请用「全部保存」后用其他应用打开。", "AirFerry",
-                MessageBoxButton.OK, MessageBoxImage.Information);
+            await UiMessages.InfoAsync("文件过大，请用「全部保存」后用其他应用打开。");
             return;
         }
         string? text = FileNameUtil.DecodeUtf8Strict(match.Data);
         if (text is null)
         {
-            MessageBox.Show("该文件不是有效的 UTF-8 文本，无法复制预览。", "AirFerry",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
+            await UiMessages.InfoAsync("该文件不是有效的 UTF-8 文本，无法复制预览。");
             return;
         }
         // Per-entry CRC is not tracked for bundle members.
@@ -145,22 +148,30 @@ public partial class ReceiveBundleView : Page
             return;
         }
         string dir = dlg.FolderName;
-        Directory.CreateDirectory(dir);
         int saved = 0;
-        foreach (BundleFile f in _result.Bundle)
+        try
         {
-            string target = FileNameUtil.UniqueTarget(dir, f.Name);
-            await Task.Run(() => File.WriteAllBytes(target, f.Data));
-            saved++;
+            Directory.CreateDirectory(dir);
+            foreach (BundleFile f in _result.Bundle)
+            {
+                string target = FileNameUtil.UniqueTarget(dir, f.Name);
+                await Task.Run(() => File.WriteAllBytes(target, f.Data));
+                saved++;
+            }
+            // Members were already indexed atomically when recovery completed.
+            // Saving is an export operation and must not create duplicate history
+            // groups each time the button is clicked.
+            await UiMessages.InfoAsync($"已保存 {saved} 个文件到:\n{dir}");
         }
-        // Members were already indexed atomically when recovery completed.
-        // Saving is an export operation and must not create duplicate history
-        // groups each time the button is clicked.
-        MessageBox.Show($"已保存 {saved} 个文件到:\n{dir}", "AirFerry",
-            MessageBoxButton.OK, MessageBoxImage.Information);
+        catch (Exception ex)
+        {
+            // async void 中逃逸的异常会绕过所有上层处理器直接崩溃进程，必须就地
+            // 兜底；同时告知用户中断前已成功写盘的数量，便于手动补救。
+            await UiMessages.ErrorAsync($"保存失败（已保存 {saved} 个）: {ex.Message}");
+        }
     }
 
-    private void ShareAll_Click(object sender, RoutedEventArgs e)
+    private async void ShareAll_Click(object sender, RoutedEventArgs e)
     {
         if (_result.Bundle is null)
         {
@@ -181,8 +192,7 @@ public partial class ReceiveBundleView : Page
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"分享失败: {ex.Message}", "AirFerry",
-                MessageBoxButton.OK, MessageBoxImage.Error);
+            await UiMessages.ErrorAsync($"分享失败: {ex.Message}");
         }
     }
 

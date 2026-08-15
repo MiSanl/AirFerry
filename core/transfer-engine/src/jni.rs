@@ -3,6 +3,17 @@
 //! Uses the official `jni` crate (correct JNIEnv ABI across all Android
 //! versions / vendors / ART implementations) with `extern "system"` — the
 //! correct calling convention for JNI native methods on 64-bit Android.
+//!
+//! ## Handle model
+//! A receiver session is heap-allocated (`Box<ReceiverSession>`), and its raw
+//! pointer is returned to Kotlin as an opaque `jlong` handle. Every function
+//! takes that handle back as an argument; pass it to
+//! [`Java_com_airferry_app_nativelib_NativeBridge_receiverDestroy`] to release
+//! the session. The handle is *not* thread-safe — the host must serialize all
+//! calls that touch the same handle (the Android client does this with
+//! `QrDecodePool`'s `ingestLock`, exactly like the Windows client's single
+//! ingest lock around the C ABI; see [`crate::cffi`] for the mirrored
+//! contract).
 
 #![cfg(feature = "jni")]
 
@@ -86,9 +97,13 @@ pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverDest
 ///   - bits 8..23  : `session_mismatch_streak` (0..=0xFFFF)
 ///   - bits 32..63 : `received_symbols` (low 32 bits; capped well below 2^32)
 ///
-/// Returns 0 on a null handle, a bad frame, or a session error (the caller
-/// treats 0 as "nothing changed"). `received_symbols == u32::MAX` is reserved
-/// as an error sentinel (a real transfer never reaches that).
+/// Returns 0 only on a null handle. A byte-array conversion failure or a
+/// frame that fails wire validation (bad magic / CRC / version) returns the
+/// [`ingest_status::INGEST_ERROR`] sentinel (`received_symbols == u32::MAX`,
+/// all flags clear) — the host treats it as "frame rejected, nothing to do".
+/// A session-level `ingest` error (e.g. `SessionMismatch`) is logged but the
+/// function still returns the *current* packed status word, since the session
+/// stays alive and its progress remains readable.
 #[no_mangle]
 pub extern "system" fn Java_com_airferry_app_nativelib_NativeBridge_receiverIngest(
     env: JNIEnv,

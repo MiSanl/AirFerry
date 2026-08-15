@@ -1,6 +1,5 @@
+using System.Diagnostics;
 using OpenCvSharp;
-using System.Buffers;
-using System.Runtime.InteropServices;
 
 namespace AirFerry.Windows.Scan;
 
@@ -30,18 +29,31 @@ namespace AirFerry.Windows.Scan;
 /// calls them; the WPF dispatcher never reads from the device.
 /// </para>
 /// </remarks>
-public sealed class VideoCapture : IDisposable
+public sealed class VideoCapture : IFrameSource
 {
+    /// <summary>
+    /// Sustained no-good-frame window after which the device is declared lost.
+    /// DirectShow's <c>IsOpened()</c> stays true after an unplug — reads just
+    /// fail forever — so only a time-based streak can detect it and let
+    /// ProducerLoop's IsOpen check report the source as gone. Time-based
+    /// (unlike ScreenCapture's 30-frame rule) because a capture card whose
+    /// HDMI signal arrives a few seconds after opening must recover in place,
+    /// not be torn down after ~0.3 s of failures.
+    /// </summary>
+    private static readonly long LossTimeoutTicks = (long)(Stopwatch.Frequency * 5.0);
+
     private readonly OpenCvSharp.VideoCapture _cap;
     private readonly Mat _bgr = new();
     private readonly Mat _gray = new();
     private bool _disposed;
+    private bool _lost;
+    private long _lastGoodTick;
 
     /// <summary>Width/height the device actually delivers (0 until first read).</summary>
     public int Width { get; private set; }
     public int Height { get; private set; }
 
-    public bool IsOpen => !_disposed && _cap.IsOpened();
+    public bool IsOpen => !_disposed && !_lost && _cap.IsOpened();
 
     /// <summary>
     /// Open <paramref name="deviceIndex"/> with the given caps. Returns false
@@ -50,6 +62,7 @@ public sealed class VideoCapture : IDisposable
     public VideoCapture(int deviceIndex, int width = 1920, int height = 1080, int fps = 60)
     {
         _cap = new OpenCvSharp.VideoCapture(deviceIndex, VideoCaptureAPIs.DSHOW);
+        _lastGoodTick = Stopwatch.GetTimestamp();
         if (_cap.IsOpened())
         {
             _cap.FrameWidth = width;
@@ -67,15 +80,23 @@ public sealed class VideoCapture : IDisposable
     /// </summary>
     public Mat? ReadGray()
     {
-        if (_disposed || !_cap.IsOpened())
+        if (_disposed || _lost || !_cap.IsOpened())
         {
             return null;
         }
         bool ok = _cap.Read(_bgr);
         if (!ok || _bgr.Empty())
         {
+            // No good frame for the whole loss window (device unplugged, or
+            // never delivered anything at all) → declare the source lost so
+            // ProducerLoop stops spinning and surfaces the loss to the user.
+            if (Stopwatch.GetTimestamp() - _lastGoodTick >= LossTimeoutTicks)
+            {
+                _lost = true;
+            }
             return null;
         }
+        _lastGoodTick = Stopwatch.GetTimestamp();
         Width = _bgr.Width;
         Height = _bgr.Height;
         Cv2.CvtColor(_bgr, _gray, ColorConversionCodes.BGR2GRAY);
@@ -87,46 +108,7 @@ public sealed class VideoCapture : IDisposable
     /// into a compact managed BGR24 snapshot for the UI. Must be called on the
     /// same producer thread before the next camera read.
     /// </summary>
-    public PreviewFrame? SnapshotBgr()
-    {
-        if (_disposed || _bgr.Empty() || _bgr.Channels() != 3)
-        {
-            return null;
-        }
-
-        int width = _bgr.Width;
-        int height = _bgr.Height;
-        int rowBytes = checked(width * 3);
-        int length = checked(rowBytes * height);
-        int sourceStride = checked((int)_bgr.Step());
-        if (sourceStride < rowBytes)
-        {
-            return null;
-        }
-        byte[] pixels = ArrayPool<byte>.Shared.Rent(length);
-
-        try
-        {
-            if (sourceStride == rowBytes)
-            {
-                Marshal.Copy(_bgr.Data, pixels, 0, length);
-            }
-            else
-            {
-                for (int y = 0; y < height; y++)
-                {
-                    Marshal.Copy(IntPtr.Add(_bgr.Data, checked(y * sourceStride)),
-                        pixels, checked(y * rowBytes), rowBytes);
-                }
-            }
-            return new PreviewFrame(pixels, width, height, rowBytes, length);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(pixels);
-            throw;
-        }
-    }
+    public PreviewFrame? SnapshotBgr() => PreviewFrameCopy.FromBgr(_bgr);
 
     public void Dispose()
     {

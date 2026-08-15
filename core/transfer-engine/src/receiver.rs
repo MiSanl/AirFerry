@@ -381,6 +381,24 @@ impl ReceiverSession {
             self.progress.frames_corrupt += 1;
             return Ok(self.is_complete());
         }
+        // Post-completion guard (audit M1): once the object is fully decoded,
+        // every further data frame is useless. The frame CRC is attacker-
+        // computable (CRC32 is not an authenticator), so a hostile screen can
+        // keep feeding wire-valid frames with *fresh* repair ESIs forever;
+        // without this check the per-block `received` HashSets and the
+        // `received_symbols` counter grow without bound (slow memory DoS) and
+        // progress would exceed `total_symbols` (>100%). Early-return with the
+        // exact same shape as the duplicate path below: count as duplicate,
+        // don't insert, don't bump received_symbols. This is safe for every
+        // binding (JNI/C-ABI/WASM all derive `accepted` from the
+        // received_symbols delta, so such frames report accepted=false,
+        // complete=true) and for resume (`save_state` serializes only the
+        // pre-descriptor `symbol_cache`, never `self.received`, so its output
+        // is unaffected).
+        if self.is_complete() {
+            self.progress.frames_duplicate += 1;
+            return Ok(true);
+        }
         if !self.received[sbn].insert(esi) {
             self.progress.frames_duplicate += 1;
             return Ok(self.is_complete());

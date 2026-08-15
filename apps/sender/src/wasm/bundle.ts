@@ -153,6 +153,17 @@ export async function buildBundle(files: File[]): Promise<BuiltBundle> {
     o += name.length
     // size as u64 BE
     const data = new Uint8Array(await files[i].arrayBuffer())
+    // Defensive: under memory pressure `arrayBuffer()` can silently return a
+    // SHORT buffer. Without this check the manifest/CRC would be computed
+    // over the truncated bytes — internally consistent, so every
+    // receiver-side check passes and the user silently gets a corrupt file.
+    // Same guard as the single-file path in compress.worker's processFiles.
+    if (data.length !== files[i].size) {
+      throw new Error(
+        `文件「${files[i].name}」读取不完整（期望 ${files[i].size} 字节，实际 ${data.length} 字节），` +
+          `请重试或拆分文件后发送。`
+      )
+    }
     const sizeBytes = u64be(data.length)
     for (const b of sizeBytes) out[o++] = b
     // content

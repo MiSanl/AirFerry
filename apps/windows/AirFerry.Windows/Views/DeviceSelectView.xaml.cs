@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using AirFerry.Windows.Models;
 using AirFerry.Windows.Scan;
+using AirFerry.Windows.Services;
 
 namespace AirFerry.Windows.Views;
 
@@ -26,9 +27,9 @@ public partial class DeviceSelectView : Page
         InitializeComponent();
         if (_resumeRootId is not null)
         {
-            ResumeHint.Text = $"继续任务 {_resumeRootId[..8]}…：扫码时会忽略其他文件";
-            ResumeHint.Visibility = Visibility.Visible;
-            StartButton.Content = "▶ 继续恢复";
+            ResumeBar.Message = $"继续任务 {_resumeRootId[..8]}…：扫码时会忽略其他文件";
+            ResumeBar.Visibility = Visibility.Visible;
+            StartButton.Content = "继续恢复";
         }
         Loaded += (_, _) => RefreshDevices();
     }
@@ -39,11 +40,12 @@ public partial class DeviceSelectView : Page
         _devices = DeviceEnumerator.Enumerate();
         if (_devices.Count == 0)
         {
-            DeviceList.Items.Add("未检测到视频设备");
-            SelectedInfo.Text = "请连接摄像头或采集卡后点击刷新";
+            EmptyStateBar.Visibility = Visibility.Visible;
+            SelectedInfo.Text = "";
             StartButton.IsEnabled = false;
             return;
         }
+        EmptyStateBar.Visibility = Visibility.Collapsed;
         foreach (DeviceInfo d in _devices)
         {
             DeviceList.Items.Add(d);
@@ -76,7 +78,32 @@ public partial class DeviceSelectView : Page
             return;
         }
         DeviceInfo selected = _devices[DeviceList.SelectedIndex];
-        NavigationService?.Navigate(new ScanView(selected.Index, _resumeRootId));
+        NavigationService?.Navigate(
+            new ScanView(new DeviceSource(selected.Index, selected.FriendlyName), _resumeRootId));
+    }
+
+    /// <summary>
+    /// Screenshot-style picker: drag = screen region, click = window, Esc =
+    /// cancel. Navigates to the scan page with the chosen source.
+    /// </summary>
+    private async void ScreenCapture_Click(object sender, RoutedEventArgs e)
+    {
+        // async void: any exception escaping here (PickAsync teardown rethrow,
+        // navigation failure, …) becomes an unhandled UI exception and kills
+        // the process — same containment as ReceiveBundleView.SaveAll_Click.
+        try
+        {
+            ScanSource? source = await RegionPicker.PickAsync();
+            if (source is null)
+            {
+                return;
+            }
+            NavigationService?.Navigate(new ScanView(source, _resumeRootId));
+        }
+        catch (Exception ex)
+        {
+            await UiMessages.ErrorAsync($"屏幕捕获启动失败：{ex.Message}", "屏幕捕获");
+        }
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)

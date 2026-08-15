@@ -1,10 +1,10 @@
 <Page x:Class="AirFerry.Windows.Views.ReceiveTextView"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
       Title="AirFerry - 文字消息"
-      Background="{StaticResource BgDark}"
-      MinWidth="640" MinHeight="560">
-    <Grid Margin="32">
+      Background="{DynamicResource ApplicationBackgroundBrush}">
+    <Grid Margin="32,24,32,32">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -12,65 +12,76 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TextBlock Grid.Row="0"
-                   Text="✓ 文字接收完成"
-                   FontSize="24" FontWeight="Bold"
-                   Foreground="#22C55E"
-                   Margin="0,0,0,24" />
+        <!-- Success header. -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,16">
+            <Border Width="44" Height="44" CornerRadius="22"
+                    Background="{DynamicResource SuccessBrush}">
+                <ui:SymbolIcon Symbol="Checkmark24" Filled="True"
+                               FontSize="22" Foreground="White"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center" />
+            </Border>
+            <TextBlock Text="文字接收完成"
+                       FontSize="22" FontWeight="Bold"
+                       Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                       VerticalAlignment="Center"
+                       Margin="14,0,0,0" />
+        </StackPanel>
 
         <!-- Scrollable, read-only text content. -->
-        <Border Grid.Row="1"
-                Background="{StaticResource CardBg}"
-                CornerRadius="12"
-                Padding="16">
+        <ui:Card Grid.Row="1">
             <TextBox x:Name="ContentBox"
                      IsReadOnly="True"
                      BorderThickness="0"
                      Background="Transparent"
-                     Foreground="{StaticResource TextPrimary}"
+                     Foreground="{DynamicResource TextFillColorPrimaryBrush}"
                      FontSize="15"
                      FontFamily="Consolas"
                      TextWrapping="Wrap"
                      VerticalScrollBarVisibility="Auto"
                      AcceptsReturn="True"
-                     Focusable="True" />
-        </Border>
+                     Focusable="True"
+                     Margin="12" />
+        </ui:Card>
 
-        <!-- CRC verification card. -->
-        <Border Grid.Row="2"
-                Background="{StaticResource CardBg}"
-                CornerRadius="12"
-                Padding="16"
-                Margin="0,16,0,0">
-            <StackPanel>
-                <TextBlock Text="CRC32 校验"
-                           FontSize="13"
-                           Foreground="{StaticResource TextSecondary}" />
-                <TextBlock x:Name="CrcStatusText"
-                           FontSize="16" FontWeight="SemiBold"
-                           Margin="0,4,0,8" />
-                <TextBlock x:Name="CrcValuesText"
-                           FontSize="12"
-                           Foreground="{StaticResource TextSecondary}"
-                           FontFamily="Consolas" />
-            </StackPanel>
-        </Border>
+        <!-- Integrity status. -->
+        <ui:InfoBar Grid.Row="2"
+                    x:Name="CrcInfoBar"
+                    Severity="Informational"
+                    IsClosable="False"
+                    Margin="0,12,0,0" />
 
-        <StackPanel Grid.Row="3" Margin="0,24,0,0">
-            <Button Style="{StaticResource PrimaryButton}"
-                    Content="📋 复制到剪贴板"
-                    Click="Copy_Click"
-                    Margin="0,0,0,8" />
+        <StackPanel Grid.Row="3" Margin="0,20,0,0">
+            <ui:Button Appearance="Primary"
+                       Content="复制到剪贴板"
+                       Click="Copy_Click"
+                       FontSize="15" Padding="0,10"
+                       HorizontalAlignment="Stretch"
+                       Margin="0,0,0,10">
+                <ui:Button.Icon>
+                    <ui:SymbolIcon Symbol="Copy24" />
+                </ui:Button.Icon>
+            </ui:Button>
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="8" />
+                    <ColumnDefinition Width="12" />
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
-                <Button Grid.Column="0" Style="{StaticResource OutlinedButton}"
-                        Content="💾 保存为 .txt" Click="SaveAs_Click" />
-                <Button Grid.Column="2" Style="{StaticResource OutlinedButton}"
-                        Content="↻ 重新扫码" Click="Rescan_Click" />
+                <ui:Button Grid.Column="0" Appearance="Secondary"
+                           Content="保存为 .txt" Click="SaveAs_Click"
+                           HorizontalAlignment="Stretch">
+                    <ui:Button.Icon>
+                        <ui:SymbolIcon Symbol="Save24" />
+                    </ui:Button.Icon>
+                </ui:Button>
+                <ui:Button Grid.Column="2" Appearance="Transparent"
+                           Content="重新扫码" Click="Rescan_Click"
+                           HorizontalAlignment="Stretch">
+                    <ui:Button.Icon>
+                        <ui:SymbolIcon Symbol="ArrowClockwise24" />
+                    </ui:Button.Icon>
+                </ui:Button>
             </Grid>
         </StackPanel>
     </Grid>

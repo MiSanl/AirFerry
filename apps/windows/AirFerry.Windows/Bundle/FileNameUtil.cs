@@ -210,9 +210,10 @@ public static class FileNameUtil
 
     /// <summary>
     /// Soft cap for the in-memory text (copy) UI — mirrors Android
-    /// <c>TextLike.MAX_TEXT_UI_BYTES</c>. Larger files stay on the file screen.
+    /// <c>TextLike.MAX_TEXT_UI_BYTES</c> (8 MiB) and the web receiver's
+    /// ETTEXTv1 cap. Larger files stay on the file screen.
     /// </summary>
-    public const int MaxTextUiBytes = 2 * 1024 * 1024;
+    public const int MaxTextUiBytes = 8 * 1024 * 1024;
 
     /// <summary>
     /// Heuristic: recovered files that should open in the text (copy/share) UI.

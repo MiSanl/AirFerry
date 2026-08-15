@@ -1,0 +1,11 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- Semantic brushes for the LIGHT theme. Anything theme-adaptive that
+         WPF-UI does not already provide lives here; reference with
+         DynamicResource so the ThemeService dictionary swap takes effect. -->
+    <SolidColorBrush x:Key="SuccessBrush" Color="#16A34A" />
+    <SolidColorBrush x:Key="ErrorBrush" Color="#DC2626" />
+    <SolidColorBrush x:Key="WarningBrush" Color="#D97706" />
+    <!-- Camera preview backdrop stays near-black in both themes. -->
+    <SolidColorBrush x:Key="PreviewBackdropBrush" Color="#0B0F14" />
+</ResourceDictionary>

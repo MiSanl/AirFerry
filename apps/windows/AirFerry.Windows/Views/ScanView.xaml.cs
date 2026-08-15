@@ -3,6 +3,7 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using AirFerry.Windows.Models;
 using AirFerry.Windows.Scan;
 using AirFerry.Windows.ViewModels;
 
@@ -19,6 +20,7 @@ namespace AirFerry.Windows.Views;
 public partial class ScanView : Page
 {
     private readonly ScanViewModel _vm;
+    private readonly ScanSource _source;
     private readonly DispatcherTimer _progressTimer;
     private readonly object _stopGate = new();
     private Task _stopTask = Task.CompletedTask;
@@ -27,8 +29,9 @@ public partial class ScanView : Page
     private int _activationEpoch;
     private volatile bool _pageActive;
 
-    public ScanView(int deviceIndex, string? resumeRootId = null)
+    public ScanView(ScanSource source, string? resumeRootId = null)
     {
+        _source = source;
         InitializeComponent();
         _vm = new ScanViewModel(resumeRootId);
         _vm.TransferCompleted += OnTransferCompleted;
@@ -55,11 +58,11 @@ public partial class ScanView : Page
             IsEnabled = false,
         };
 
-        Loaded += async (_, _) => await StartAsync(deviceIndex);
+        Loaded += async (_, _) => await StartAsync(_source);
         Unloaded += async (_, _) => await CleanupAsync();
     }
 
-    private async Task StartAsync(int deviceIndex)
+    private async Task StartAsync(ScanSource source)
     {
         int epoch = Interlocked.Increment(ref _activationEpoch);
         _pageActive = true;
@@ -84,9 +87,16 @@ public partial class ScanView : Page
         }
 
         DrawProgressRing(0);
-        _vm.StartScan(deviceIndex);
+        _vm.StartScan(source);
         _progressTimer.Start();
-        StopButton.Content = _vm.IsScanning ? "⏹ 停止" : "▶ 重试";
+        SetStopButton(_vm.IsScanning ? "停止" : "重试",
+            _vm.IsScanning ? Wpf.Ui.Controls.SymbolRegular.Stop24 : Wpf.Ui.Controls.SymbolRegular.ArrowClockwise24);
+    }
+
+    private void SetStopButton(string text, Wpf.Ui.Controls.SymbolRegular symbol)
+    {
+        StopButton.Content = text;
+        StopButton.Icon = new Wpf.Ui.Controls.SymbolIcon { Symbol = symbol };
     }
 
     private void OnPreviewFrameReady(PreviewFrame frame)
@@ -177,11 +187,22 @@ public partial class ScanView : Page
         double radius = (size - stroke) / 2;
         Point center = new(size / 2, size / 2);
 
+        // Semi-opaque backdrop keeps the ring readable over any camera image,
+        // in both light and dark themes.
+        var backdrop = new System.Windows.Shapes.Ellipse
+        {
+            Width = size, Height = size,
+            Fill = new SolidColorBrush(Color.FromArgb(0xB3, 0x00, 0x00, 0x00)),
+        };
+        Canvas.SetLeft(backdrop, 0);
+        Canvas.SetTop(backdrop, 0);
+        ProgressCanvas.Children.Add(backdrop);
+
         // Background ring.
         var bg = new System.Windows.Shapes.Ellipse
         {
             Width = size, Height = size,
-            Stroke = new SolidColorBrush(Color.FromRgb(0x33, 0x41, 0x55)),
+            Stroke = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)),
             StrokeThickness = stroke,
         };
         Canvas.SetLeft(bg, 0);
@@ -199,7 +220,7 @@ public partial class ScanView : Page
             bool largeArc = angle > 180;
             var arc = new System.Windows.Shapes.Path
             {
-                Stroke = (Brush)FindResource("Accent"),
+                Stroke = (Brush)FindResource("AccentFillColorDefaultBrush"),
                 StrokeThickness = stroke,
                 Data = new PathGeometry
                 {
@@ -222,7 +243,7 @@ public partial class ScanView : Page
             Text = $"{percent:F0}%",
             FontSize = 28,
             FontWeight = FontWeights.Bold,
-            Foreground = (Brush)FindResource("TextPrimary"),
+            Foreground = Brushes.White,
         };
         Canvas.SetLeft(label, center.X - 30);
         Canvas.SetTop(label, center.Y - 20);
@@ -279,12 +300,12 @@ public partial class ScanView : Page
                 if (_pageActive)
                 {
                     SyncUiFromViewModel();
-                    StopButton.Content = "▶ 继续";
+                    SetStopButton("继续", Wpf.Ui.Controls.SymbolRegular.Play24);
                 }
             }
             else
             {
-                await StartAsync(_vm.SelectedDeviceIndex);
+                await StartAsync(_vm.SelectedSource ?? _source);
             }
         }
         catch (Exception ex)

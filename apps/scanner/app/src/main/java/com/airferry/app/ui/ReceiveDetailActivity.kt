@@ -48,6 +48,13 @@ class ReceiveDetailActivity : ComponentActivity() {
     /** True when the descriptor never supplied an expected CRC (so 0 is not a real value). */
     private var crcUnknown: Boolean = true
 
+    /**
+     * Background thread for the SAF save copy (M6): whole-streaming a blob of
+     * up to hundreds of MiB on the main thread (the activity-result callback)
+     * is a guaranteed ANR.
+     */
+    private val saveExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     private val createDocument = registerForActivityResult(
         CreateNamedDocument()
     ) { uri: Uri? ->
@@ -81,6 +88,11 @@ class ReceiveDetailActivity : ComponentActivity() {
         if (!isResave) copyToReceivedDir()
 
         setContent { ReceiveDetailScreen() }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        saveExecutor.shutdown()
     }
 
     @Composable
@@ -208,14 +220,26 @@ class ReceiveDetailActivity : ComponentActivity() {
     }
 
     private fun saveToUri(uri: Uri) {
-        try {
-            val src = recoveredFile ?: return
-            contentResolver.openOutputStream(uri)?.use { out ->
-                src.inputStream().use { it.copyTo(out) }
+        val src = recoveredFile ?: return
+        // M6: the full stream copy runs on the background executor; the
+        // completion toast hops back to the main thread.
+        Toast.makeText(this, "保存中…", Toast.LENGTH_SHORT).show()
+        saveExecutor.execute {
+            val error: String? = try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    src.inputStream().use { it.copyTo(out) }
+                }
+                null
+            } catch (e: Exception) {
+                e.message
             }
-            Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "保存失败: ${e.message}", Toast.LENGTH_LONG).show()
+            runOnUiThread {
+                if (error == null) {
+                    Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "保存失败: $error", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 

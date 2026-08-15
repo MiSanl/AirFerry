@@ -810,9 +810,19 @@ export function ReceivePage(): React.ReactElement {
         dbg(`[qr#${i}] replacing dead worker...`)
         spawnQrWorker(i, trackReady)
       })
-      qr.addEventListener("messageerror", (ev) =>
+      // A reply whose structured-clone deserialization failed never arrives:
+      // leaving the slot busy wedges it forever (effective pool -1 per
+      // occurrence), and the worker's state after the failed deserialization
+      // is unknown — so recover exactly like the fatal "error" event:
+      // terminate + replace (the replacement holds its slot busy until it
+      // reports ready, so captureLoop never dispatches to it prematurely).
+      qr.addEventListener("messageerror", (ev) => {
         dbg(`[qr#${i}] MESSAGE ERROR: ${String(ev.data || "")}`)
-      )
+        if (qrWorkersRef.current[i] !== qr) return
+        qr.terminate()
+        dbg(`[qr#${i}] replacing worker after messageerror...`)
+        spawnQrWorker(i, trackReady)
+      })
       // Kick off this worker's initialization. Sending here (rather than in the
       // caller) guarantees both the initial pool and error-path replacements
       // always get their init — forgetting it leaves the slot busy forever and

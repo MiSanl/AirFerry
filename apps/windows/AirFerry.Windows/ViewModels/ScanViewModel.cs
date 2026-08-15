@@ -12,9 +12,10 @@ namespace AirFerry.Windows.ViewModels;
 
 /// <summary>
 /// The scan-page state machine — the Windows counterpart of Android's
-/// <c>ScanActivity</c>. Owns the <see cref="VideoCapture"/> (producer),
-/// <see cref="QrDecodePool"/> (N parallel decoders + serialized ingest), and a
-/// single <see cref="ReceiverSession"/> (the Rust RaptorQ engine). On completion
+/// <c>ScanActivity</c>. Owns the <see cref="IFrameSource"/> (producer — a
+/// DirectShow device, a screen rectangle or a window), <see cref="QrDecodePool"/>
+/// (N parallel decoders + serialized ingest), and a single
+/// <see cref="ReceiverSession"/> (the Rust RaptorQ engine). On completion
 /// it assembles the bytes, trims RaptorQ zero-padding, verifies CRC, unpacks a
 /// bundle if present, and stages the result for the detail/bundle views.
 /// </summary>
@@ -36,7 +37,7 @@ namespace AirFerry.Windows.ViewModels;
 /// </remarks>
 public partial class ScanViewModel : ObservableObject, IDisposable
 {
-    private AirFerry.Windows.Scan.VideoCapture? _capture;
+    private IFrameSource? _capture;
     private QrDecodePool? _pool;
     private ReceiverSession? _session;
     private Thread? _producerThread;
@@ -84,9 +85,9 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         _resumeRootId = normalized;
     }
 
-    /// <summary>The device index chosen in the device-select page.</summary>
+    /// <summary>The frame source chosen in the device-select page.</summary>
     [ObservableProperty]
-    private int _selectedDeviceIndex;
+    private ScanSource? _selectedSource;
 
     [ObservableProperty]
     private string _statusText = "等待扫码…";
@@ -142,11 +143,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private static string TempDir => Path.Combine(Path.GetTempPath(), "AirFerry");
 
     /// <summary>
-    /// Start the pipeline on <paramref name="deviceIndex"/>. Idempotent —
-    /// calling while running first stops the previous session.
+    /// Start the pipeline on <paramref name="source"/> (device, screen region
+    /// or window). Idempotent — calling while running first stops the previous
+    /// session.
     /// </summary>
     [RelayCommand]
-    public void StartScan(int deviceIndex)
+    public void StartScan(ScanSource source)
     {
         StopScan();
         lock (_lifecycleGate)
@@ -158,7 +160,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
         }
         Interlocked.Increment(ref _sessionEpoch);
-        SelectedDeviceIndex = deviceIndex;
+        // 清掉上一次传输残留的分段装配器，避免新一轮扫描读到旧任务的状态文案
+        // （分段账本本身落盘持久，段数据由 SegmentAssembler.Open→Resume 恢复，
+        // 置空引用不丢段）。注意：_resumeRootId 由构造函数在 StartScan 之前注入，
+        // 且本方法下方与 HandleSegmentedTransfer 都依赖它过滤目标传输，不能在此清空。
+        _segAssembler = null;
+        SelectedSource = source;
         IsComplete = false;
         IsRecovering = false;
         Progress = 0;
@@ -178,11 +185,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
             _session = new ReceiverSession();
             Interlocked.Exchange(ref _recoveryStarted, 0);
-            _capture = new Scan.VideoCapture(deviceIndex);
+            _capture = FrameSourceFactory.Create(source);
             if (!_capture.IsOpen)
             {
                 StopScan();
-                StatusText = "无法打开设备，请检查是否被其他程序占用";
+                StatusText = source is DeviceSource
+                    ? "无法打开设备，请检查是否被其他程序占用"
+                    : $"无法打开视频源: {source.DisplayName}";
                 return;
             }
 
@@ -203,7 +212,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
             IsScanning = true;
             StatusText = _resumeRootId is null
-                ? "正在扫描…对准屏幕上的二维码"
+                ? $"正在扫描… 视频源: {source.DisplayName}"
                 : $"正在继续任务 {_resumeRootId[..8]}…，其他文件会被忽略";
         }
         catch (Exception ex)
@@ -218,7 +227,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     {
         Thread? producer;
         QrDecodePool? pool;
-        Scan.VideoCapture? capture;
+        IFrameSource? capture;
         ReceiverSession? session;
         Task<RecoveryResult?>? recoveryTask;
         Task cleanup;
@@ -313,7 +322,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private static void CleanupDetachedPipeline(
         Thread? producer,
         QrDecodePool? pool,
-        Scan.VideoCapture? capture,
+        IFrameSource? capture,
         ReceiverSession? session,
         Task<RecoveryResult?>? recoveryTask)
     {
@@ -400,13 +409,21 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             // Snapshot references once per iteration. StopScan may detach the
             // fields while a driver call is blocked, but keeps these objects
             // alive until this producer exits.
-            Scan.VideoCapture? capture = _capture;
+            IFrameSource? capture = _capture;
             QrDecodePool? pool = _pool;
             if (capture is null || pool is null) break;
             Mat? gray = capture.ReadGray();
             if (gray is null)
             {
-                // Camera exhausted — a few nulls in a row means the device died.
+                if (!capture.IsOpen)
+                {
+                    // Source is gone for good (captured window closed, region
+                    // invalid, device died). StopScan joins this producer —
+                    // dispatching it synchronously here would self-deadlock.
+                    HandleFrameSourceLost();
+                    break;
+                }
+                // Transient miss — a few nulls in a row is normal.
                 Thread.Sleep(10);
                 continue;
             }
@@ -441,6 +458,30 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 nextPreviewAt = now + previewInterval;
             }
         }
+    }
+
+    /// <summary>
+    /// The frame source died mid-scan (captured window closed, screen region
+    /// invalid, device unplugged). Runs on the producer thread, so the stop
+    /// itself is dispatched — <see cref="StopScan"/> joins the producer and
+    /// would otherwise wait on itself. The status message is written after the
+    /// stop so <c>ResetStoppedUi</c> cannot overwrite it.
+    /// </summary>
+    private void HandleFrameSourceLost()
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                StopScan();
+            }
+            catch
+            {
+                // The cleanup path reports its own failures; the message below
+                // is the actionable one either way.
+            }
+            StatusText = "视频源已关闭，扫描已停止";
+        });
     }
 
     /// <summary>
@@ -751,7 +792,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // Crash recovery: all segments may already be durable while history
         // promotion was interrupted. Promotion is deliberately idempotent.
         if (asm.IsComplete())
-            return ArchiveSegmentedTransfer(asm, displayName, rootSize);
+            return ArchiveSegmentedTransfer(asm, displayName, decompressedSize);
 
         // A failure leaves all earlier verified segments untouched. The outer
         // recovery boundary swaps in a fresh child receiver so this segment can
@@ -771,13 +812,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             return null;
         }
 
-        return ArchiveSegmentedTransfer(asm, displayName, rootSize);
+        return ArchiveSegmentedTransfer(asm, displayName, decompressedSize);
     }
 
     private RecoveryResult ArchiveSegmentedTransfer(
         AirFerry.Windows.Bundle.SegmentAssembler asm,
         string displayName,
-        ulong rootSize)
+        ulong decompressedSize)
     {
         // Concatenate the compressed segments and stream-decompress exactly once
         // to a temp file. The native call already verified the decompressed
@@ -811,9 +852,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             }
             else if (BundleParser.IsBundle(original))
             {
-                result = StageBundle(original, expectedCrc, crcKnown, receivedCrc);
-                result ??= StageSingleFile(original, displayName, originalSize,
-                    expectedCrc, crcKnown, receivedCrc);
+                // If parsing failed, fall through to single-file handling
+                // (?? keeps `result` provably non-null; StageBundle returns
+                // RecoveryResult? — the sibling path at the non-segmented
+                // branch uses the same fallback).
+                result = StageBundle(original, expectedCrc, crcKnown, receivedCrc)
+                    ?? StageSingleFile(original, displayName, originalSize,
+                        expectedCrc, crcKnown, receivedCrc);
             }
             else if (FileNameUtil.IsTextLikeName(
                          string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
@@ -836,16 +881,22 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             // Very large single file: stream/atomically-move the decompressed
             // temp file into ContentStore without holding it in memory.
+            // 注意：expectedSize 校验的是**解压产物**长度，必须传解压后大小
+            // （调用方的压缩流 rootSize 只用于分段账本，语义勿混——Android 同名
+            // 函数的误导性参数名正是当初移植出错的根源）。
             string finalName = string.IsNullOrEmpty(displayName) ? "received_file" : displayName;
             ContentStore.PutResult put = ContentStore.PutFile(
                 finalName, decompressedPath,
                 crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
                 crcUnknown: !crcKnown, kind: "file",
                 expectedSha256Hex: asm.RootSha256Hex,
-                expectedSize: (long)rootSize);
+                expectedSize: (long)decompressedSize,
+                // 稳定条目 ID：入库后若索引发布被中断（崩溃/断电），重试时按
+                // 同 ID 去重，不产生重复历史条目（镜像 Android ScanActivity）。
+                stableEntryId: "segment-" + asm.RootSessionIdHex);
             result = new RecoveryResult(
                 SingleFilePath: put.Path,
-                SingleFileSize: rootSize,
+                SingleFileSize: decompressedSize,
                 ExpectedCrc32: crcKnown ? expectedCrc : null,
                 Crc32Known: crcKnown,
                 ReceivedCrc32: null,

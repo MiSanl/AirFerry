@@ -724,7 +724,7 @@ impl ReceiverSessionWasm {
             .map(|s| (s.root_session_id >> 64) as u64)
             .unwrap_or(0)
     }
-    /// SHA-256 of this segment's uncompressed bytes, or an empty vector for a
+    /// SHA-256 of this segment's **compressed** bytes, or an empty vector for a
     /// legacy non-segmented descriptor.
     pub fn raw_sha256(&self) -> Vec<u8> {
         self.inner

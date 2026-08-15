@@ -171,7 +171,7 @@ export interface SegmentMetaWasm {
   rootOriginalSize: number
   /** SHA-256 of the complete uncompressed root file (32 bytes). */
   rootSha256: Uint8Array
-  /** SHA-256 of this segment's uncompressed bytes (32 bytes). */
+  /** SHA-256 of this segment's **compressed** bytes (32 bytes). */
   rawSha256: Uint8Array
 }
 

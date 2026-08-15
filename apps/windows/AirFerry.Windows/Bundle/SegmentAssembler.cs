@@ -44,7 +44,12 @@ public sealed class SegmentAssembler
     private int _receivedCount;
     private long _updatedAt;
 
-    private string RootSessionIdHex => $"{_rootHi:x16}{_rootLo:x16}";
+    /// <summary>
+    /// 根会话 ID 的 32 位小写 hex（hi 在前、lo 在后各 16 位）——与磁盘账本目录名、
+    /// Android 端 <c>rootSessionIdHex</c> 一致。用于派生 ContentStore 稳定条目 ID，
+    /// 保证大文件分段入库崩溃重试时不产生重复历史条目。
+    /// </summary>
+    public string RootSessionIdHex => $"{_rootHi:x16}{_rootLo:x16}";
     private string PartialPath => Path.Combine(_dir, "transfer.partial");
     private string BitmapPath => Path.Combine(_dir, "bitmap.json");
 

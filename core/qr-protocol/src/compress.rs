@@ -54,17 +54,81 @@ const XZ_PRESET: u32 = 6 | LZMA_PRESET_EXTREME;
 #[cfg(not(target_arch = "wasm32"))]
 const XZ_DECODER_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 
+/// Maximum zstd back-reference window (`2^log` bytes) enforced on BOTH sides
+/// of this stack (audit L1). libzstd defaults to
+/// `ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`, i.e. a hostile CRC-valid frame header
+/// can force a ~128 MiB window allocation *before* any output is produced —
+/// RAM that is independent of `read_capped`/`decompress_stream_to_file`'s
+/// output cap (the bomb defense only bounds output bytes). Clamping the
+/// window tightens that input-side hole, mirroring the XZ path's
+/// `XZ_DECODER_MEMORY_LIMIT`.
+///
+/// Choice of 23 (8 MiB window):
+/// - **Production sender** = the TS worker's wasm-zstd at **level 1**: zstd's
+///   default cParams table caps level 1 at `windowLog = 19` for any source
+///   size (`clevels.h`, "> 256 KB" row), so ≤ 256 MiB originals stay at 19 —
+///   23 leaves four levels of headroom (table values only reach 23 at
+///   level 17).
+/// - **Rust-side compression** (`DEFAULT_LEVEL = 22`, test path): the zstd
+///   crate's `encode_all` is a *streaming* encoder with no pledged src size,
+///   so level 22 used to emit `windowLog = 27` frames regardless of input
+///   size (the table value is never srcSize-clamped on that path — verified
+///   empirically: even an 8 KiB level-22 stream was rejected by a 23-clamped
+///   decoder before this change). [`compress`] now caps the encoder window
+///   at the same 23, so every stream this stack produces decodes under the
+///   clamp by construction (root `cargo test` green).
+#[cfg(not(target_arch = "wasm32"))]
+const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
+/// Build a zstd streaming decoder with the receiver-side window clamp
+/// ([`ZSTD_WINDOW_LOG_MAX`]) applied. All untrusted-input decode paths must
+/// go through this so no `Decoder` is ever constructed unclamped.
+#[cfg(not(target_arch = "wasm32"))]
+fn zstd_decoder<R: std::io::BufRead>(reader: R) -> Result<zstd::stream::read::Decoder<'static, R>> {
+    let mut dec = zstd::stream::read::Decoder::with_buffer(reader)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    dec.window_log_max(ZSTD_WINDOW_LOG_MAX)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    Ok(dec)
+}
+
 /// Compress `data` with zstd at the given level.
 /// For small files, uses maximum compression (level 22) by default.
+///
+/// The encoder window is capped at [`ZSTD_WINDOW_LOG_MAX`] so every stream
+/// this stack produces stays decodable under the matching receiver-side
+/// window clamp. (The zstd crate's `encode_all` is a streaming encoder with
+/// no pledged src size, so high levels otherwise declare the full table
+/// window — level 22 → windowLog 27 — even for tiny inputs, which its own
+/// clamped decoder would then reject.)
 #[cfg(not(target_arch = "wasm32"))]
 pub fn compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::encode_all(data, level).map_err(|e| Error::Compress(e.to_string()))
+    use std::io::Write;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    encoder
+        .window_log(ZSTD_WINDOW_LOG_MAX)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    encoder
+        .write_all(data)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| Error::Compress(e.to_string()))
 }
 
 /// Decompress zstd-encoded `data`. (Kept for backward compatibility.)
+///
+/// Uses the same window clamp as [`decompress_with_limit`] so no untrusted
+/// input is ever decoded through an unclamped decoder.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(data).map_err(|e| Error::Compress(e.to_string()))
+    use std::io::Read;
+    let mut dec = zstd_decoder(data)?;
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|e| Error::Compress(e.to_string()))?;
+    Ok(out)
 }
 
 /// Compress `data` with the algorithm identified by a [`COMPRESSION_*`] tag.
@@ -106,8 +170,7 @@ pub fn decompress_with(data: &[u8], compression: u8) -> Result<Vec<u8>> {
 pub fn decompress_with_limit(data: &[u8], compression: u8, max_output: usize) -> Result<Vec<u8>> {
     match compression {
         COMPRESSION_ZSTD => {
-            let dec = zstd::stream::read::Decoder::new(data)
-                .map_err(|e| Error::Compress(e.to_string()))?;
+            let dec = zstd_decoder(data)?;
             read_capped(dec, max_output)
         }
         COMPRESSION_XZ => {
@@ -222,9 +285,15 @@ pub fn decompress_stream_to_file(
     // `Decoder::new` / `Stream::new_stream_decoder` fail, leaving a freshly-
     // created empty output file that must not linger).
     let result: Result<()> = match compression {
-        COMPRESSION_ZSTD => zstd::stream::read::Decoder::new(in_file)
-            .map_err(|e| Error::Compress(e.to_string()))
-            .and_then(|mut dec| decode(&mut dec)),
+        // Window-clamped streaming decoder (audit L1): same
+        // ZSTD_WINDOW_LOG_MAX bound as the in-memory path. The ~128 KiB
+        // BufReader capacity mirrors libzstd's ZSTD_DStreamInSize (what
+        // Decoder::new would have used).
+        COMPRESSION_ZSTD => zstd_decoder(std::io::BufReader::with_capacity(
+            128 * 1024,
+            in_file,
+        ))
+        .and_then(|mut dec| decode(&mut dec)),
         COMPRESSION_XZ => xz2::stream::Stream::new_stream_decoder(XZ_DECODER_MEMORY_LIMIT, 0)
             .map_err(|e| Error::Compress(e.to_string()))
             .and_then(|stream| {
@@ -440,5 +509,89 @@ mod tests {
             decompress_with_limit(&x, COMPRESSION_XZ, data.len()).unwrap(),
             data
         );
+    }
+
+    /// Hand-assembled, otherwise-valid zstd frame that declares a
+    /// windowLog of 27 (a 128 MiB back-reference window — the libzstd default
+    /// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`, so an *unclamped* streaming decoder
+    /// accepts it and allocates the full window before producing any output).
+    /// Body is a single raw (uncompressed) block, so the stream itself is
+    /// perfectly decodable; only the declared window is oversized.
+    fn oversized_window_frame() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]); // zstd magic (LE)
+        f.push(0x00); // Frame_Header_Descriptor: no FCS, no checksum, no dict
+        f.push(0x88); // Window_Descriptor: exponent 17, mantissa 0 → windowLog 27
+        // Block header (3B LE): last=1, type=0 (Raw), size=4.
+        f.extend_from_slice(&[0x21, 0x00, 0x00]);
+        f.extend_from_slice(b"ABCD");
+        f
+    }
+
+    /// Audit L1: the receiver-side zstd decoder must clamp
+    /// `ZSTD_d_windowLogMax` so a hostile CRC-valid frame header cannot force
+    /// a 128 MiB window allocation. The frame built above is wire-valid (an
+    /// unclamped decoder returns its payload), yet the clamped
+    /// `decompress_with_limit` must reject it.
+    #[test]
+    fn decompress_with_limit_rejects_oversized_zstd_window() {
+        let frame = oversized_window_frame();
+        // Sanity: the frame is a legitimate zstd stream that a default
+        // (unclamped) decoder happily decodes.
+        assert_eq!(
+            zstd::decode_all(&frame[..]).unwrap(),
+            b"ABCD".to_vec(),
+            "test frame must be a valid zstd stream"
+        );
+        // The clamped receiver path refuses it (frameParameter_unsupported).
+        assert!(
+            decompress_with_limit(&frame, COMPRESSION_ZSTD, 1024).is_err(),
+            "oversized zstd window must be rejected"
+        );
+    }
+
+    /// Same clamp on the streaming-to-disk path used by Android/Windows for
+    /// descriptor-v5 segmented transfers: an oversized-window frame must fail
+    /// (and the partial output file must be cleaned up).
+    #[test]
+    fn decompress_stream_to_file_rejects_oversized_zstd_window() {
+        let frame = oversized_window_frame();
+        let dir = std::env::temp_dir();
+        let input = dir.join(format!("airferry_win_clamp_in_{}.zst", std::process::id()));
+        let output = dir.join(format!("airferry_win_clamp_out_{}.bin", std::process::id()));
+        std::fs::write(&input, &frame).unwrap();
+        let result = decompress_stream_to_file(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            COMPRESSION_ZSTD,
+            1024,
+        );
+        let _ = std::fs::remove_file(&input);
+        assert!(result.is_err(), "oversized zstd window must be rejected");
+        assert!(
+            !output.exists(),
+            "failed decode must not leave a partial output file"
+        );
+    }
+
+    /// The clamp must not break legitimate streams: every level/size this
+    /// stack produces must still round-trip through the *clamped* decoder.
+    /// Level 1 is what the production TS sender uses (≤ 256 MiB inputs,
+    /// table windowLog 19); level 22 is the Rust-side default — [`compress`]
+    /// caps its encoder window at 23, so its output declares ≤ 23 and is
+    /// accepted by construction.
+    #[test]
+    fn clamped_zstd_decoder_accepts_legitimate_streams() {
+        for (level, len) in [(1, 1 << 20), (3, 300_000), (DEFAULT_LEVEL, 40_000)] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 & 0xff) as u8).collect();
+            let z = compress(&data, level).unwrap();
+            assert_eq!(
+                decompress_with_limit(&z, COMPRESSION_ZSTD, data.len()).unwrap(),
+                data,
+                "level {level} / {len} bytes must survive the window clamp"
+            );
+            // And the legacy `decompress` path (same clamp).
+            assert_eq!(decompress(&z).unwrap(), data);
+        }
     }
 }

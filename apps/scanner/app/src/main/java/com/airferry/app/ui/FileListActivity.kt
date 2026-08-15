@@ -40,6 +40,8 @@ import com.airferry.app.scan.FileTransfer
 import com.airferry.app.scan.SegmentAssembler
 import com.airferry.app.scan.TextLike
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 private val BgDark = Color(0xFF0F172A)
 private val CardBg = Color(0xFF1E293B)
@@ -82,25 +84,62 @@ class FileListActivity : ComponentActivity() {
     private var pendingSave: Pair<File, String>? = null
     private var indexErrorShown = false
 
+    /**
+     * Single background thread for the history list load and the SAF save
+     * copies. Both previously ran on the main thread:
+     *  - [loadRows] → [ContentStore.listEntries] is `@Synchronized` on the
+     *    ContentStore object and can block for the whole duration of an
+     *    in-flight archive ([ContentStore.putFile] holds the same monitor for
+     *    tens of seconds on large segmented transfers) → guaranteed ANR.
+     *  - SAF save copies whole-streamed blobs of up to hundreds of MiB → ANR.
+     * A single thread also keeps the sequential save queue strictly ordered.
+     */
+    private val bgExecutor = Executors.newSingleThreadExecutor()
+
     private val createDocument = registerForActivityResult(
         CreateNamedDocument()
     ) { uri: Uri? ->
         val job = pendingSave
         pendingSave = null
         if (uri != null && job != null && job.first.exists()) {
-            try {
-                contentResolver.openOutputStream(uri)?.use { out ->
-                    job.first.inputStream().use { it.copyTo(out) }
+            // The full stream copy runs on the background executor (M6); the
+            // queue only advances after the copy finishes, preserving the
+            // one-SAF-dialog-at-a-time sequential semantics.
+            Toast.makeText(this, "保存中…", Toast.LENGTH_SHORT).show()
+            bgExecutor.execute {
+                val error: String? = try {
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        job.first.inputStream().use { it.copyTo(out) }
+                    }
+                    null
+                } catch (e: Exception) {
+                    e.message
                 }
-            } catch (e: Exception) {
-                Toast.makeText(this, "保存失败: ${e.message}", Toast.LENGTH_LONG).show()
+                runOnUiThread {
+                    if (error != null) {
+                        Toast.makeText(this, "保存失败: $error", Toast.LENGTH_LONG).show()
+                    }
+                    advanceSaveQueue()
+                }
             }
+        } else {
+            advanceSaveQueue()
         }
+    }
+
+    /** Continue the sequential save flow after a copy (or a cancelled dialog). */
+    private fun advanceSaveQueue() {
+        if (isFinishing || isDestroyed) return
         if (saveQueue.isEmpty()) {
             Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
         } else {
             launchNextSave()
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        bgExecutor.shutdown()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -113,13 +152,43 @@ class FileListActivity : ComponentActivity() {
     private fun FileListScreen() {
         // null = root (top-level entries + bundle groups); non-null = inside a bundle
         var openBundleId by remember { mutableStateOf<String?>(null) }
-        var rows by remember { mutableStateOf(loadRows(openBundleId)) }
+        var rows by remember { mutableStateOf<List<Row>>(emptyList()) }
         var selection by remember { mutableStateOf<Set<String>?>(null) }
         var pendingDelete by remember { mutableStateOf<List<Row>?>(null) }
         var pendingClearAll by remember { mutableStateOf(false) }
         val inSelectionMode = selection != null
 
-        fun refresh() { rows = loadRows(openBundleId) }
+        // H3: loadRows touches the ContentStore monitor (listEntries is
+        // @Synchronized and blocks behind a long putFile archive) plus segment
+        // ledgers on disk — it must never run on the main thread. The
+        // generation counter discards stale results so a slow load can never
+        // overwrite a newer one (e.g. rapidly entering/leaving a bundle).
+        var rowsGeneration by remember { mutableStateOf(0) }
+        fun refresh() {
+            // Fail-safe against the executor being shut down from onDestroy:
+            // the background completion callbacks (clear-all / delete) post
+            // back via runOnUiThread without checking destroy state, and
+            // submitting to a shutdown executor throws
+            // RejectedExecutionException on the main thread (uncaught → crash).
+            // refresh() and onDestroy both run on the main thread, so the
+            // lifecycle check cannot race with shutdown; the try/catch is
+            // defense-in-depth for any future background-thread caller.
+            if (isFinishing || isDestroyed) return
+            val filter = openBundleId
+            val gen = ++rowsGeneration
+            try {
+                bgExecutor.execute {
+                    val loaded = loadRows(filter)
+                    runOnUiThread {
+                        if (gen == rowsGeneration) rows = loaded
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                // Activity destroyed mid-flight — nothing left to refresh.
+            }
+        }
+        // Initial (and config-change) load — async, off the main thread.
+        LaunchedEffect(Unit) { refresh() }
         fun exitSelection() { selection = null }
         fun toggle(row: Row) {
             val k = row.key
@@ -127,11 +196,21 @@ class FileListActivity : ComponentActivity() {
         }
 
         fun clearAll() {
-            ContentStore.clearAll(this)
-            openBundleId = null
-            refresh()
-            exitSelection()
-            Toast.makeText(this, "已清空", Toast.LENGTH_SHORT).show()
+            // H3: clearAll takes the same @Synchronized ContentStore monitor an
+            // archive may hold for tens of seconds — never on the main thread.
+            bgExecutor.execute {
+                ContentStore.clearAll(this)
+                runOnUiThread {
+                    // The destroy-vs-callback race: this runnable can run after
+                    // onDestroy already shut the executor down (refresh() is
+                    // fail-safe, but the toast must not fire either).
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    openBundleId = null
+                    refresh()
+                    exitSelection()
+                    Toast.makeText(this, "已清空", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
         Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
@@ -275,10 +354,18 @@ class FileListActivity : ComponentActivity() {
                     TextButton(onClick = {
                         val doomed = pendingDelete ?: emptyList()
                         pendingDelete = null
-                        for (r in doomed) deleteRow(r)
-                        refresh()
-                        exitSelection()
-                        Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+                        // H3: deleteEntry/deleteBundle/discard take the same
+                        // @Synchronized ContentStore monitor (plus disk I/O) —
+                        // run off the main thread, refresh once done.
+                        bgExecutor.execute {
+                            for (r in doomed) deleteRow(r)
+                            runOnUiThread {
+                                if (isFinishing || isDestroyed) return@runOnUiThread
+                                refresh()
+                                exitSelection()
+                                Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     }) { Text("删除", color = DeleteRed) }
                 },
                 dismissButton = {
@@ -316,7 +403,9 @@ class FileListActivity : ComponentActivity() {
         } catch (e: IllegalStateException) {
             if (!indexErrorShown) {
                 indexErrorShown = true
-                window.decorView.post {
+                // loadRows runs on a background thread — never touch the view
+                // hierarchy from there; hop to the main thread for the toast.
+                runOnUiThread {
                     Toast.makeText(this, e.message ?: "接收历史索引损坏", Toast.LENGTH_LONG).show()
                 }
             }
@@ -485,9 +574,14 @@ class FileListActivity : ComponentActivity() {
             }
         }
         Thread {
+            // M4: stream the CRC (64 KiB buffer, O(1) memory). The previous
+            // `file.readBytes()` whole-loaded blobs of up to hundreds of MiB
+            // and OOM-crashed — an Error the old `catch (Exception)` could not
+            // intercept. CRC is display-only here, so any failure (including
+            // OOM) just degrades to "unknown" (-1).
             val receivedCrc = try {
-                ScanActivity.crc32OfBytes(file.readBytes())
-            } catch (_: Exception) {
+                ScanActivity.crc32OfFile(file)
+            } catch (t: Throwable) {
                 -1L
             }
             val expectedCrc = e.crcHex.toLongOrNull(16) ?: 0L
