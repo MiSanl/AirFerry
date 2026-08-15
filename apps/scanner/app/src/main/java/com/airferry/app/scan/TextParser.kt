@@ -41,6 +41,17 @@ object TextParser {
     }
 
     /**
+     * The message bytes without the 8-byte wire magic. Callers that stage an
+     * ETTEXTv1 payload as a FILE (over the text-UI size cap) MUST go through
+     * this — saving the raw wire bytes would put the literal "ETTEXTv1"
+     * protocol header at the start of the user's file.
+     */
+    fun payloadWithoutMagic(bytes: ByteArray): ByteArray {
+        if (!isText(bytes)) return bytes
+        return bytes.copyOfRange(MAGIC.size, bytes.size)
+    }
+
+    /**
      * Decode the text payload: strip the 8-byte magic and UTF-8-decode the rest.
      * Returns `null` if [bytes] does not carry the magic or the tail is not
      * valid UTF-8. The caller should treat `null` as "not a text payload /

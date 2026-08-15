@@ -63,7 +63,10 @@ function decodeUtf8Strict(bytes: Uint8Array): { text: string; valid: boolean } {
   }
 }
 
-const MAX_TEXT_UI_BYTES = 8 * 1024 * 1024
+// Inline-text cap, mirrored from Android TextLike.MAX_TEXT_UI_BYTES and
+// Windows FileNameUtil.MaxTextUiBytes (256 KiB). Oversized ETTEXT messages
+// are handed to the UI as an ordinary .txt FILE (magic already stripped).
+const MAX_TEXT_UI_BYTES = 256 * 1024
 
 /**
  * Parse a recovered, decompressed payload into a text / bundle / file result.

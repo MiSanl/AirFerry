@@ -652,15 +652,26 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong originalSize = payload.OriginalSize;
 
         RecoveryResult? result;
-        if (TextParser.IsText(bytes) &&
-            FileNameUtil.FitsTextUi(bytes.LongLength - TextParser.Magic.Length))
+        if (TextParser.IsText(bytes))
         {
-            // Text payload → decode UTF-8, stage under the descriptor filename,
-            // and carry the string for the copy/share UI. Checked BEFORE the
+            // ETTEXTv1 payloads start with the 8-byte wire magic. Strip it up
+            // front so EVERY downstream path — the text UI and the
+            // oversized→file fallback alike — sees the message text, never the
+            // protocol header (the fallback used to stage a file that
+            // literally began with the "ETTEXTv1" bytes). Checked BEFORE the
             // bundle branch: the two magics never collide ("ETTEXTv1" vs
-            // "ETBUNDL1"). If decoding fails, fall through to single-file
-            // handling so the user still gets something.
-            string? text = TextParser.Parse(bytes);
+            // "ETBUNDL1").
+            bytes = bytes[TextParser.Magic.Length..];
+            originalSize = (ulong)bytes.LongLength;
+            if (string.IsNullOrEmpty(displayName) || !displayName.Contains('.'))
+            {
+                displayName = string.IsNullOrEmpty(displayName)
+                    ? "文字消息.txt"
+                    : displayName + ".txt";
+            }
+            // Text UI when it fits the cap; oversized text → ordinary .txt
+            // file. DecodeUtf8Strict is null on invalid UTF-8 (→ file too).
+            string? text = FileNameUtil.DecodeUtf8Strict(bytes);
             result = text is not null
                 ? StageEtText(text, displayName, expectedCrc, crcKnown, receivedCrc)
                 : StageSingleFile(bytes, displayName, originalSize,
@@ -841,10 +852,21 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             ulong receivedCrc = Crc32.Compute(original);
             ulong originalSize = (ulong)original.LongLength;
 
-            if (TextParser.IsText(original) &&
-                FileNameUtil.FitsTextUi(original.LongLength - TextParser.Magic.Length))
+            if (TextParser.IsText(original))
             {
-                string? text = TextParser.Parse(original);
+                // Same ETTEXT restructure as RecoverAndStageCore: strip the
+                // 8-byte wire magic up front so the oversized→file fallback
+                // stages the message text, not a file starting with the
+                // literal "ETTEXTv1" bytes.
+                original = original[TextParser.Magic.Length..];
+                originalSize = (ulong)original.LongLength;
+                if (string.IsNullOrEmpty(displayName) || !displayName.Contains('.'))
+                {
+                    displayName = string.IsNullOrEmpty(displayName)
+                        ? "文字消息.txt"
+                        : displayName + ".txt";
+                }
+                string? text = FileNameUtil.DecodeUtf8Strict(original);
                 result = text is not null
                     ? StageEtText(text, displayName, expectedCrc, crcKnown, receivedCrc)
                     : StageSingleFile(original, displayName, originalSize,

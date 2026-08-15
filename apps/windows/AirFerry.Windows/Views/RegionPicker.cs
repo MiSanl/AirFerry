@@ -73,11 +73,13 @@ internal sealed class RegionPickerSession
         // handling the picking mouse-UP, so the second press of an accidental
         // double-click would fall through to the just-picked app (e.g. select
         // a word / click a link inside the browser). Keep them shown and
-        // hit-testable for a beat to swallow the trailing click, then close.
+        // hit-testable for one system double-click window (user-configurable,
+        // default 500 ms — a fixed 300 ms can miss it) plus a small margin,
+        // then close.
         RegionPickerWindow[] windows = _windows.ToArray();
         var closer = new System.Windows.Threading.DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(300),
+            Interval = TimeSpan.FromMilliseconds(ScreenNative.GetDoubleClickTime() + 50),
         };
         closer.Tick += (_, _) =>
         {

@@ -903,29 +903,31 @@ class ScanActivity : ComponentActivity() {
         // Prefer the descriptor filename (sender select-page name); fall back
         // to the default only when the descriptor never supplied one.
         //
-        // Size guard: only decode into the in-memory text UI when it fits within
-        // the text cap. Otherwise fall through to single-file handling below,
-        // which saves the raw bytes as a `.txt` file — decoding a multi-MB text
-        // message into a ~2x UTF-16 String plus a re-encode here balloons the
-        // JVM heap past the budget on low-end devices (the sibling text paths in
-        // FileListActivity / ReceiveTextActivity / ReceiveBundleActivity all
-        // guard with fitsTextUi; this branch is the only one that did not).
-        if (TextParser.isText(truncBytes) &&
-            com.airferry.app.scan.TextLike.fitsTextUi(truncBytes.size)
-        ) {
-            val text = TextParser.parse(truncBytes)
+        // The 8-byte wire magic is stripped up front: BOTH the in-memory text
+        // path and the oversized→file fallback below must see the message
+        // text — the fallback previously saved the raw wire bytes, putting the
+        // literal "ETTEXTv1" protocol header at the start of the user's file.
+        if (TextParser.isText(truncBytes)) {
+            val messageBytes = TextParser.payloadWithoutMagic(truncBytes)
+            // Prefer descriptor name; ensure a .txt-ish save label for pure text.
+            // (Sender already normalizes to *.txt; this is a receive-side belt.)
+            val textName = when {
+                displayName.isEmpty() -> TEXT_RECEIVED_NAME
+                displayName.contains('.') -> displayName
+                else -> "$displayName.txt"
+            }
+            // Size guard: only decode into the in-memory text UI when it fits
+            // the text cap — decoding a multi-MB message into a ~2x UTF-16
+            // String plus a re-encode balloons the JVM heap on low-end devices.
+            val text = if (com.airferry.app.scan.TextLike.fitsTextUi(messageBytes.size))
+                TextParser.parse(truncBytes)
+            else
+                null
             if (text != null) {
                 updateRecoveryStage("正在保存文字…")
                 val contentBytes = text.toByteArray(Charsets.UTF_8)
                 val contentCrc = crc32OfBytes(contentBytes)
                 val crcHex = java.lang.Long.toHexString(contentCrc)
-                // Prefer descriptor name; ensure a .txt-ish save label for pure text.
-                // (Sender already normalizes to *.txt; this is a receive-side belt.)
-                val textName = when {
-                    displayName.isEmpty() -> TEXT_RECEIVED_NAME
-                    displayName.contains('.') -> displayName
-                    else -> "$displayName.txt"
-                }
                 val put = store.putBytes(
                     this, textName, contentBytes,
                     crcHex = crcHex, crcUnknown = false, kind = "text",
@@ -940,6 +942,27 @@ class ScanActivity : ComponentActivity() {
                     putExtra("CRC32_RECEIVED", receivedCrc)
                     putExtra("CRC32_UNKNOWN", !crcKnown)
                 }
+            }
+            // Oversized (over the text cap) or invalid UTF-8 → ordinary .txt
+            // FILE, magic stripped.
+            updateRecoveryStage("正在保存文件…")
+            val contentCrc = crc32OfBytes(messageBytes)
+            val put = store.putBytes(
+                this, textName, messageBytes,
+                crcHex = java.lang.Long.toHexString(contentCrc),
+                crcUnknown = false, kind = "file",
+            )
+            clearRecoveryStage()
+            return Intent(this, ReceiveDetailActivity::class.java).apply {
+                putExtra("FILE_PATH", put.path.absolutePath)
+                putExtra("FILE_SIZE", messageBytes.size.toLong())
+                putExtra("FILE_NAME", textName)
+                putExtra("ENTRY_ID", put.entry.id)
+                putExtra("CRC32", expectedCrc)
+                putExtra("CRC32_RECEIVED", receivedCrc)
+                putExtra("CRC32_UNKNOWN", !crcKnown)
+                // Already archived into ContentStore — do not copy again.
+                putExtra("RESAVE", true)
             }
         }
 
@@ -1273,21 +1296,28 @@ class ScanActivity : ComponentActivity() {
         if (small) {
             val receivedCrc = crc32OfBytes(originalBytes)
 
-            // Text payload → ETTEXTv1.
-            if (com.airferry.app.scan.TextParser.isText(originalBytes) &&
-                com.airferry.app.scan.TextLike.fitsTextUi(originalBytes.size)
-            ) {
-                val text = com.airferry.app.scan.TextParser.parse(originalBytes)
+            // Text payload → ETTEXTv1. Strip the 8-byte wire magic up front
+            // (same restructure as recoverAndStage): the oversized→file
+            // fallback must stage the message text, never bytes starting with
+            // the literal "ETTEXTv1" protocol header.
+            if (com.airferry.app.scan.TextParser.isText(originalBytes)) {
+                val messageBytes =
+                    com.airferry.app.scan.TextParser.payloadWithoutMagic(originalBytes)
+                val textName = when {
+                    displayName.isEmpty() -> TEXT_RECEIVED_NAME
+                    displayName.contains('.') -> displayName
+                    else -> "$displayName.txt"
+                }
+                val text =
+                    if (com.airferry.app.scan.TextLike.fitsTextUi(messageBytes.size))
+                        com.airferry.app.scan.TextParser.parse(originalBytes)
+                    else
+                        null
                 if (text != null) {
                     updateRecoveryStage("正在保存文字…")
                     val contentBytes = text.toByteArray(Charsets.UTF_8)
                     val contentCrc = crc32OfBytes(contentBytes)
                     val crcHex = java.lang.Long.toHexString(contentCrc)
-                    val textName = when {
-                        displayName.isEmpty() -> TEXT_RECEIVED_NAME
-                        displayName.contains('.') -> displayName
-                        else -> "$displayName.txt"
-                    }
                     val put = store.putBytes(
                         this, textName, contentBytes,
                         crcHex = crcHex, crcUnknown = false, kind = "text",
@@ -1302,6 +1332,27 @@ class ScanActivity : ComponentActivity() {
                         putExtra("CRC32_RECEIVED", receivedCrc)
                         putExtra("CRC32_UNKNOWN", !crcKnown)
                     }
+                }
+                // Oversized (over the text cap) or invalid UTF-8 → ordinary
+                // .txt FILE, magic stripped.
+                updateRecoveryStage("正在保存文件…")
+                val contentCrc = crc32OfBytes(messageBytes)
+                val put = store.putBytes(
+                    this, textName, messageBytes,
+                    crcHex = java.lang.Long.toHexString(contentCrc),
+                    crcUnknown = false, kind = "file",
+                )
+                asm.commitArchived(); segAssembler = null; resumeRootId = null
+                clearRecoveryStage()
+                return Intent(this, ReceiveDetailActivity::class.java).apply {
+                    putExtra("FILE_PATH", put.path.absolutePath)
+                    putExtra("FILE_SIZE", messageBytes.size.toLong())
+                    putExtra("FILE_NAME", textName)
+                    putExtra("ENTRY_ID", put.entry.id)
+                    putExtra("CRC32", expectedCrc)
+                    putExtra("CRC32_RECEIVED", receivedCrc)
+                    putExtra("CRC32_UNKNOWN", !crcKnown)
+                    putExtra("RESAVE", true)
                 }
             }
 

@@ -63,12 +63,12 @@ internal partial class RegionPickerWindow : Window
         PreviewMouseLeftButtonUp += OnUp;
         PreviewMouseRightButtonDown += SwallowMouseButton;
         PreviewMouseRightButtonUp += OnRightUp;
-        PreviewMouseMiddleButtonDown += SwallowMouseButton;
-        PreviewMouseMiddleButtonUp += SwallowMouseButton;
-        PreviewMouseXButton1Down += SwallowMouseButton;
-        PreviewMouseXButton1Up += SwallowMouseButton;
-        PreviewMouseXButton2Down += SwallowMouseButton;
-        PreviewMouseXButton2Up += SwallowMouseButton;
+        // WPF has discrete preview events ONLY for Left/Right; middle and the
+        // X buttons arrive on the generic routed pair (see ChangedButton) —
+        // there is no PreviewMouseMiddleButtonDown/XButton1Down (using them
+        // was a build break). Swallow the aux buttons there.
+        PreviewMouseDown += SwallowAuxButton;
+        PreviewMouseUp += SwallowAuxButton;
         PreviewMouseWheel += (_, e) => e.Handled = true;
         PreviewKeyDown += OnKey;
     }
@@ -214,12 +214,16 @@ internal partial class RegionPickerWindow : Window
     }
 
     /// <summary>
-    /// Swallow non-left buttons so they can never leak anywhere (the overlay
-    /// is an input barrier — nothing under it may react to middle/X clicks).
+    /// Swallow non-primary buttons (middle / XButton1 / XButton2) so they can
+    /// never leak anywhere — the overlay is an input barrier; nothing under it
+    /// may react. Left/Right keep their own discrete preview handlers.
     /// </summary>
-    private static void SwallowMouseButton(object sender, MouseButtonEventArgs e)
+    private static void SwallowAuxButton(object sender, MouseButtonEventArgs e)
     {
-        e.Handled = true;
+        if (e.ChangedButton is not (MouseButton.Left or MouseButton.Right))
+        {
+            e.Handled = true;
+        }
     }
 
     /// <summary>

@@ -115,6 +115,10 @@ internal static class ScreenNative
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT lpPoint);
 
+    /// <summary>System double-click time in milliseconds (user-configurable).</summary>
+    [DllImport("user32.dll")]
+    public static extern uint GetDoubleClickTime();
+
     /// <summary>Current window rect; zero rect when the query fails.</summary>
     public static RECT GetWindowRectNow(IntPtr hwnd)
     {
