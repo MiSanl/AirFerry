@@ -26,8 +26,8 @@ android {
         applicationId = "com.airferry.app"
         minSdk = 29          // Android 10+
         targetSdk = 34
-        versionCode = 17
-        versionName = "1.2.3"
+        versionCode = 18
+        versionName = "1.2.4"
 
         // Native build: ZXing-C++ via CMake + JNI bridge.
         externalNativeBuild {
