@@ -15,13 +15,21 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- Exe/taskbar/Alt-Tab icon (multi-size 16–128, generated from
          apps/sender/assets/icon*.png — see AGENTS.md §3.4 for the regen
-         command). WPF SDK auto-includes .ico as a Resource for XAML use. -->
+         command). Note: ApplicationIcon sets the Win32 exe icon; XAML use via
+         pack:// URI requires the explicit <Resource Include="Assets\app.ico" /> below. -->
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Embed app.ico as a WPF Resource so pack://application:,,,/Assets/app.ico resolves at XAML runtime.
+         ApplicationIcon only sets the Win32 exe header icon via /win32icon; the WPF SDK does NOT automatically
+         promote ApplicationIcon into the assembly's g.resources stream. -->
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- Camera + capture-card capture via OpenCV's DirectShow/Media Foundation
