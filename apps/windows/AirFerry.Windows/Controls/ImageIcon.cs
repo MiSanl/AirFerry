@@ -29,11 +29,13 @@ public class ImageIcon : IconElement
 
     /// <summary>
     /// IconElement lazily builds its single visual child; bind (rather than
-    /// copy) Source so a XAML-time or later assignment keeps working.
+    /// copy) Source so a XAML-time or later assignment keeps working. The
+    /// image type must stay fully qualified: <c>Wpf.Ui.Controls</c> ships its
+    /// own <c>Image</c>, making the bare name ambiguous under both usings.
     /// </summary>
     protected override UIElement InitializeChildren()
     {
-        Image image = new() { Stretch = Stretch.Uniform };
+        System.Windows.Controls.Image image = new() { Stretch = Stretch.Uniform };
         _ = BindingOperations.SetBinding(
             image, System.Windows.Controls.Image.SourceProperty,
             new Binding(nameof(Source)) { Source = this });
