@@ -14,8 +14,8 @@ namespace AirFerry.Windows.Views;
 /// <summary>
 /// Single-file receive detail page — mirrors Android's
 /// <c>ReceiveDetailActivity</c>: shows filename / size / integrity
-/// verification (themed InfoBar), and offers "save to…", "share" (Explorer
-/// select), and "rescan".
+/// verification (themed InfoBar), and offers "save to…", "open folder"
+/// (Explorer selects the logically named export), and "rescan".
 /// </summary>
 public partial class ReceiveDetailView : Page
 {
@@ -113,7 +113,7 @@ public partial class ReceiveDetailView : Page
         NavigationService?.GoBack();
     }
 
-    private async void Share_Click(object sender, RoutedEventArgs e)
+    private async void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
         string src = _result.SingleFilePath ?? "";
         if (!File.Exists(src))
@@ -137,7 +137,7 @@ public partial class ReceiveDetailView : Page
         }
         catch (Exception ex)
         {
-            await UiMessages.ErrorAsync($"分享失败: {ex.Message}");
+            await UiMessages.ErrorAsync($"打开文件夹失败: {ex.Message}");
         }
     }
 

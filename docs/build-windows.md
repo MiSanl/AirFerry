@@ -183,6 +183,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 - **主题**：`App.xaml` 合并 `ui:ThemesDictionary` + `ui:ControlsDictionary` + 自有语义 token 字典（`Themes/DesignTokens.{Light,Dark}.xaml`：`SuccessBrush`/`ErrorBrush`/`WarningBrush`/`PreviewBackdropBrush`）。`Services/ThemeService.cs` 按 `settings.json` 的 `theme` 键（`light`/`dark`/`system`，设置页可改）应用主题：跟随系统模式用 `SystemThemeWatcher.Watch` 监听 OS 切换；之后统一应用品牌主色 `#2563EB`。设置读写由 `Services/AppSettings.cs` 独占（手写 JSON，与 Android 端格式对齐）。**主题画刷一律 `DynamicResource` 引用**。
 - **控件约定**：`ui:Card` 卡片（继承 ContentControl、无 `Padding` 属性，内边距写到子元素 `Margin`；要填满行高须显式 `VerticalAlignment="Stretch"`）、`ui:Button Appearance=Primary/Secondary/Transparent`（**图标必须显式 `<ui:Button.Icon><ui:SymbolIcon …/></ui:Button.Icon>`，`Icon="…24"` 简写不渲染；满宽按钮须显式 `HorizontalAlignment="Stretch"`**，WPF-UI Button 样式默认左对齐）、`ui:InfoBar` 状态条、`ui:SymbolIcon` 图标；**`ComboBox`/`Slider` 没有 `ui:` 包装类**，直接用标准控件（ControlsDictionary 隐式样式接管）。弹窗统一 `Services/UiMessages.cs`（`ui:MessageBox`，调用方必须 `await`，勿同步阻塞 dispatcher）。
 - **RegionPickerWindow 例外**：全屏透明覆盖层与 FluentWindow 不兼容，保持普通 Window，配色固定（主题无关）。
+- **接收结果页层级**：`ReceiveDetailView` / `ReceiveTextView` / `ReceiveBundleView` 顶部先单独显示左对齐的「返回」，下一行再显示成功图标与接收完成状态；导航和结果状态不放在同一横排。单文件与文件包结果页原「分享」按钮实际是调用 Explorer 定位导出文件，因此统一按真实行为显示为「打开文件夹」并使用文件夹图标。
 
 ---
 

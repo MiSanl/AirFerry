@@ -16,7 +16,7 @@ namespace AirFerry.Windows.Views;
 /// <summary>
 /// Multi-file bundle receive page — mirrors Android's
 /// <c>ReceiveBundleActivity</c>: lists each unpacked file with name + size,
-/// offers "save all" / "share all" / "rescan". Double-click (or Enter) on a
+/// offers "save all" / "open folder" / "rescan". Double-click (or Enter) on a
 /// .txt entry opens <see cref="ReceiveTextView"/> so mixed-batch text can be
 /// copied (sender materialises "添加文字" as named .txt inside ETBUNDL1).
 /// </summary>
@@ -171,7 +171,7 @@ public partial class ReceiveBundleView : Page
         }
     }
 
-    private async void ShareAll_Click(object sender, RoutedEventArgs e)
+    private async void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
         if (_result.Bundle is null)
         {
@@ -192,7 +192,7 @@ public partial class ReceiveBundleView : Page
         }
         catch (Exception ex)
         {
-            await UiMessages.ErrorAsync($"分享失败: {ex.Message}");
+            await UiMessages.ErrorAsync($"打开文件夹失败: {ex.Message}");
         }
     }
 

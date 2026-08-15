@@ -383,11 +383,11 @@ offset  size   field
 
 | 源 | 当前 |
 |----|------|
-| `Cargo.toml` `[workspace.package] version` | `1.2.5` |
-| `apps/sender/package.json` `version` + `manifest.version` | `1.2.5` |
-| `apps/web/package.json` `version` | `1.2.5` |
-| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.2.5` / `19` |
-| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.2.5` |
+| `Cargo.toml` `[workspace.package] version` | `1.2.6` |
+| `apps/sender/package.json` `version` + `manifest.version` | `1.2.6` |
+| `apps/web/package.json` `version` | `1.2.6` |
+| `apps/scanner/app/build.gradle.kts` `versionName` / `versionCode` | `1.2.6` / `20` |
+| `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>` | `1.2.6` |
 
 `scripts/build-all.sh` 的 release 打包文件名版本号由 `read_version()` 从 `apps/sender/package.json` 动态读取，与 `manifest.version` 同源，**无需在脚本里手改**。Windows 发版必须给 workflow 的 `release_tag` 输入一个已存在 tag；workflow 从该 tag 检出、核对 tag commit 与 package/manifest 版本后再派生 `VER`，不再维护可漂移的硬编码版本。
 
