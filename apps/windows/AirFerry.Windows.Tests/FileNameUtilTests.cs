@@ -106,13 +106,16 @@ public class FileNameUtilTests
     [Theory]
     [InlineData("notes.txt", true)]
     [InlineData("readme.MD", true)]
-    [InlineData("data.json", true)]
-    [InlineData("path/to/code.rs", true)]
+    [InlineData("notes.md", true)]
+    [InlineData("data.json", false)]
+    [InlineData("page.html", false)]
+    [InlineData("path/to/code.rs", false)]
+    [InlineData("notes.markdown", false)]
     [InlineData("photo.png", false)]
     [InlineData("archive.zip", false)]
     [InlineData("noext", false)]
     [InlineData(".gitignore", false)]
-    public void IsTextLikeName_MatchesCommonExtensions(string name, bool expected)
+    public void IsTextLikeName_OnlyPlainTxtMd(string name, bool expected)
     {
         Assert.Equal(expected, FileNameUtil.IsTextLikeName(name));
     }

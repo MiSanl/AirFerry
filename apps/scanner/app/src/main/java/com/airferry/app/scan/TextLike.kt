@@ -30,21 +30,12 @@ object TextLike {
      */
     const val MAX_TEXT_UI_BYTES: Int = 256 * 1024
 
-    private val EXTENSIONS = setOf(
-        // documents / notes
-        "txt", "text", "md", "markdown", "rst", "adoc", "asciidoc",
-        "csv", "tsv", "log", "nfo", "srt", "vtt", "diff", "patch",
-        // structured / config
-        "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
-        "properties", "env", "plist",
-        // web / markup
-        "html", "htm", "css", "svg",
-        // common source / scripts (often transferred as "text")
-        "js", "mjs", "cjs", "ts", "tsx", "jsx",
-        "py", "rb", "go", "rs", "java", "kt", "kts", "swift",
-        "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "sql", "sh", "bash",
-        "zsh", "bat", "cmd", "ps1", "r", "lua", "php",
-    )
+    // Only plain-note formats open in the text UI. Everything else — HTML,
+    // JSON/YAML/XML, source code, logs — is handled as a regular file even
+    // when it is technically text: rendering anything richer than a note in
+    // the single-string text screen buys nothing and has been the source of
+    // crashes (multi-MB HTML). Mirrors Windows FileNameUtil.TextLikeExtensions.
+    private val EXTENSIONS = setOf("txt", "md")
 
     fun isTextLikeName(name: String): Boolean {
         val base = name.substringAfterLast('/', name).substringAfterLast('\\')

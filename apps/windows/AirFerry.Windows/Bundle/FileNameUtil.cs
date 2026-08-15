@@ -262,17 +262,11 @@ public static class FileNameUtil
         }
     }
 
-    // Keep in sync with apps/scanner/.../scan/TextLike.kt
+    // Keep in sync with apps/scanner/.../scan/TextLike.kt — only plain-note
+    // formats; everything else (HTML, JSON, source code, logs) is a regular
+    // file even when technically text.
     private static readonly HashSet<string> TextLikeExtensions = new(StringComparer.Ordinal)
     {
-        "txt", "text", "md", "markdown", "rst", "adoc", "asciidoc",
-        "csv", "tsv", "log", "nfo", "srt", "vtt", "diff", "patch",
-        "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
-        "properties", "env", "plist",
-        "html", "htm", "css", "svg",
-        "js", "mjs", "cjs", "ts", "tsx", "jsx",
-        "py", "rb", "go", "rs", "java", "kt", "kts", "swift",
-        "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "sql", "sh", "bash",
-        "zsh", "bat", "cmd", "ps1", "r", "lua", "php",
+        "txt", "md",
     };
 }

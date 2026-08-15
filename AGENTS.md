@@ -407,7 +407,7 @@ npm run preview        # 本地预览构建产物
 | **ZXing-C++ JNI（native）** | `app/src/main/cpp/scan_jni.cpp` | 完整保留 v1.1.3 解码实现（TryHarder/TryInvert、全帧/ROI/多码打包）；CMake 仍把 ZXing v3.0.2 固定到不可变 commit |
 | 多文件包解包 | `app/.../scan/BundleParser.kt` | 恢复后拆包（ETBUNDL1） |
 | **文字载荷解析** | `app/.../scan/TextParser.kt` | `isText`/`parse`（ETTEXTv1 → UTF-8）；字节级镜像 TS `text.ts` 与 C# `TextParser.cs` |
-| **文本类启发式** | `app/.../scan/TextLike.kt` | 扩展名 + `decodeUtf8Strict`；与 Windows `FileNameUtil.IsTextLikeName` 对齐。内联文字 UI 上限 `MAX_TEXT_UI_BYTES`=`MaxTextUiBytes`=**256 KiB**（两平台镜像；曾为 8 MiB，多 MB HTML 在文字页主线程整读+整渲染必崩，v1.2.4 起超限一律走文件页） |
+| **文本类启发式** | `app/.../scan/TextLike.kt` | **仅 `txt`/`md` 两个扩展名**走文字页（与 Windows `FileNameUtil.TextLikeExtensions` 镜像；曾含 json/html/源码等几十种，v1.2.4 起收紧——其余格式一律按文件处理）；内联文字 UI 上限 `MAX_TEXT_UI_BYTES`=`MaxTextUiBytes`=**256 KiB**（两平台镜像；曾为 8 MiB，多 MB HTML 在文字页主线程整读+整渲染必崩，超限同样走文件页）；`decodeUtf8Strict` 拒绝非 UTF-8 |
 | **内容库（映射去重）** | `app/.../scan/ContentStore.kt` | `files/store/blobs/<hh>/<sha256>` + `index.json`。大文件新任务/逐段写入先检查空间；完成时验证根 SHA，成品同卷原子移动到内容地址，并以根任务派生的稳定条目 ID 做崩溃重试，既不重复历史记录也不产生常态 2× 占用。Windows 实现同构 |
 | **分段账本（磁盘 .partial + bitmap）** | `app/.../scan/SegmentAssembler.kt` | `storeSegment` 随机写 `.partial` + 原子 `bitmap.json`；`open()` 恢复时对每个标记段做全量 SHA-256 复核，**修正结果即时 best-effort 落盘**——防「账本虚报完备」（bitmap 计满但某段 `.partial` 损坏）让廉价账本检查（`listTasks`/重归档门）反复误判完备、每个 descriptor 帧触发一次逐段全量重哈希的自旋；`hasStoredSegment` 是只读单段复核快路径 |
 | 文件导出名 / MIME | `app/.../scan/FileTransfer.kt` + `AirFerryFileProvider.kt` | ContentStore 实体是无扩展名 SHA-256；四参数 URI 把逻辑名写入 `DISPLAY_NAME`，自定义 provider 覆盖 `getType`/`getTypeAnonymous` 返回逻辑 MIME；SAF 同样按扩展名选择 MIME，避免目标应用落成 `.bin` |
