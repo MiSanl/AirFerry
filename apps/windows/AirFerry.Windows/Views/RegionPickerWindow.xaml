@@ -1,3 +1,10 @@
+<!-- ⚠️ Window.Background must NOT be "Transparent": on an AllowsTransparency
+     layered window the OS hit-tests per-pixel alpha — alpha=0 pixels are
+     click-through at the OS level, so the undimmed hover/selection hole (not
+     covered by any dim Border) would pass clicks straight to the app below,
+     and WPF's Background hit-testing never sees them. #01 = alpha 1/255:
+     visually imperceptible, but every pixel is OS-opaque and all input
+     reaches the overlay's preview handlers. -->
 <Window x:Class="AirFerry.Windows.Views.RegionPickerWindow"
         x:ClassModifier="internal"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -5,7 +12,7 @@
         Title="AirFerry - 选择捕获区域"
         WindowStyle="None"
         AllowsTransparency="True"
-        Background="Transparent"
+        Background="#01000000"
         Topmost="True"
         ShowInTaskbar="False"
         ShowActivated="True"
