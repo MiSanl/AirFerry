@@ -315,6 +315,7 @@ npm run preview        # 本地预览构建产物
    - `Cargo.toml` `[workspace.package] version`（→ 核心库）
    - `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）
    - `apps/web/package.json` `version`（→ web 包自身版本）
+   - 两个 `package-lock.json`（sender/web）只**手工改自身 `version` 字段两处**（根 + `packages[""]`），**勿用 `npm install --package-lock-only` 重生成**——v1.2.7 曾用它刷新 lock，结果剪掉了 `react@18.3.1` 等依赖条目（-76 行），`pages.yml` 的 `npm ci` 因 lock 与 package.json 不同步直接失败。改完用 `npm ci --ignore-scripts --dry-run` 验证同步
    - Windows CI 不保存版本副本；手动触发时输入已存在的 `release_tag`，workflow 校验 tag commit 与 package/manifest 后派生文件名
 
 ### 2.9 Windows 发版（GitHub Actions workflow）
