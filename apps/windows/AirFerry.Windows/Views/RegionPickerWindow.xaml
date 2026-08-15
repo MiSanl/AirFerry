@@ -42,7 +42,7 @@
                 VerticalAlignment="Top"
                 Margin="0,24,0,0"
                 IsHitTestVisible="False">
-            <TextBlock Text="拖动选择屏幕区域 · 单击选择窗口 · Esc 取消"
+            <TextBlock Text="拖动选择屏幕区域 · 单击选择窗口 · 右键选择整个屏幕 · Esc 取消"
                        Foreground="White"
                        FontSize="14" />
         </Border>

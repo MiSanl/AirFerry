@@ -58,9 +58,9 @@ internal sealed class RegionPickerSession
     }
 
     /// <summary>
-    /// Settle the picker exactly once: resolve the task and close every
-    /// overlay. Closing also lands here via each window's OnClosing, which is
-    /// a no-op once completed.
+    /// Settle the picker exactly once: resolve the task, then close every
+    /// overlay after a short swallow delay. Closing also lands here via each
+    /// window's OnClosing, which is a no-op once completed.
     /// </summary>
     public bool TryComplete(ScanSource? result)
     {
@@ -69,17 +69,32 @@ internal sealed class RegionPickerSession
             return false;
         }
         _ = Completion.TrySetResult(result);
-        foreach (RegionPickerWindow window in _windows.ToArray())
+        // Do NOT close the overlays on the spot: completion happens while
+        // handling the picking mouse-UP, so the second press of an accidental
+        // double-click would fall through to the just-picked app (e.g. select
+        // a word / click a link inside the browser). Keep them shown and
+        // hit-testable for a beat to swallow the trailing click, then close.
+        RegionPickerWindow[] windows = _windows.ToArray();
+        var closer = new System.Windows.Threading.DispatcherTimer
         {
-            try
+            Interval = TimeSpan.FromMilliseconds(300),
+        };
+        closer.Tick += (_, _) =>
+        {
+            closer.Stop();
+            foreach (RegionPickerWindow window in windows)
             {
-                window.Close();
+                try
+                {
+                    window.Close();
+                }
+                catch
+                {
+                    // A half-torn overlay must not block the others.
+                }
             }
-            catch
-            {
-                // A half-torn overlay must not block the others.
-            }
-        }
+        };
+        closer.Start();
         return true;
     }
 

@@ -51,6 +51,15 @@ internal partial class RegionPickerWindow : Window
         PreviewMouseLeftButtonDown += OnDown;
         PreviewMouseMove += OnMove;
         PreviewMouseLeftButtonUp += OnUp;
+        PreviewMouseRightButtonDown += SwallowMouseButton;
+        PreviewMouseRightButtonUp += OnRightUp;
+        PreviewMouseMiddleButtonDown += SwallowMouseButton;
+        PreviewMouseMiddleButtonUp += SwallowMouseButton;
+        PreviewMouseXButton1Down += SwallowMouseButton;
+        PreviewMouseXButton1Up += SwallowMouseButton;
+        PreviewMouseXButton2Down += SwallowMouseButton;
+        PreviewMouseXButton2Up += SwallowMouseButton;
+        PreviewMouseWheel += (_, e) => e.Handled = true;
         PreviewKeyDown += OnKey;
     }
 
@@ -171,6 +180,29 @@ internal partial class RegionPickerWindow : Window
             e.Handled = true;
             _session.TryComplete(null);
         }
+    }
+
+    /// <summary>
+    /// Swallow non-left buttons so they can never leak anywhere (the overlay
+    /// is an input barrier — nothing under it may react to middle/X clicks).
+    /// </summary>
+    private static void SwallowMouseButton(object sender, MouseButtonEventArgs e)
+    {
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Right-click = quick-pick this overlay's ENTIRE monitor as the capture
+    /// region. Fullscreen apps (games, F11 browsers) are awkward to pick by
+    /// click: borderless games minimize on focus steal, exclusive-fullscreen
+    /// windows can't be highlighted/captured at all — a whole-monitor region
+    /// sidesteps every one of those cases.
+    /// </summary>
+    private void OnRightUp(object sender, MouseButtonEventArgs e)
+    {
+        e.Handled = true;
+        _session.TryComplete(new ScreenRegionSource(
+            _monitor.Left, _monitor.Top, _monitor.Width, _monitor.Height));
     }
 
     /// <summary>

@@ -81,7 +81,7 @@
 
 ### Windows 接收端
 
-解压 `airferry-receiver-windows-x64-v1.2.3.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注）；也可点「🖥 屏幕捕获」用截图式选择器把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
+解压 `airferry-receiver-windows-x64-v1.2.3.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在设备选择页挑选摄像头或采集卡（USB/HDMI/SDI 采集卡会被自动标注）；也可点「🖥 屏幕捕获」用截图式选择器把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 
