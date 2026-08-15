@@ -37,6 +37,8 @@
     <Compile Include="..\AirFerry.Windows\Bundle\TextParser.cs" Link="Bundle\TextParser.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\FileNameUtil.cs" Link="Bundle\FileNameUtil.cs" />
     <Compile Include="..\AirFerry.Windows\Bundle\ShareExport.cs" Link="Bundle\ShareExport.cs" />
+    <Compile Include="..\AirFerry.Windows\Bundle\ContinuousSave.cs" Link="Bundle\ContinuousSave.cs" />
+    <Compile Include="..\AirFerry.Windows\Services\AppSettings.cs" Link="Services\AppSettings.cs" />
     <Compile Include="..\AirFerry.Windows\Native\NativeBridge.cs" Link="Native\NativeBridge.cs" />
     <Compile Include="..\AirFerry.Windows\Native\NativeZxingBridge.cs" Link="Native\NativeZxingBridge.cs" />
   </ItemGroup>

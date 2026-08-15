@@ -24,6 +24,7 @@ public static class AppSettings
     private static bool _loaded;
     private static int _redundancy = DefaultRedundancy;
     private static string _theme = ThemeSystem;
+    private static string _continuousDir = "";
 
     public static int Redundancy
     {
@@ -33,6 +34,12 @@ public static class AppSettings
     public static string Theme
     {
         get { EnsureLoaded(); return _theme; }
+    }
+
+    /// <summary>Last folder used by continuous receive ("" = never set).</summary>
+    public static string ContinuousSaveDir
+    {
+        get { EnsureLoaded(); return _continuousDir; }
     }
 
     public static void SetRedundancy(int value)
@@ -47,6 +54,44 @@ public static class AppSettings
         EnsureLoaded();
         _theme = NormalizeTheme(value);
         Save();
+    }
+
+    public static void SetContinuousSaveDir(string? value)
+    {
+        EnsureLoaded();
+        _continuousDir = value?.Trim() ?? "";
+        Save();
+    }
+
+    /// <summary>
+    /// Escape a value for the hand-rolled JSON string literal. Windows paths
+    /// contain backslashes and may contain quotes — both must be escaped or
+    /// the settings file becomes unparseable garbage.
+    /// </summary>
+    public static string EscapeJsonString(string value) =>
+        value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+    /// <summary>Inverse of <see cref="EscapeJsonString"/>.</summary>
+    public static string UnescapeJsonString(string value)
+    {
+        if (!value.Contains('\\'))
+        {
+            return value;
+        }
+        var sb = new System.Text.StringBuilder(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '\\' && i + 1 < value.Length)
+            {
+                sb.Append(value[i + 1]);
+                i++;
+            }
+            else
+            {
+                sb.Append(value[i]);
+            }
+        }
+        return sb.ToString();
     }
 
     private static string NormalizeTheme(string? value) =>
@@ -69,6 +114,7 @@ public static class AppSettings
             // Minimal hand-rolled parse — deliberately no System.Text.Json here.
             _redundancy = Math.Clamp(ParseInt(json, "default_redundancy", DefaultRedundancy), 5, 50);
             _theme = NormalizeTheme(ParseString(json, "theme"));
+            _continuousDir = ParseString(json, "continuous_dir") ?? "";
         }
         catch { /* fall through to defaults */ }
     }
@@ -110,8 +156,26 @@ public static class AppSettings
         {
             return null;
         }
-        int end = json.IndexOf('"', start + 1);
-        return end < 0 ? null : json.Substring(start + 1, end - start - 1);
+        // Scan to the closing quote, honouring \" and \\ escapes.
+        var sb = new System.Text.StringBuilder();
+        int i = start + 1;
+        while (i < json.Length)
+        {
+            char c = json[i];
+            if (c == '\\' && i + 1 < json.Length)
+            {
+                sb.Append(json[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (c == '"')
+            {
+                return sb.ToString();
+            }
+            sb.Append(c);
+            i++;
+        }
+        return null;
     }
 
     private static void Save()
@@ -124,7 +188,8 @@ public static class AppSettings
                 Directory.CreateDirectory(dir);
             }
             File.WriteAllText(SettingsPath,
-                $"{{\"default_redundancy\":{_redundancy},\"theme\":\"{_theme}\"}}");
+                $"{{\"default_redundancy\":{_redundancy},\"theme\":\"{_theme}\"," +
+                $"\"continuous_dir\":\"{EscapeJsonString(_continuousDir)}\"}}");
         }
         catch { /* settings are best-effort; never block the UI */ }
     }

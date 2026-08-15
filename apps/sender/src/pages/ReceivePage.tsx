@@ -1,16 +1,17 @@
 /**
- * Web receiver page — scan the sender's QR video stream with the camera and
- * recover the file/text/bundle.
+ * Web receiver page — scan the sender's QR video stream and recover the
+ * file/text/bundle.
  *
  * Pipeline (all off-main-thread where possible):
- *   camera (getUserMedia) → video element
+ *   camera (getUserMedia) or screen/tab capture (getDisplayMedia) → video element
  *     → requestVideoFrameCallback captures a frame
- *       → qr-decode.worker (zxing-wasm compat) decodes all QR payloads
+ *       → qr-decode.worker (fast ZXing-C++ WASM or zxing-wasm compat) decodes all QR payloads
  *         → receive.worker ingests them (serial; Rust receiver not thread-safe)
  *           → on complete: assemble_raw → JS decompress → CRC → parse
  *
- * M2 uses the zxing-wasm compat path (full-frame RGBA decode, no manual ROI
- * tracker). The ROI tracker + self-compiled ZXing-C++ fast path land in M3.
+ * The entry screen shows a source selector (camera / screen capture). The
+ * screen option is hidden where getDisplayMedia is unavailable (mobile
+ * browsers), leaving the camera-only UI exactly as before.
  */
 
 import { useState, useCallback, useRef, useEffect } from "react"
@@ -29,6 +30,9 @@ import {
 } from "@/receive/taskStore"
 
 type Stage = "camera" | "scanning" | "recovering" | "done" | "error"
+
+/** Scan source chosen on the entry screen: camera or screen/tab capture. */
+type ScanSourceKind = "camera" | "display"
 
 /** Mirrors Android ScanActivity's UI state — the shared receiver UX. */
 interface ProgressInfo {
@@ -459,6 +463,14 @@ export function ReceivePage(): React.ReactElement {
   // End-to-end capture fps (how often captureLoop runs) — shown in the corner to
   // diagnose whether the 120 codes/s ceiling is camera fps (30) vs decode speed.
   const [captureFps, setCaptureFps] = useState<number>(0)
+  // Scan source selection on the entry screen. displaySupported is detected
+  // once: mobile browsers have no getDisplayMedia, so the option hides there.
+  const [source, setSource] = useState<ScanSourceKind>("camera")
+  const [displaySupported] = useState<boolean>(() =>
+    typeof navigator !== "undefined" &&
+    !!navigator.mediaDevices &&
+    typeof navigator.mediaDevices.getDisplayMedia === "function"
+  )
 
   // Sliding-window rate samples + transfer timer (mirror Android refs).
   const rateSamplesRef = useRef<RateSample[]>([])
@@ -518,6 +530,12 @@ export function ReceivePage(): React.ReactElement {
     stageRef.current = stage
   }, [stage])
 
+  // Mirror the source choice for async callbacks (start button etc.).
+  const sourceRef = useRef<ScanSourceKind>("camera")
+  useEffect(() => {
+    sourceRef.current = source
+  }, [source])
+
   // Throttle capture-fps updates to the UI (every 500ms) while scanning.
   useEffect(() => {
     const id = setInterval(() => {
@@ -555,6 +573,15 @@ export function ReceivePage(): React.ReactElement {
     }
   }, [teardown])
 
+  /** Attach a stream to the shared video element. */
+  const attachStream = useCallback((stream: MediaStream) => {
+    streamRef.current = stream
+    const video = videoRef.current
+    if (video) {
+      video.srcObject = stream
+    }
+  }, [])
+
   /** Start the camera stream and attach it to the video element. */
   const startCamera = useCallback(async (): Promise<boolean> => {
     setStage("camera")
@@ -587,12 +614,8 @@ export function ReceivePage(): React.ReactElement {
         }
       }
       if (!stream) throw lastError ?? new Error("没有可用摄像头")
-      streamRef.current = stream
-      const video = videoRef.current
-      if (video) {
-        video.srcObject = stream
-        await video.play()
-      }
+      attachStream(stream)
+      await videoRef.current?.play()
       return true
     } catch (e) {
       setError(
@@ -602,7 +625,60 @@ export function ReceivePage(): React.ReactElement {
       setStage("error")
       return false
     }
-  }, [])
+  }, [attachStream])
+
+  /**
+   * Start screen/tab/window capture (desktop browsers). The browser picker
+   * must be triggered from a user gesture — the 开始接收 click qualifies.
+   * Only the frame rate is pinned; the resolution follows the captured
+   * surface's native size (desktop surfaces are ≥1080p, plenty for QR).
+   * Cancelling the picker stays on the entry screen (not an error).
+   */
+  const startDisplay = useCallback(async (): Promise<boolean> => {
+    setStage("camera")
+    stageRef.current = "camera"
+    setError(null)
+    for (const track of streamRef.current?.getTracks() ?? []) track.stop()
+    streamRef.current = null
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 60, max: 60 } },
+        audio: false,
+      })
+      attachStream(stream)
+      await videoRef.current?.play()
+      // The browser's own "stop sharing" bar ends the track without throwing;
+      // watch for it and drop back to the source-select screen. Later stages
+      // (recovering/done) no longer depend on the stream, so ignore it there.
+      const track = stream.getVideoTracks()[0]
+      if (track) {
+        track.onended = () => {
+          if (stageRef.current === "scanning" || stageRef.current === "camera") {
+            teardown()
+            setStage("camera")
+            stageRef.current = "camera"
+          }
+        }
+      }
+      return true
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "NotAllowedError") {
+        // User dismissed the picker — quietly stay on the entry screen.
+        return false
+      }
+      setError(
+        `无法开始屏幕捕获：${e instanceof Error ? e.message : String(e)}。请使用支持屏幕共享的桌面浏览器（HTTPS 或 localhost）。`
+      )
+      stageRef.current = "error"
+      setStage("error")
+      return false
+    }
+  }, [attachStream, teardown])
+
+  /** Start whichever source the user picked on the entry screen. */
+  const startSelectedSource = useCallback(async (): Promise<boolean> => {
+    return sourceRef.current === "display" ? startDisplay() : startCamera()
+  }, [startDisplay, startCamera])
 
   /**
    * Merge a worker `status` message into the UI progress state. Computes the
@@ -1218,7 +1294,7 @@ export function ReceivePage(): React.ReactElement {
 
   const continueStoredTask = useCallback(async (task: StoredSegmentTask) => {
     targetRootRef.current = task.rootId
-    if (await startCamera()) {
+    if (await startSelectedSource()) {
       const started = await startScanning()
       if (started) {
         setProgress((p) => ({
@@ -1229,7 +1305,7 @@ export function ReceivePage(): React.ReactElement {
         }))
       }
     }
-  }, [startCamera, startScanning])
+  }, [startSelectedSource, startScanning])
 
   const removeStoredTask = useCallback(async (task: StoredSegmentTask) => {
     if (!window.confirm(`删除「${task.fileName}」的恢复记录和已收分段？`)) return
@@ -1271,14 +1347,40 @@ export function ReceivePage(): React.ReactElement {
         <div className="receive-stage">
           {(stage === "camera" || stage === "scanning" || stage === "recovering") && (
             <div className="camera-area">
+              {/* Display capture previews with contain: cover would crop QR
+                  codes living at the screen edges (frames are extracted at
+                  native videoWidth/Height via canvas, so CSS never affects
+                  decoding — this is preview-only). */}
               <video
                 ref={videoRef}
                 autoPlay
                 playsInline
                 muted
-                className="camera-video"
+                className={`camera-video${source === "display" ? " contain" : ""}`}
               />
               <canvas ref={canvasRef} style={{ display: "none" }} />
+              {stage === "camera" && (
+                <div className="source-select">
+                  <button
+                    type="button"
+                    className={`source-option${source === "camera" ? " selected" : ""}`}
+                    onClick={() => setSource("camera")}
+                  >
+                    <span className="source-option-title">摄像头</span>
+                    <span className="source-option-desc">用手机或电脑摄像头对准屏幕上的二维码</span>
+                  </button>
+                  {displaySupported && (
+                    <button
+                      type="button"
+                      className={`source-option${source === "display" ? " selected" : ""}`}
+                      onClick={() => setSource("display")}
+                    >
+                      <span className="source-option-title">屏幕捕获</span>
+                      <span className="source-option-desc">直接捕获本机的屏幕 / 标签页 / 窗口（桌面浏览器）</span>
+                    </button>
+                  )}
+                </div>
+              )}
               {stage === "scanning" && (
                 <div className="fps-badge">{captureFps} fps</div>
               )}
@@ -1290,9 +1392,9 @@ export function ReceivePage(): React.ReactElement {
               <button
                 onClick={async () => {
                   targetRootRef.current = null
-                  if (await startCamera()) await startScanning()
+                  if (await startSelectedSource()) await startScanning()
                 }}
-                className="btn btn-primary"
+                className="btn primary"
               >
                 开始接收
               </button>
@@ -1314,7 +1416,7 @@ export function ReceivePage(): React.ReactElement {
           {stage === "error" && (
             <div className="error-area">
               <p className="error-msg">❌ {error}</p>
-              <button onClick={reset} className="btn btn-primary">
+              <button onClick={reset} className="btn primary">
                 重试
               </button>
             </div>
@@ -1364,12 +1466,12 @@ function StoredResultView({
       <p className="crc-status">✔️ 每段 CRC/SHA-256 均已校验，并已保存到本机恢复历史</p>
       <div className="file-result">
         <p>📄 {task.fileName}（{formatSize(task.rootOriginalSize)}）</p>
-        <button onClick={() => void save()} disabled={saving} className="btn btn-primary">
+        <button onClick={() => void save()} disabled={saving} className="btn primary">
           {saving ? "正在写入…" : "保存文件"}
         </button>
       </div>
       {saveError && <p className="error-msg">保存失败：{saveError}</p>}
-      <button onClick={onReset} className="btn btn-primary">
+      <button onClick={onReset} className="btn primary">
         再接收一次
       </button>
     </div>
@@ -1440,7 +1542,7 @@ function TaskHistory({
               <div className="task-actions">
                 {complete ? (
                   <button
-                    className="btn btn-primary"
+                    className="btn primary"
                     disabled={working}
                     onClick={() => void run(task, () => onDownload(task))}
                   >
@@ -1448,7 +1550,7 @@ function TaskHistory({
                   </button>
                 ) : (
                   <button
-                    className="btn btn-primary"
+                    className="btn primary"
                     disabled={busy || working}
                     onClick={() => void run(task, () => onContinue(task))}
                   >
@@ -1602,7 +1704,7 @@ function ResultView({
       {recovered.kind === "bundle" && (
         <BundleView entries={recovered.entries} />
       )}
-      <button onClick={onReset} className="btn btn-primary">
+      <button onClick={onReset} className="btn primary">
         再接收一次
       </button>
     </div>
@@ -1676,7 +1778,7 @@ function FileView({
       <p>
         📄 {name}（{sizeKiB} KiB）
       </p>
-      <button onClick={onDownload} className="btn btn-primary">
+      <button onClick={onDownload} className="btn primary">
         下载
       </button>
     </div>
@@ -1730,7 +1832,7 @@ function BundleView({
           )
         })}
       </ul>
-      <button onClick={onDownloadAll} className="btn btn-primary">
+      <button onClick={onDownloadAll} className="btn primary">
         全部下载
       </button>
     </div>

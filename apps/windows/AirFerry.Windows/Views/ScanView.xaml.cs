@@ -28,6 +28,7 @@ public partial class ScanView : Page
     private int _previewRenderScheduled;
     private int _activationEpoch;
     private volatile bool _pageActive;
+    private bool _suppressToggleEvents;
 
     public ScanView(ScanSource source, string? resumeRootId = null)
     {
@@ -36,6 +37,8 @@ public partial class ScanView : Page
         _vm = new ScanViewModel(resumeRootId);
         _vm.TransferCompleted += OnTransferCompleted;
         _vm.PreviewFrameReady += OnPreviewFrameReady;
+        ContinuousList.ItemsSource = _vm.ContinuousItems;
+        UpdateContinuousUi();
 
         // Progress poll at 7 Hz (same as Android's ~7Hz UI refresh). Also syncs
         // the VM's observable fields into the WPF text controls each tick.
@@ -52,6 +55,17 @@ public partial class ScanView : Page
                 else
                 {
                     RecoveryStageText.Visibility = Visibility.Collapsed;
+                }
+                // Continuous-mode counters change outside toggle events —
+                // refresh the summary line on the same 7 Hz cadence.
+                if (!string.IsNullOrEmpty(_vm.ContinuousSummaryText))
+                {
+                    ContinuousSummaryText.Text = _vm.ContinuousSummaryText;
+                    ContinuousSummaryText.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    ContinuousSummaryText.Visibility = Visibility.Collapsed;
                 }
             }, Dispatcher)
         {
@@ -319,6 +333,99 @@ public partial class ScanView : Page
     private void FileList_Click(object sender, RoutedEventArgs e)
     {
         NavigationService?.Navigate(new FileListView());
+    }
+
+    private void ContinuousToggle_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_suppressToggleEvents)
+        {
+            return;
+        }
+        string? dir = PickContinuousFolder();
+        if (dir is null)
+        {
+            // Cancelled the folder picker — revert the toggle without
+            // re-entering this handler.
+            _suppressToggleEvents = true;
+            ContinuousToggle.IsChecked = false;
+            _suppressToggleEvents = false;
+            return;
+        }
+        Services.AppSettings.SetContinuousSaveDir(dir);
+        _vm.SetContinuousDir(dir);
+        UpdateContinuousUi();
+    }
+
+    private void ContinuousToggle_Unchecked(object sender, RoutedEventArgs e)
+    {
+        if (_suppressToggleEvents)
+        {
+            return;
+        }
+        _vm.DisableContinuous();
+        UpdateContinuousUi();
+    }
+
+    private void ContinuousChange_Click(object sender, RoutedEventArgs e)
+    {
+        string? dir = PickContinuousFolder();
+        if (dir is null)
+        {
+            return;
+        }
+        Services.AppSettings.SetContinuousSaveDir(dir);
+        _vm.SetContinuousDir(dir);
+        UpdateContinuousUi();
+    }
+
+    private string? PickContinuousFolder()
+    {
+        var dlg = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "选择持续接收的保存文件夹",
+        };
+        string? last = Services.AppSettings.ContinuousSaveDir;
+        if (!string.IsNullOrEmpty(last) && System.IO.Directory.Exists(last))
+        {
+            dlg.InitialDirectory = last;
+        }
+        return dlg.ShowDialog() == true ? dlg.FolderName : null;
+    }
+
+    private void ContinuousOpen_Click(object sender, RoutedEventArgs e)
+    {
+        string dir = _vm.ContinuousSaveDir;
+        if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir))
+        {
+            return;
+        }
+        try
+        {
+            System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo("explorer.exe")
+                {
+                    Arguments = dir,
+                    UseShellExecute = true,
+                });
+        }
+        catch
+        {
+            // Opening Explorer is cosmetic; never break the scan loop.
+        }
+    }
+
+    private void UpdateContinuousUi()
+    {
+        bool on = _vm.ContinuousMode;
+        string dir = _vm.ContinuousSaveDir;
+        ContinuousDirText.Text = on && dir.Length > 0 ? $"保存至 {dir}" : string.Empty;
+        ContinuousDirText.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        ContinuousChangeButton.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        ContinuousOpenButton.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        bool hasFeed = _vm.ContinuousItems.Count > 0;
+        ContinuousSummaryText.Text = _vm.ContinuousSummaryText;
+        ContinuousSummaryText.Visibility = on || hasFeed ? Visibility.Visible : Visibility.Collapsed;
+        ContinuousListScroll.Visibility = on || hasFeed ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private Task StopPipelineAsync()

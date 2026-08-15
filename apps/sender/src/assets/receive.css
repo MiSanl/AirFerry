@@ -67,6 +67,61 @@
   display: block;
   object-fit: cover;
 }
+/* 屏幕捕获预览用 contain：cover 会把画面边缘（可能正是二维码所在）裁掉。
+   取帧走 canvas 的 videoWidth/Height 原生分辨率，object-fit 只影响预览不影响解码。 */
+.camera-video.contain {
+  object-fit: contain;
+}
+
+/* ───────────── 扫码来源选择 ───────────── */
+/* 待开始（camera 阶段）在黑色画面区上覆盖来源选择卡；
+   getDisplayMedia 不可用（手机浏览器）时屏幕捕获选项不渲染，观感与旧版一致。 */
+.source-select {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px;
+  background: var(--color-bg);
+}
+.source-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 14px 16px;
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  font: inherit;
+}
+.source-option:hover {
+  border-color: var(--color-border-strong);
+}
+.source-option.selected {
+  border-color: var(--color-primary);
+  background: var(--color-primary-light);
+  box-shadow: 0 0 0 3px var(--color-primary-ring);
+}
+.source-option-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.source-option.selected .source-option-title {
+  color: var(--color-primary);
+}
+.source-option-desc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
 
 /* 扫描中 fps 角标（正常帧率用成功绿；配 token） */
 .fps-badge {

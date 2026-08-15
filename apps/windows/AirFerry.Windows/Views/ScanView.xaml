@@ -9,6 +9,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- Top bar: back + title + history. -->
@@ -58,8 +59,90 @@
             </Border>
         </Grid>
 
-        <!-- Status card at the bottom. -->
+        <!-- Continuous receive: keep scanning, save every transfer to one folder. -->
         <ui:Card Grid.Row="2" Margin="0,12,0,0">
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <CheckBox Grid.Column="0"
+                              x:Name="ContinuousToggle"
+                              Content="持续接收"
+                              Checked="ContinuousToggle_Checked"
+                              Unchecked="ContinuousToggle_Unchecked"
+                              VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="1"
+                               x:Name="ContinuousDirText"
+                               Text=""
+                               FontSize="12"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center"
+                               Margin="12,0,12,0"
+                               Visibility="Collapsed" />
+                    <ui:Button Grid.Column="2"
+                               x:Name="ContinuousChangeButton"
+                               Appearance="Secondary"
+                               Content="更改"
+                               Click="ContinuousChange_Click"
+                               Visibility="Collapsed"
+                               VerticalAlignment="Center">
+                        <ui:Button.Icon>
+                            <ui:SymbolIcon Symbol="Folder24" />
+                        </ui:Button.Icon>
+                    </ui:Button>
+                    <ui:Button Grid.Column="3"
+                               x:Name="ContinuousOpenButton"
+                               Appearance="Secondary"
+                               Content="打开文件夹"
+                               Click="ContinuousOpen_Click"
+                               Visibility="Collapsed"
+                               Margin="8,0,0,0"
+                               VerticalAlignment="Center">
+                        <ui:Button.Icon>
+                            <ui:SymbolIcon Symbol="FolderOpen24" />
+                        </ui:Button.Icon>
+                    </ui:Button>
+                </Grid>
+                <TextBlock Grid.Row="1"
+                           x:Name="ContinuousSummaryText"
+                           Text=""
+                           FontSize="12"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                           Margin="0,6,0,0"
+                           Visibility="Collapsed" />
+                <ScrollViewer Grid.Row="2"
+                              x:Name="ContinuousListScroll"
+                              MaxHeight="110"
+                              Margin="0,8,0,0"
+                              VerticalScrollBarVisibility="Auto"
+                              Visibility="Collapsed">
+                    <ItemsControl x:Name="ContinuousList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Line}"
+                                           FontSize="12"
+                                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                           TextTrimming="CharacterEllipsis"
+                                           Margin="0,0,0,4" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+        </ui:Card>
+
+        <!-- Status card at the bottom. -->
+        <ui:Card Grid.Row="3" Margin="0,12,0,0">
             <Grid Margin="20">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />

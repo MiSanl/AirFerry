@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -46,7 +47,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private int _recoveryStarted;
     private int _sessionEpoch;
     private readonly object _lifecycleGate = new();
-    private Task<RecoveryResult?>? _recoveryCoreTask;
+    private Task<RecoveryOutcome>? _recoveryCoreTask;
     private Task _deferredCleanupTask = Task.CompletedTask;
     private readonly Queue<RateSample> _rateSamples = new();
     private long _transferStartTimestamp;
@@ -58,6 +59,8 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     private string? _resumeRootId;
     /// <summary>Disk-backed assembler for a descriptor-v5 large transfer (null = none).</summary>
     private AirFerry.Windows.Bundle.SegmentAssembler? _segAssembler;
+    /// <summary>Continuous-receive folder sink (null = single-receive mode).</summary>
+    private AirFerry.Windows.Bundle.ContinuousSaver? _continuousSaver;
 
     private sealed record AssembledPayload(
         byte[] Bytes,
@@ -133,6 +136,72 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// second. Subscribers must marshal rendering to their UI dispatcher.
     /// </summary>
     public event Action<PreviewFrame>? PreviewFrameReady;
+
+    /// <summary>One entry in the continuous-receive feed (newest first).</summary>
+    public enum ContinuousItemStatus { Saved, Skipped, Failed }
+
+    public sealed record ContinuousReceivedItem(
+        string TimeText,
+        string Name,
+        string SizeText,
+        ContinuousItemStatus Status,
+        string? Error = null)
+    {
+        /// <summary>Preformatted feed line for the ItemsControl template.</summary>
+        public string Line => Status switch
+        {
+            ContinuousItemStatus.Skipped => $"{TimeText}  {Name} · 重复，已跳过",
+            ContinuousItemStatus.Failed => $"{TimeText}  {Name} · 保存失败: {Error}",
+            _ => $"{TimeText}  {Name} · {SizeText}",
+        };
+    }
+
+    /// <summary>
+    /// Continuous mode: on completion do not navigate — save into the chosen
+    /// folder, re-arm a fresh receiver and keep scanning for the next file.
+    /// </summary>
+    public bool ContinuousMode { get; private set; }
+
+    public string ContinuousSaveDir => _continuousSaver?.TargetDir ?? string.Empty;
+
+    public int ContinuousSavedCount { get; private set; }
+
+    public int ContinuousSkippedCount { get; private set; }
+
+    /// <summary>Most-recent-first feed of continuous saves (dispatcher thread only).</summary>
+    public ObservableCollection<ContinuousReceivedItem> ContinuousItems { get; } = [];
+
+    public string ContinuousSummaryText =>
+        ContinuousMode || ContinuousSavedCount > 0 || ContinuousSkippedCount > 0
+            ? $"已保存 {ContinuousSavedCount} 份 · 跳过 {ContinuousSkippedCount} 份重复"
+            : string.Empty;
+
+    /// <summary>
+    /// Point continuous mode at a folder and enable it. Re-enabling with the
+    /// same folder keeps the dedup set (a toggled-off period does not forget
+    /// what was already saved); a different folder starts fresh.
+    /// </summary>
+    public void SetContinuousDir(string dir)
+    {
+        bool sameDir = _continuousSaver is not null && string.Equals(
+            _continuousSaver.TargetDir, dir, StringComparison.OrdinalIgnoreCase);
+        if (!sameDir)
+        {
+            _continuousSaver = new AirFerry.Windows.Bundle.ContinuousSaver(dir);
+            ContinuousSavedCount = 0;
+            ContinuousSkippedCount = 0;
+            ContinuousItems.Clear();
+        }
+        ContinuousMode = true;
+    }
+
+    public void DisableContinuous()
+    {
+        // Keep the saver instance: toggling back on with the same folder
+        // continues to dedup against earlier saves.
+        ContinuousMode = false;
+    }
+
 
     /// <summary>Legacy archive directory, retained only for one-time migration.</summary>
     public static string ReceivedDir =>
@@ -229,7 +298,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         QrDecodePool? pool;
         IFrameSource? capture;
         ReceiverSession? session;
-        Task<RecoveryResult?>? recoveryTask;
+        Task<RecoveryOutcome>? recoveryTask;
         Task cleanup;
         lock (_lifecycleGate)
         {
@@ -324,7 +393,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         QrDecodePool? pool,
         IFrameSource? capture,
         ReceiverSession? session,
-        Task<RecoveryResult?>? recoveryTask)
+        Task<RecoveryOutcome>? recoveryTask)
     {
         // Producer owns ReadGray/SnapshotBgr. It must exit before capture.Dispose.
         if (producer?.IsAlive == true) producer.Join();
@@ -519,7 +588,13 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                         return;
                     }
                     IsComplete = true;
-                    _ = RecoverAndStageAsync(session, pool, epoch);
+                    // Snapshot BOTH the mode and the saver instance at
+                    // completion-detection time: an in-flight transfer keeps
+                    // the folder that was active when it completed — changing
+                    // the folder mid-recovery only affects the next transfer.
+                    AirFerry.Windows.Bundle.ContinuousSaver? saver =
+                        ContinuousMode ? _continuousSaver : null;
+                    _ = RecoverAndStageAsync(session, pool, epoch, saver);
                 });
             }
             return true;
@@ -532,9 +607,10 @@ public partial class ScanViewModel : ObservableObject, IDisposable
     /// <c>recoverAndStage</c> step by step.
     /// </summary>
     private async Task RecoverAndStageAsync(
-        ReceiverSession session, QrDecodePool pool, int epoch)
+        ReceiverSession session, QrDecodePool pool, int epoch,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
-        Task<RecoveryResult?> coreTask;
+        Task<RecoveryOutcome> coreTask;
         lock (_lifecycleGate)
         {
             if (epoch != Volatile.Read(ref _sessionEpoch) ||
@@ -543,16 +619,16 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             {
                 return;
             }
-            coreTask = Task.Run(() => RecoverAndStageCore(session, pool));
+            coreTask = Task.Run(() => RecoverAndStageCore(session, pool, saver));
             _recoveryCoreTask = coreTask;
         }
         IsRecovering = true;
         RecoveryStageText = "正在组装数据…";
 
-        RecoveryResult? result;
+        RecoveryOutcome outcome;
         try
         {
-            result = await coreTask;
+            outcome = await coreTask;
         }
         catch (Exception ex)
         {
@@ -586,7 +662,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
 
         IsRecovering = false;
         RecoveryStageText = string.Empty;
-        if (result is null)
+        if (outcome.Result is null && outcome.ContinuousReport is null)
         {
             // A large-transfer segment was stored but the transfer is not yet
             // complete — keep scanning for the remaining segments.
@@ -604,11 +680,21 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                 : $"等待任务 {_resumeRootId[..8]}… 的分段，其他文件已忽略";
             return;
         }
+        if (saver is not null && outcome.ContinuousReport is not null)
+        {
+            // Continuous mode: record the folder save, re-arm a fresh receiver
+            // and keep scanning — no navigation, no teardown.
+            RecordContinuousOutcome(saver, outcome.ContinuousReport);
+            ContinueNextTransfer(session, pool, epoch);
+            return;
+        }
         StatusText = "接收完成";
-        TransferCompleted?.Invoke(result);
+        TransferCompleted?.Invoke(outcome.Result!);
     }
 
-    private RecoveryResult? RecoverAndStageCore(ReceiverSession session, QrDecodePool pool)
+    private RecoveryOutcome RecoverAndStageCore(
+        ReceiverSession session, QrDecodePool pool,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
         pool.IngestStopped = true;
 
@@ -616,12 +702,12 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // assembler and return once every segment has arrived.
         if (pool.RunExclusive(() => session.IsSegmented()))
         {
-            return HandleSegmentedTransfer(session, pool);
+            return HandleSegmentedTransfer(session, pool, saver);
         }
         if (_resumeRootId is not null)
         {
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
         // Take one coherent native snapshot under the ingest lock. No metadata
@@ -641,26 +727,58 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (payload is null)
         {
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
-        byte[] bytes = payload.Bytes;
-        ulong expectedCrc = payload.ExpectedCrc;
-        bool crcKnown = payload.CrcKnown;
-        ulong receivedCrc = Crc32.Compute(bytes);
-        string displayName = payload.DisplayName;
-        ulong originalSize = payload.OriginalSize;
+        ulong receivedCrc = Crc32.Compute(payload.Bytes);
+        ClassifiedPayload classified = ClassifyRecovered(
+            payload.Bytes, payload.DisplayName, payload.OriginalSize);
+        if (saver is not null)
+        {
+            return RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified));
+        }
+        return RecoveryOutcome.Single(StageClassified(
+            classified, payload.ExpectedCrc, payload.CrcKnown, receivedCrc));
+    }
 
-        RecoveryResult? result;
+    private enum RecoveredKind { EtText, Bundle, TextLikeFile, SingleFile }
+
+    private sealed record ClassifiedPayload(
+        RecoveredKind Kind,
+        string DisplayName,
+        ulong OriginalSize,
+        byte[] Bytes,
+        string? Text,
+        IReadOnlyList<BundleFile>? BundleFiles);
+
+    /// <summary>Recovery pipeline outcome: a staged store result, or a
+    /// continuous-folder save report, or neither (a segment was stored — keep
+    /// scanning for the rest of the transfer).</summary>
+    private sealed record RecoveryOutcome(RecoveryResult? Result, ContinuousSaveReport? ContinuousReport)
+    {
+        public static RecoveryOutcome None() => new(null, null);
+        public static RecoveryOutcome Single(RecoveryResult result) => new(result, null);
+        public static RecoveryOutcome Continuous(ContinuousSaveReport report) => new(null, report);
+    }
+
+    /// <summary>
+    /// Classify assembled bytes into one of the four recovery shapes. Shared
+    /// by the plain and segmented paths so the two cascades cannot drift; the
+    /// mutating steps (ETTEXT magic strip, .txt name normalization) are
+    /// applied here, once.
+    /// </summary>
+    private static ClassifiedPayload ClassifyRecovered(
+        byte[] bytes, string displayName, ulong originalSize)
+    {
         if (TextParser.IsText(bytes))
         {
             // ETTEXTv1 payloads start with the 8-byte wire magic. Strip it up
-            // front so EVERY downstream path — the text UI and the
-            // oversized→file fallback alike — sees the message text, never the
-            // protocol header (the fallback used to stage a file that
-            // literally began with the "ETTEXTv1" bytes). Checked BEFORE the
-            // bundle branch: the two magics never collide ("ETTEXTv1" vs
-            // "ETBUNDL1").
+            // front so EVERY downstream path — the text UI, the continuous
+            // folder save and the oversized→file fallback alike — sees the
+            // message text, never the protocol header (the fallback used to
+            // stage a file that literally began with the "ETTEXTv1" bytes).
+            // Checked BEFORE the bundle branch: the two magics never collide
+            // ("ETTEXTv1" vs "ETBUNDL1").
             bytes = bytes[TextParser.Magic.Length..];
             originalSize = (ulong)bytes.LongLength;
             if (string.IsNullOrEmpty(displayName) || !displayName.Contains('.'))
@@ -669,52 +787,108 @@ public partial class ScanViewModel : ObservableObject, IDisposable
                     ? "文字消息.txt"
                     : displayName + ".txt";
             }
-            // Text UI when it fits the cap; oversized text → ordinary .txt
-            // file. DecodeUtf8Strict is null on invalid UTF-8 (→ file too).
-            string? text = FileNameUtil.DecodeUtf8Strict(bytes);
-            result = text is not null
-                ? StageEtText(text, displayName, expectedCrc, crcKnown, receivedCrc)
-                : StageSingleFile(bytes, displayName, originalSize,
-                    expectedCrc, crcKnown, receivedCrc);
+            // Text UI when it fits the cap; oversized or invalid-UTF-8 text →
+            // an ordinary .txt file.
+            return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
+                ? new ClassifiedPayload(RecoveredKind.EtText, displayName, originalSize, bytes, text, null)
+                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
         }
-        else if (BundleParser.IsBundle(bytes))
+        if (BundleParser.IsBundle(bytes))
         {
-            result = StageBundle(bytes, expectedCrc, crcKnown, receivedCrc);
-            // If parsing failed, fall through to single-file handling.
-            result ??= StageSingleFile(bytes, displayName, originalSize,
-                expectedCrc, crcKnown, receivedCrc);
+            AirFerry.Windows.Bundle.Bundle? bundle = BundleParser.Parse(bytes);
+            // Parse failure falls through to single-file handling with the
+            // container bytes (same fallback the bundle branch always had).
+            return bundle is not null && bundle.Files.Count > 0
+                ? new ClassifiedPayload(RecoveredKind.Bundle, displayName, originalSize, bytes, null, bundle.Files)
+                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
         }
-        else if (FileNameUtil.IsTextLikeName(
-                     string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
-                 && FileNameUtil.FitsTextUi(bytes.LongLength))
+        if (FileNameUtil.IsTextLikeName(
+                string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
+            && FileNameUtil.FitsTextUi(bytes.LongLength))
         {
-            // Single text-like document (readme.md, notes.json, …): open the
-            // copy/share UI only when the payload is valid UTF-8 and small enough
-            // for the in-memory text view. Still stage a temp file so save-as
-            // can use the original name.
-            string? text = FileNameUtil.DecodeUtf8Strict(bytes);
-            result = text is not null
-                ? StageTextLikeFile(bytes, displayName, originalSize,
-                    expectedCrc, crcKnown, receivedCrc, text)
-                : StageSingleFile(bytes, displayName, originalSize,
-                    expectedCrc, crcKnown, receivedCrc);
+            // Single text-like document (readme.md, notes.json, …): the
+            // copy/share UI only when the payload is valid UTF-8 and small
+            // enough; otherwise an ordinary file.
+            return FileNameUtil.DecodeUtf8Strict(bytes) is { } text
+                ? new ClassifiedPayload(RecoveredKind.TextLikeFile, displayName, originalSize, bytes, text, null)
+                : new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
         }
-        else
-        {
-            result = StageSingleFile(bytes, displayName, originalSize,
-                expectedCrc, crcKnown, receivedCrc);
-        }
+        return new ClassifiedPayload(RecoveredKind.SingleFile, displayName, originalSize, bytes, null, null);
+    }
 
-        return result;
+    /// <summary>Stage a classified payload into the ContentStore (single-receive mode).</summary>
+    private RecoveryResult StageClassified(
+        ClassifiedPayload c, ulong expectedCrc, bool crcKnown, ulong receivedCrc)
+    {
+        return c.Kind switch
+        {
+            RecoveredKind.EtText =>
+                StageEtText(c.Text!, c.DisplayName, expectedCrc, crcKnown, receivedCrc),
+            RecoveredKind.Bundle =>
+                StageBundle(c.BundleFiles!, expectedCrc, crcKnown, receivedCrc)
+                ?? StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
+                    expectedCrc, crcKnown, receivedCrc),
+            RecoveredKind.TextLikeFile =>
+                StageTextLikeFile(c.Bytes, c.DisplayName, c.OriginalSize,
+                    expectedCrc, crcKnown, receivedCrc, c.Text!),
+            _ => StageSingleFile(c.Bytes, c.DisplayName, c.OriginalSize,
+                expectedCrc, crcKnown, receivedCrc),
+        };
+    }
+
+    /// <summary>
+    /// Save a classified payload into the continuous folder snapshot taken at
+    /// completion time. Disk failures become Failed reports — the pipeline
+    /// keeps scanning either way.
+    /// </summary>
+    private ContinuousSaveReport TrySaveContinuous(
+        AirFerry.Windows.Bundle.ContinuousSaver saver, ClassifiedPayload c)
+    {
+        try
+        {
+            return c.Kind switch
+            {
+                RecoveredKind.EtText => saver.SaveText(c.DisplayName, c.Text!),
+                RecoveredKind.Bundle => saver.SaveBundle(c.BundleFiles!, null),
+                // Text-like files are real files first: save the original
+                // bytes, not a text re-encode.
+                _ => saver.SaveSingle(c.DisplayName, c.Bytes),
+            };
+        }
+        catch (Exception ex)
+        {
+            return ContinuousSaveReport.Failed(c.DisplayName, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Move an already-verified decompressed file (&gt;256 MiB segmented path)
+    /// into the continuous folder, deduplicating by the root SHA-256 the
+    /// native decompression already verified.
+    /// </summary>
+    private ContinuousSaveReport TryMoveContinuous(
+        AirFerry.Windows.Bundle.ContinuousSaver saver,
+        string displayName, string sourcePath, string sha256Hex)
+    {
+        try
+        {
+            return saver.MoveVerifiedFile(displayName, sourcePath, sha256Hex);
+        }
+        catch (Exception ex)
+        {
+            return ContinuousSaveReport.Failed(displayName, ex.Message);
+        }
     }
 
     /// <summary>
     /// Store one recovered descriptor-v5 segment into the disk-backed assembler.
-    /// Returns a <see cref="RecoveryResult"/> only once every segment of the root
-    /// transfer has arrived and been merged; otherwise null (the receiver keeps
+    /// Returns a completed outcome only once every segment of the root
+    /// transfer has arrived and been merged; otherwise None (the receiver keeps
     /// scanning for the next segment).
     /// </summary>
-    private RecoveryResult? HandleSegmentedTransfer(ReceiverSession session, QrDecodePool pool)
+    private RecoveryOutcome HandleSegmentedTransfer(
+        ReceiverSession session, QrDecodePool pool,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
         // Take a coherent native snapshot under the ingest lock: metadata +
         // assembled **compressed** bytes for this segment (no decompression —
@@ -743,7 +917,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         if (seg is null)
         {
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
         int index = (int)seg.SegmentIndex;
@@ -784,7 +958,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             !string.Equals(rootId, _resumeRootId, StringComparison.Ordinal))
         {
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
         // Reuse the active root so a long, sequential transfer does not reopen
@@ -803,7 +977,7 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         // Crash recovery: all segments may already be durable while history
         // promotion was interrupted. Promotion is deliberately idempotent.
         if (asm.IsComplete())
-            return ArchiveSegmentedTransfer(asm, displayName, decompressedSize);
+            return ArchiveSegmentedTransfer(asm, displayName, decompressedSize, saver);
 
         // A failure leaves all earlier verified segments untouched. The outer
         // recovery boundary swaps in a fresh child receiver so this segment can
@@ -813,23 +987,24 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         {
             UpdateSegmentedProgress(asm);
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
         if (!asm.IsComplete())
         {
             UpdateSegmentedProgress(asm);
             SwapReceiverForNextSegment(session, pool);
-            return null;
+            return RecoveryOutcome.None();
         }
 
-        return ArchiveSegmentedTransfer(asm, displayName, decompressedSize);
+        return ArchiveSegmentedTransfer(asm, displayName, decompressedSize, saver);
     }
 
-    private RecoveryResult ArchiveSegmentedTransfer(
+    private RecoveryOutcome ArchiveSegmentedTransfer(
         AirFerry.Windows.Bundle.SegmentAssembler asm,
         string displayName,
-        ulong decompressedSize)
+        ulong decompressedSize,
+        AirFerry.Windows.Bundle.ContinuousSaver? saver)
     {
         // Concatenate the compressed segments and stream-decompress exactly once
         // to a temp file. The native call already verified the decompressed
@@ -840,97 +1015,79 @@ public partial class ScanViewModel : ObservableObject, IDisposable
         ulong expectedCrc = asm.Crc32();
         bool crcKnown = asm.Crc32Known();
 
-        RecoveryResult result;
+        RecoveryOutcome outcome;
         long length = new FileInfo(decompressedPath).Length;
         // Text / bundle detection needs the bytes in memory. Anything larger
         // than the legacy whole-transfer ceiling is a single file by
-        // construction, so skip the in-memory dispatch and stream-copy straight
-        // to the content store — this is what lets > 256 MiB files be recovered.
+        // construction, so skip the in-memory dispatch — ≤256 MiB goes through
+        // the shared classifier, larger files stream straight to their sink
+        // (ContentStore blob or continuous folder). This is what lets
+        // > 256 MiB files be recovered.
         if (length <= 256L * 1024 * 1024)
         {
             byte[] original = File.ReadAllBytes(decompressedPath);
             ulong receivedCrc = Crc32.Compute(original);
-            ulong originalSize = (ulong)original.LongLength;
-
-            if (TextParser.IsText(original))
-            {
-                // Same ETTEXT restructure as RecoverAndStageCore: strip the
-                // 8-byte wire magic up front so the oversized→file fallback
-                // stages the message text, not a file starting with the
-                // literal "ETTEXTv1" bytes.
-                original = original[TextParser.Magic.Length..];
-                originalSize = (ulong)original.LongLength;
-                if (string.IsNullOrEmpty(displayName) || !displayName.Contains('.'))
-                {
-                    displayName = string.IsNullOrEmpty(displayName)
-                        ? "文字消息.txt"
-                        : displayName + ".txt";
-                }
-                string? text = FileNameUtil.DecodeUtf8Strict(original);
-                result = text is not null
-                    ? StageEtText(text, displayName, expectedCrc, crcKnown, receivedCrc)
-                    : StageSingleFile(original, displayName, originalSize,
-                        expectedCrc, crcKnown, receivedCrc);
-            }
-            else if (BundleParser.IsBundle(original))
-            {
-                // If parsing failed, fall through to single-file handling
-                // (?? keeps `result` provably non-null; StageBundle returns
-                // RecoveryResult? — the sibling path at the non-segmented
-                // branch uses the same fallback).
-                result = StageBundle(original, expectedCrc, crcKnown, receivedCrc)
-                    ?? StageSingleFile(original, displayName, originalSize,
-                        expectedCrc, crcKnown, receivedCrc);
-            }
-            else if (FileNameUtil.IsTextLikeName(
-                         string.IsNullOrEmpty(displayName) ? "received_file" : displayName)
-                     && FileNameUtil.FitsTextUi(original.LongLength))
-            {
-                string? text = FileNameUtil.DecodeUtf8Strict(original);
-                result = text is not null
-                    ? StageTextLikeFile(original, displayName, originalSize,
-                        expectedCrc, crcKnown, receivedCrc, text)
-                    : StageSingleFile(original, displayName, originalSize,
-                        expectedCrc, crcKnown, receivedCrc);
-            }
-            else
-            {
-                result = StageSingleFile(original, displayName, originalSize,
-                    expectedCrc, crcKnown, receivedCrc);
-            }
+            ClassifiedPayload classified = ClassifyRecovered(
+                original, displayName, (ulong)original.LongLength);
+            outcome = saver is not null
+                ? RecoveryOutcome.Continuous(TrySaveContinuous(saver, classified))
+                : RecoveryOutcome.Single(StageClassified(
+                    classified, expectedCrc, crcKnown, receivedCrc));
         }
         else
         {
-            // Very large single file: stream/atomically-move the decompressed
-            // temp file into ContentStore without holding it in memory.
-            // 注意：expectedSize 校验的是**解压产物**长度，必须传解压后大小
-            // （调用方的压缩流 rootSize 只用于分段账本，语义勿混——Android 同名
-            // 函数的误导性参数名正是当初移植出错的根源）。
             string finalName = string.IsNullOrEmpty(displayName) ? "received_file" : displayName;
-            ContentStore.PutResult put = ContentStore.PutFile(
-                finalName, decompressedPath,
-                crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
-                crcUnknown: !crcKnown, kind: "file",
-                expectedSha256Hex: asm.RootSha256Hex,
-                expectedSize: (long)decompressedSize,
-                // 稳定条目 ID：入库后若索引发布被中断（崩溃/断电），重试时按
-                // 同 ID 去重，不产生重复历史条目（镜像 Android ScanActivity）。
-                stableEntryId: "segment-" + asm.RootSessionIdHex);
-            result = new RecoveryResult(
-                SingleFilePath: put.Path,
-                SingleFileSize: decompressedSize,
-                ExpectedCrc32: crcKnown ? expectedCrc : null,
-                Crc32Known: crcKnown,
-                ReceivedCrc32: null,
-                Bundle: null,
-                BundleDir: null,
-                DisplayName: finalName);
+            if (saver is not null)
+            {
+                // Move the verified temp file straight into the continuous
+                // folder; on a duplicate the ledger's own directory cleanup
+                // (CommitArchived below) removes it.
+                outcome = RecoveryOutcome.Continuous(
+                    TryMoveContinuous(saver, finalName, decompressedPath, asm.RootSha256Hex));
+            }
+            else
+            {
+                // Very large single file: stream/atomically-move the decompressed
+                // temp file into ContentStore without holding it in memory.
+                // 注意：expectedSize 校验的是**解压产物**长度，必须传解压后大小
+                // （调用方的压缩流 rootSize 只用于分段账本，语义勿混——Android 同名
+                // 函数的误导性参数名正是当初移植出错的根源）。
+                ContentStore.PutResult put = ContentStore.PutFile(
+                    finalName, decompressedPath,
+                    crcHex: crcKnown ? expectedCrc.ToString("x") : "unknown",
+                    crcUnknown: !crcKnown, kind: "file",
+                    expectedSha256Hex: asm.RootSha256Hex,
+                    expectedSize: (long)decompressedSize,
+                    // 稳定条目 ID：入库后若索引发布被中断（崩溃/断电），重试时按
+                    // 同 ID 去重，不产生重复历史条目（镜像 Android ScanActivity）。
+                    stableEntryId: "segment-" + asm.RootSessionIdHex);
+                outcome = RecoveryOutcome.Single(new RecoveryResult(
+                    SingleFilePath: put.Path,
+                    SingleFileSize: decompressedSize,
+                    ExpectedCrc32: crcKnown ? expectedCrc : null,
+                    Crc32Known: crcKnown,
+                    ReceivedCrc32: null,
+                    Bundle: null,
+                    BundleDir: null,
+                    DisplayName: finalName));
+            }
+        }
+
+        // A FAILED continuous save (disk full, folder removed, permissions)
+        // must NOT commit the ledger: CommitArchived deletes the received
+        // segments, the decompressed temp and the resume record — with them
+        // gone the transfer could never be retried. Keep everything; the
+        // idempotent promotion path (asm.IsComplete() above) retries on the
+        // next replayed stream or via the history page's 继续恢复.
+        if (outcome.ContinuousReport is { Status: ContinuousSaveStatus.Failed })
+        {
+            return outcome;
         }
 
         asm.CommitArchived();
         _segAssembler = null;
         _resumeRootId = null;
-        return result;
+        return outcome;
     }
 
     private sealed record SegmentPayload(
@@ -992,6 +1149,84 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             });
             return true;
         }
+    }
+
+    /// <summary>
+    /// Update the continuous counters/feed/status (dispatcher thread). The
+    /// counters and feed describe the **currently selected** folder: when the
+    /// folder was switched mid-transfer (the save went to the snapshot saver's
+    /// older folder), only the status line reports it.
+    /// </summary>
+    private void RecordContinuousOutcome(
+        AirFerry.Windows.Bundle.ContinuousSaver saver, ContinuousSaveReport report)
+    {
+        switch (report.Status)
+        {
+            case ContinuousSaveStatus.SkippedDuplicate:
+                StatusText = ReferenceEquals(saver, _continuousSaver)
+                    ? $"重复，已跳过: {report.DisplayName}"
+                    : $"重复，已跳过: {report.DisplayName}（{saver.TargetDir}）";
+                break;
+            case ContinuousSaveStatus.Failed:
+                StatusText = $"保存失败: {report.Error}（继续接收中）";
+                break;
+            default:
+                StatusText = ReferenceEquals(saver, _continuousSaver)
+                    ? $"已保存: {report.DisplayName}"
+                    : $"已保存: {report.DisplayName}（{saver.TargetDir}）";
+                break;
+        }
+        if (!ReferenceEquals(saver, _continuousSaver))
+        {
+            return;
+        }
+        ContinuousItemStatus status;
+        string? error = null;
+        switch (report.Status)
+        {
+            case ContinuousSaveStatus.SkippedDuplicate:
+                ContinuousSkippedCount++;
+                status = ContinuousItemStatus.Skipped;
+                break;
+            case ContinuousSaveStatus.Failed:
+                status = ContinuousItemStatus.Failed;
+                error = report.Error;
+                break;
+            default:
+                ContinuousSavedCount++;
+                status = ContinuousItemStatus.Saved;
+                break;
+        }
+        ContinuousItems.Insert(0, new ContinuousReceivedItem(
+            DateTime.Now.ToString("HH:mm:ss"),
+            report.DisplayName,
+            report.SizeBytes > 0 ? FormatBytes((ulong)report.SizeBytes) : string.Empty,
+            status,
+            error));
+        while (ContinuousItems.Count > 50)
+        {
+            ContinuousItems.RemoveAt(ContinuousItems.Count - 1);
+        }
+    }
+
+    /// <summary>
+    /// Continuous mode's "receive the next file" step: re-arm a fresh receiver
+    /// (the exact swap the segmented path performs between segments — the
+    /// producer thread, decode pool and capture device keep running) and reset
+    /// the per-transfer UI so the next descriptor starts from zero.
+    /// </summary>
+    private void ContinueNextTransfer(ReceiverSession session, QrDecodePool pool, int epoch)
+    {
+        IsComplete = false;
+        Progress = 0;
+        ReceivedSymbolsText = "0";
+        TotalSymbolsText = "0";
+        FileSummaryText = "等待下一份文件…";
+        _rateSamples.Clear();
+        _transferStartTimestamp = 0;
+        _decodePerSecond = 0;
+        _recentWireBytesPerSecond = 0;
+        SwapReceiverForNextSegment(session, pool);
     }
 
     private RecoveryResult StageSingleFile(byte[] bytes, string displayName,
@@ -1064,33 +1299,27 @@ public partial class ScanViewModel : ObservableObject, IDisposable
             DisplayName: finalName);
     }
 
-    private RecoveryResult? StageBundle(byte[] bytes, ulong expectedCrc,
-        bool crcKnown, ulong receivedCrc)
+    private RecoveryResult? StageBundle(
+        IReadOnlyList<BundleFile> files, ulong expectedCrc, bool crcKnown, ulong receivedCrc)
     {
-        AirFerry.Windows.Bundle.Bundle? bundle = BundleParser.Parse(bytes);
-        if (bundle is null || bundle.Files.Count == 0)
+        if (files.Count == 0)
         {
             return null;
         }
         string bundleId = Guid.NewGuid().ToString("N");
         string bundleTitle = $"发送_{DateTime.Now:MMdd_HHmmss}";
-        var staged = new List<BundleFile>(bundle.Files.Count);
-        ContentStore.PutBytesBatch(bundle.Files.Select(f =>
+        ContentStore.PutBytesBatch(files.Select(f =>
             new ContentStore.PutBytesRequest(
                 f.Name, f.Data, Kind: "file",
                 BundleId: bundleId, BundleTitle: bundleTitle)).ToList());
-        foreach (BundleFile f in bundle.Files)
-        {
-            // Keep in-memory bytes for the bundle UI; disk is content-addressed.
-            staged.Add(new BundleFile(f.Name, f.Data));
-        }
         return new RecoveryResult(
             SingleFilePath: null,
             SingleFileSize: null,
             ExpectedCrc32: expectedCrc,
             Crc32Known: crcKnown,
             ReceivedCrc32: receivedCrc,
-            Bundle: staged,
+            // Keep in-memory bytes for the bundle UI; disk is content-addressed.
+            Bundle: files.Select(f => new BundleFile(f.Name, f.Data)).ToList(),
             BundleDir: null);
     }
 
