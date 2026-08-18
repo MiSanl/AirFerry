@@ -296,7 +296,7 @@ npm run preview        # 本地预览构建产物
 - `transfer_engine_bg.wasm` + `wasm-zstd.wasm` + `lzma-wasm.wasm`——运行时加载的 WASM 模块
 - 图标 `icon{16,32,48,64,128}.png`
 
-> MV2 与 MV3 用同一 Chrome 签名私钥打包会得到**相同的扩展 ID**（`nboajkjpabbekenmadidokmefholfmfk`），便于升级替换。
+> MV2 与 MV3 用同一 Chrome 签名私钥打包会得到**相同的扩展 ID**（`lgafjpalpcbiellnlbfdabdlbfooojjm`），便于升级替换。该 ID 由固定私钥公钥 SHA-256 的前 128 位按 Chrome 规则换算，并与 v1.2.7/v1.2.8 CRX3 头部的 `crx_id` 一致。
 
 ### ⚠️ 关键依赖顺序（最容易踩的坑）
 

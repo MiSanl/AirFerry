@@ -87,7 +87,7 @@
 2. 使用 zip 时打开 `chrome://extensions`，右上角开启「开发者模式」
 3. 点击「加载已解压的扩展程序」，选择解压目录
 
-> v1.2.8 CRX 复用了原固定私钥，MV2/MV3 扩展 ID 均保持为 `nboajkjpabbekenmadidokmefholfmfk`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
+> v1.2.8 CRX 复用了原固定私钥，MV2/MV3 扩展 ID 均保持为 `lgafjpalpcbiellnlbfdabdlbfooojjm`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
 
 ### Firefox 扩展
 
