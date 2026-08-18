@@ -73,9 +73,10 @@ function buildVariant(variant) {
   try {
     if (variant === "simd") modernize(temp)
     const pkg = path.join(temp, `pkg-${variant}`)
-    const env = variant === "simd"
-      ? { ...process.env, RUSTFLAGS: "-C target-feature=+simd128" }
-      : process.env
+    // `simd` is retained as the historical name of the modern wasm-bindgen
+    // variant. Keep the generated module scalar so it also loads in hardened
+    // or virtualized Chromium environments where WebAssembly SIMD is disabled.
+    const env = process.env
     run(
       "wasm-pack",
       ["build", path.join(temp, "core/transfer-engine"), "--target", "web", "--out-dir", pkg,

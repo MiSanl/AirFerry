@@ -6,7 +6,7 @@
 
 - Node.js ≥ 18
 - npm
-- **`apps/sender/wasm-pkg-simd/` 必须完整**（Rust WASM 现代产物，网页端复用它，不单独编译 Rust）
+- **`apps/sender/wasm-pkg-simd/` 必须完整**（Rust WASM 现代标量产物；`simd` 为历史目录名，网页端复用它，不单独编译 Rust）
 
 ## 构建 WASM 核心
 
@@ -17,7 +17,7 @@
 ```bash
 cd apps/sender
 npm install            # 首次
-npm run wasm           # 生成 legacy/simd 两个变体
+npm run wasm           # 生成 legacy/simd 两个标量变体（simd 为历史名）
 ```
 
 > 网页端明确使用现代/MV3 变体。`prepare-wasm.cjs` 每次都校验 sender 的 `wasm-pkg-simd`，持跨进程锁原子复制到 **web 自有**的 `apps/web/wasm-pkg/`；扩展构建切换自己的 MV2/MV3 包时不会改动 Vite 正在读取的文件。

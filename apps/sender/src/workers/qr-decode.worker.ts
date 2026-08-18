@@ -3,7 +3,7 @@
  *
  * Two backends:
  *  - FAST (default, M3): self-compiled ZXing-C++ → WASM (`fastzxing/`), reads a
- *    raw Y (luminance) plane — no RGBA conversion, ~4× less data, -O3 + SIMD.
+ *    raw Y (luminance) plane — no RGBA conversion, ~4× less data, -O3 scalar.
  *  - COMPAT (fallback): `zxing-wasm` npm package, reads RGBA ImageData.
  *
  * The worker auto-probes the fast module on `init`; if it loads it reports

@@ -19,11 +19,11 @@ npm run wasm
 | 产物目录 | wasm-bindgen 版本 | 特性 | 供哪个目标 |
 |---------|------------------|------|-----------|
 | `wasm-pkg-legacy/` | `=0.2.92`（默认锁定） | 标量、无 externref（Chrome 87+ 可加载） | MV2（`chrome-mv2` / `firefox-mv2`） |
-| `wasm-pkg-simd/` | `=0.2.125`（隔离副本升级） | `+simd128` SIMD + externref（Chrome 96+ / FF 116+） | MV3（`chrome-mv3` / `firefox-mv3`） |
+| `wasm-pkg-simd/` | `=0.2.125`（隔离副本升级） | 标量 + externref（Chrome 96+ / FF 116+；`simd` 为历史名） | MV3（`chrome-mv3` / `firefox-mv3`） |
 
 > **工作树隔离**：脚本把 workspace 复制到临时目录，只在副本中升级 wasm-bindgen 并重算 lockfile；源码 `Cargo.toml` / `Cargo.lock` 从不写入。`.wasm-build.lock` 还会阻止并发构建互相覆盖发布目录。详见 `apps/sender/scripts/build-wasm.cjs`。
 
-> **关于 SIMD 提速的实测结论**：`+simd128` 对当前纯标量的 `raptorq` crate **无性能收益**（实测 0.95×，反而因 wasm 变大略慢）；QR 编码现用 `fast_qr` crate（已替代旧 `qrcode`，Reed-Solomon 路径 ~7-9× 提速），同样无 wasm32 SIMD intrinsics。双产物机制的真实价值是「MV2 兼容老 Chrome（无 externref）+ MV3 用新工具链」的兼容性分离，并为未来引入 SIMD 化的库保留构建基础设施。详见 `AGENTS.md` §5 第6条。
+> **关于 SIMD 的实测结论**：旧 `+simd128` 构建对当前 wasm32 热路径**无性能收益**（实测 0.95×，反而因 wasm 变大略慢），并在部分加固/虚拟化 Chromium 中无法加载，因此已移除。双产物都是标量；差别仅是 MV2 的旧 wasm-bindgen 与 MV3/Web 的新 wasm-bindgen/externref。`simd` 目录和命令名为兼容现有构建链保留。
 
 > `npm run build` 已内嵌此步骤，通常无需单独跑 `npm run wasm`。
 
@@ -56,7 +56,7 @@ npm run build:firefox-mv3   # Firefox MV3
 npm run build:firefox-mv2   # Firefox MV2
 ```
 
-单目标脚本不重新编译 WASM；先运行一次 `npm run wasm`。随后脚本会明确选择对应的 `wasm-pkg-simd`（MV3）或 `wasm-pkg-legacy`（MV2），再执行 Plasmo、manifest 修正和 zstd 资源复制，不会复用上一次目标遗留的错误变体。WASM 构建、扩展目标切换和 web 快照复制共用 `.wasm-build.lock`；锁覆盖完整 Plasmo 构建窗口，防止并发任务切换正在读取的 glue/WASM。
+单目标脚本不重新编译 WASM；先运行一次 `npm run wasm`。随后脚本会明确选择对应的 `wasm-pkg-simd`（MV3 现代标量版，历史名）或 `wasm-pkg-legacy`（MV2 标量版），再执行 Plasmo、manifest 修正和 zstd 资源复制，不会复用上一次目标遗留的错误变体。WASM 构建、扩展目标切换和 web 快照复制共用 `.wasm-build.lock`；锁覆盖完整 Plasmo 构建窗口，防止并发任务切换正在读取的 glue/WASM。
 
 ### 构建后处理
 
@@ -183,6 +183,6 @@ apps/sender/
 │   └── assets/
 │       └── app.css
 ├── wasm-pkg-legacy/            # MV2：标量 + wasm-bindgen 0.2.92
-├── wasm-pkg-simd/              # MV3：SIMD + 0.2.125
+├── wasm-pkg-simd/              # MV3：标量 + 0.2.125（历史名）
 └── assets/                     # 发送端 icon{16,32,48,64,128,512}.png + 接收端 receiver-icon*.png
 ```

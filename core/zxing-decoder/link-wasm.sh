@@ -28,7 +28,7 @@ fi
 # support emscripten traps and JS sees a numeric exception ("解码失败: 638680").
 # Enabling exceptions lets our wrapper's catch(...) swallow it and return nullptr
 # gracefully (the frame is just skipped) instead of breaking the whole backend.
-emcc -O3 -std=c++20 -msimd128 -fexceptions \
+emcc -O3 -std=c++20 -fexceptions \
   -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=web,worker \
   -s INITIAL_MEMORY=67108864 -s ALLOW_MEMORY_GROWTH=0 \
   -s STACK_SIZE=1048576 \

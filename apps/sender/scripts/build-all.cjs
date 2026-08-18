@@ -10,8 +10,9 @@
  * ## Per-target WASM selection
  *
  * The two WASM variants are pre-built by scripts/build-wasm.cjs into
- * wasm-pkg-legacy/ (MV2, Chrome87-safe, no SIMD) and wasm-pkg-simd/ (MV3,
- * wasm-bindgen 0.2.125 + SIMD). The loader uses the `@airferry-wasm` alias,
+ * wasm-pkg-legacy/ (MV2, Chrome87-safe) and wasm-pkg-simd/ (the historically
+ * named modern scalar variant, wasm-bindgen 0.2.125). The loader uses the
+ * `@airferry-wasm` alias,
  * which Plasmo resolves to `wasm-pkg/`; before each build we copy the matching
  * variant there. This keeps application imports static while still shipping
  * per-target WASM.
@@ -45,8 +46,9 @@ function run(cmd) {
 
 /**
  * Copy wasm-pkg-<variant>/ over wasm-pkg/ so the next plasmo build bundles
- * the right WASM module. `variant` is "simd" for MV3 targets, "legacy" for
- * MV2. We wipe and re-copy rather than symlink so Plasmo/Vite's file-watching
+ * the right WASM module. `variant` is the historical name "simd" for modern
+ * MV3 targets, and "legacy" for MV2. Both modules are scalar. We wipe and
+ * re-copy rather than symlink so Plasmo/Vite's file-watching
  * sees a real directory (some bundlers mis-handle symlinks in the build).
  */
 function useWasmPkg(variant) {
@@ -68,7 +70,8 @@ function useWasmPkg(variant) {
 // it, and no second target build can switch the shared wasm-pkg underneath us.
 const releaseLock = acquireWasmLock(root);
 try {
-  // Build each target. MV3 → SIMD variant; MV2 → legacy (Chrome87-safe) variant.
+  // Build each target. MV3 → modern scalar variant (historically named
+  // "simd"); MV2 → legacy scalar variant (Chrome87-safe).
   for (const target of selectedTargets) {
     const isMV3 = target.endsWith("mv3");
     useWasmPkg(isMV3 ? "simd" : "legacy");

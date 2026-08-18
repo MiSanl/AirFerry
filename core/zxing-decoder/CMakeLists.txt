@@ -57,7 +57,7 @@ add_library(airferry_zxing STATIC
 target_link_libraries(airferry_zxing PRIVATE ZXing::ZXing)
 # -fexceptions: ZXing-C++ throws on some big/partial frames; without it the
 # wasm traps and JS sees a numeric exception. Match link-wasm.sh.
-target_compile_options(airferry_zxing PRIVATE -msimd128 -O3 -fexceptions)
+target_compile_options(airferry_zxing PRIVATE -O3 -fexceptions)
 set_target_properties(airferry_zxing PROPERTIES
     OUTPUT_NAME "airferry_zxing"
 )

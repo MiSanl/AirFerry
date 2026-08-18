@@ -109,7 +109,7 @@ verify_apk_signature() {
 }
 
 build_wasm() {
-  info "编译 Rust WASM 双产物 (legacy=0.2.92/标量 → wasm-pkg-legacy/, simd=0.2.125+SIMD → wasm-pkg-simd/) ..."
+  info "编译 Rust WASM 双产物 (legacy=0.2.92/标量 → wasm-pkg-legacy/, simd=0.2.125/标量现代版 → wasm-pkg-simd/; simd 为历史目录名) ..."
   cd "$ROOT/apps/sender"
   npm run wasm 2>&1 | tail -3
   info "WASM 双产物编译完成"
