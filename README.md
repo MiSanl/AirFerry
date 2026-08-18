@@ -61,14 +61,14 @@
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-sender-chrome-mv3-v1.2.8.zip` | Chrome / Edge MV3 现代标量版；解压后用「加载已解压的扩展程序」安装 |
-| `airferry-sender-chrome-mv2-v1.2.8.zip` | Chrome / Edge MV2 旧版兼容标量版；解压加载 |
+| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Chrome / Edge MV3 现代标量版；CRX 使用固定发布密钥签名，受策略限制时改用 zip 解压加载 |
+| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Chrome / Edge MV2 旧版兼容标量版；CRX 使用同一固定发布密钥签名 |
 | `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox 扩展，MV3（Firefox 116+） |
 | `airferry-sender-firefox-mv2-v1.2.8.xpi` | Firefox 91+ 的 MV2 兼容版 |
 | `airferry-sender-web-v1.2.8.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
 | `airferry-sender-web-standalone-v1.2.8.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
 | `airferry-receiver-web-v1.2.8.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-receiver-android-arm64-v1.2.7.apk` | **Android 扫码端**：本次发送端热修不影响 Android，继续使用 v1.2.7 签名 APK |
+| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
 | `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
 
 > 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。web 发送端/接收端由 GitHub Actions `pages` workflow 自动构建并部署到 GitHub Pages（推送 `main` 即触发）。
@@ -83,11 +83,11 @@
 
 ### Chrome / Edge 扩展
 
-1. 下载对应 `.zip` 文件（MV3 为现代标量版，MV2 供旧版浏览器兼容）并解压
-2. 打开 `chrome://extensions`，右上角开启「开发者模式」
+1. 优先下载对应 `.crx`（MV3 为现代标量版，MV2 供旧版浏览器兼容）；若浏览器策略阻止商店外 CRX 安装，则下载同名 `.zip` 并解压
+2. 使用 zip 时打开 `chrome://extensions`，右上角开启「开发者模式」
 3. 点击「加载已解压的扩展程序」，选择解压目录
 
-> v1.2.8 未使用非原固定私钥重签 CRX，以免扩展 ID 变更；因此提供 `.zip` 解压加载版。
+> v1.2.8 CRX 复用了原固定私钥，MV2/MV3 扩展 ID 均保持为 `nboajkjpabbekenmadidokmefholfmfk`；zip 作为浏览器阻止商店外 CRX 安装时的回退。
 
 ### Firefox 扩展
 
