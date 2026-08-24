@@ -113,27 +113,20 @@ dotnet run --project AirFerry.Windows -c Release
 
 ---
 
-## 6. GitHub Actions 发版（推荐，非 Windows 本机）
+## 6. GitHub Actions 构建与发版
 
-macOS/Linux 无法编 WPF。正式 Windows 产物用 [`.github/workflows/windows.yml`](../.github/workflows/windows.yml)：
+macOS/Linux 无法编 WPF。常规 Windows 质量门用 [`.github/workflows/windows.yml`](../.github/workflows/windows.yml)：
 
 ```text
 push/PR（core/** 或 apps/windows/**）
   → rust-cffi (ubuntu) + csharp-tests (ubuntu) + windows-build (windows-2022)
 
-workflow_dispatch（手动输入已存在的 `release_tag`）且上述三 job 成功
-  → windows-pack：
-       cargo build --features cffi --release
-       拷贝 transfer_engine.dll → apps/windows/AirFerry.Windows/runtime/
-       CMake/MSVC 构建共享 ZXing-C++ + CTest
-       拷贝 airferry_zxing.dll → apps/windows/AirFerry.Windows/runtime/
-       dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
-       Compress-Archive → airferry-receiver-windows-x64-v${VER}.zip
-       gh release upload v${VER} airferry-receiver-windows-x64-v${VER}.zip --clobber
-       （tag commit、package/manifest 版本与 release 任一不一致即失败）
+tag `v<VER>`
+  → release-all：构建 Windows WPF 接收端 zip 和桌面发送端 EXE，
+    并与扩展、网页端和 Android APK 一起上传到同一 Release
 ```
 
-操作：Actions → **windows** → **Run workflow**，输入已创建的 tag（例如 `v1.2.3`）。workflow 从 tag 派生 `VER`，并验证 checkout 的提交正是该 tag，避免从 `main` 漂移提交生成同名发布资产。手动发布与 push 质量门按事件/tag 分组，不会互相取消。
+正式发版使用 [`.github/workflows/release-all.yml`](../.github/workflows/release-all.yml)。推送与全部版本源一致的 `v<VER>` tag，或在 Actions → **release-all** 中输入已有 tag；它会从 tag 重新构建所有分发产物并创建或更新 Release。Android 与 Chrome CRX 所需 Secrets 见 [GitHub Actions 全量发布](build-release-ci.md)。
 
 本地 Windows 仍可用 `.\scripts\build-windows.ps1 -Pack`（产物进 `dist/`）。
 
@@ -193,7 +186,7 @@ Windows 端的核心新增功能。启动后进入**设备选择页**：
 |------|------|------|
 | 可执行文件 | `apps/windows/AirFerry.Windows/bin/x64/Release/net8.0-windows/win-x64/AirFerry.exe` | 依赖同目录下的 `transfer_engine.dll`、`airferry_zxing.dll` + OpenCV native DLLs |
 | Windows 接收端 zip（本地） | `dist/airferry-receiver-windows-x64-v{VER}.zip` | `build-windows.ps1 -Pack` |
-| 发布 zip（CI） | GitHub Release asset 同名 | `windows.yml` → `windows-pack` job |
+| 发布 zip（CI） | GitHub Release asset 同名 | `release-all.yml` → `windows` job |
 
 > 所有本地产物均 git-ignored。分发走 GitHub Release；**默认 Windows 发版路径是 workflow**（§6）。
 

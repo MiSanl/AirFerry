@@ -67,11 +67,12 @@
 | `airferry-sender-firefox-mv2-v1.2.8.xpi` | Firefox 91+ 的 MV2 兼容版 |
 | `airferry-sender-web-v1.2.8.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
 | `airferry-sender-web-standalone-v1.2.8.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
+| `airferry-sender-windows-x64-v1.2.8.exe` | Windows x64 发送端桌面版（免安装 portable EXE） |
 | `airferry-receiver-web-v1.2.8.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
 | `airferry-receiver-android-arm64-v1.2.8.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
 | `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
 
-> 发送端/APK/web 由 `./scripts/build-all.sh release` 产出；版本号取自 `apps/sender/package.json`。Windows zip 默认由 GitHub Actions `windows` workflow（`workflow_dispatch`）上传到同一 Release。Chrome `.crx` 需本机有 Chrome 才能签名，否则仅产出 `.zip`。web 发送端/接收端由 GitHub Actions `pages` workflow 自动构建并部署到 GitHub Pages（推送 `main` 即触发）。
+> 本地可用 `./scripts/build-all.sh release` 构建发送端、APK 与网页端。正式全量发布由 GitHub Actions `release-all` workflow 完成：为与代码版本一致的 `v<VER>` tag 构建扩展 CRX/zip/xpi、网页发送/接收端、Android APK、Windows 接收端 zip 及 Windows 发送端 EXE 并上传到同一 Release。Android 与 CRX 固定签名材料必须先配置为仓库 Secrets，详见 [GitHub Actions 全量发布](docs/build-release-ci.md)。`pages` workflow 只负责网页部署，需在仓库 Settings → Pages 启用 GitHub Actions；其部署状态不影响 Release 资产构建。
 
 ### Android 接收端
 
@@ -111,6 +112,7 @@ AirFerry/
 │   └── zxing-decoder/     # Windows 对 Android v1.1.3 模式的 ZXing-C++ 实现
 ├── apps/
 │   ├── sender/            # Plasmo + React + TS + WASM 发送端（浏览器扩展）
+│   ├── desktop/           # Electron Windows 发送端（复用 web/sender 业务代码）
 │   ├── scanner/           # Kotlin + CameraX + ZXing-C++ 接收端（Android App）
 │   └── windows/           # C# WPF + OpenCvSharp + ZXing-C++（Windows App）
 ├── scripts/
@@ -154,6 +156,7 @@ AirFerry/
 - [构建指南 - 浏览器扩展](docs/build-browser.md)
 - [构建指南 - Android](docs/build-android.md)
 - [构建指南 - Windows](docs/build-windows.md)
+- [GitHub Actions 全量发布](docs/build-release-ci.md)
 - [开发环境搭建](docs/dev-setup.md)
 
 ## 致谢

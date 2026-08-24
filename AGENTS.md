@@ -31,6 +31,9 @@ AirFerry/
 │   │   ├── src/main.tsx        #   薄入口：mount sender 的 App（options.tsx）
 │   │   ├── scripts/            #   prepare-wasm（锁定并复制 sender simd 包 + 拷 zstd）/ lzma 提取
 │   │   └── public/             #   wasm-zstd.wasm（worker 运行时 fetch，构建时拷入）
+│   ├── desktop/                # Electron Windows 发送端（加载 web dist，打 portable EXE）
+│   │   ├── main.cjs            #   安全桌面壳（禁 Node 集成、启 sandbox）
+│   │   └── package.json        #   build：web 静态站点 + electron-builder portable EXE
 │   ├── scanner/                # Android App（Kotlin + CameraX + ZXing-C++）
 │   │   └── app/src/main/
 │   │       ├── java/com/airferry/app/   # Kotlin
@@ -266,11 +269,13 @@ npm run preview        # 本地预览构建产物
 | 网页发送端 | `airferry-sender-web-v{VER}.zip` | 纯静态站点（`index.html` + `assets/` + 根目录 `wasm-zstd.wasm`）；Vite `base:"./"` 相对路径，可部署到任意静态托管的任意子路径。v1.1.6 起**仅含发送端**（`build_web` 产 `apps/web/dist/`，打包排除 `zxing_reader.wasm`）。`pack_dist` 自动打包（须先跑 `build-all.sh web`，缺失时 warn 跳过） |
 | 网页接收端 | `airferry-receiver-web-v{VER}.zip` | **接收端独立 zip**（`receiver.html` + assets + `wasm-zstd.wasm` + `zxing_reader.wasm`）。v1.1.6 起与发送端 web 拆分，可独立部署；`build:receiver` 产 `apps/web/dist-receiver/`。⚠️ **不能双击运行**，需部署到 HTTPS / localhost（`getUserMedia` 摄像头仅安全上下文可用）。`pack_dist` 自动打包（缺失时 warn 跳过） |
 | 网页发送端单文件 | `airferry-sender-web-standalone-v{VER}.html` | **单个自包含 HTML**（约 2MB），所有 JS/CSS/Worker/WASM 内联（WASM 转 base64），**双击在 `file://` 下即用**，无需服务器。由 `npm run build:standalone` 产出 `apps/web/dist-standalone/index.html`。**v1.2.0 起 `build_web` 自动构建并按版本规范复制到 `dist/`**（`airferry-sender-web-standalone-v{VER}.html`），随 `release`/`all`/`web` 一并产出，纳入发布流程——不再手动改名上传 |
+| Windows 发送端 | `airferry-sender-windows-x64-v{VER}.exe` | Windows x64 Electron portable EXE；由 `apps/desktop` 构建，复用 web/sender 业务代码，免安装直接运行 |
 
 #### 发布流程（GitHub Release 怎么来）
 
-1. **本地构建打包**：`./scripts/build-all.sh release`（macOS/Linux）→ 产出 `dist/` 下除 Windows 外的全部产物（扩展 4 目标 crx/zip/xpi + Android APK + web zip）。Windows zip 单独在 Windows 上用 `.\scripts\build-windows.ps1 -Pack` 或走 `.github/workflows/windows.yml` 的 `windows-pack` job（见 §2.9）。
-2. **创建/更新 Release**：`build-all.sh release` 内部 `pack_dist` 只把产物放进 `dist/`，**不自动上传 GitHub**。发版时手动：
+1. **CI 全量发布（推荐）**：推送与全部版本源一致的 `v{VER}` tag，触发 `.github/workflows/release-all.yml`。它在 GitHub-hosted runner 上构建并上传扩展 CRX/zip/xpi、网页发送/接收端与单文件版、Android APK、Windows 接收端 zip 和 Windows 发送端 EXE；Android keystore 与 Chrome PEM 必须通过 GitHub Secrets 注入，详见 `docs/build-release-ci.md`。
+2. **本地构建打包**：`./scripts/build-all.sh release`（macOS/Linux）→ 产出 `dist/` 下除 Windows 外的全部产物。Windows zip 单独在 Windows 上用 `.\scripts\build-windows.ps1 -Pack`。
+3. **手动创建/更新 Release**：`build-all.sh release` 内部 `pack_dist` 只把产物放进 `dist/`，**不自动上传 GitHub**。发版时手动：
    ```bash
    gh release create v{VER} -R UR-SillyB/AirFerry \
      --target <commit-sha> --title v{VER} \
@@ -281,8 +286,8 @@ npm run preview        # 本地预览构建产物
    gh release upload v{VER} -R UR-SillyB/AirFerry \
      $(./scripts/build-all.sh dist-upload-list) --clobber   # 上传/覆盖 asset
    ```
-   Windows asset 由 `windows.yml` 的 `windows-pack` job 自动 `gh release upload --clobber`（仅传单个 Windows zip，CI 干净 checkout 无密钥）。
-3. **重新发布同一 tag（需改 notes / 重排 asset / 清 label 时）**：保留 tag 以维持下载链接稳定，只重建 release 记录：
+    `release-all.yml` 已覆盖所有发布资产；不要与旧 `windows.yml` 的手动 `windows-pack` 同时上传同名 Windows zip。
+4. **重新发布同一 tag（需改 notes / 重排 asset / 清 label 时）**：保留 tag 以维持下载链接稳定，只重建 release 记录：
    ```bash
    gh release delete v{VER} -R UR-SillyB/AirFerry --yes --cleanup-tag=false   # 删 release，保留 tag
    gh release create v{VER} -R UR-SillyB/AirFerry --target <tag-commit> --title v{VER} --notes-file docs/releases/v{VER}.md
@@ -310,8 +315,9 @@ npm run preview        # 本地预览构建产物
    - `Cargo.toml` `[workspace.package] version`（→ 核心库）
    - `apps/windows/AirFerry.Windows/AirFerry.Windows.csproj` `<Version>`（→ exe 内嵌）
    - `apps/web/package.json` `version`（→ web 包自身版本）
-   - 两个 `package-lock.json`（sender/web）只**手工改自身 `version` 字段两处**（根 + `packages[""]`），**勿用 `npm install --package-lock-only` 重生成**——v1.2.7 曾用它刷新 lock，结果剪掉了 `react@18.3.1` 等依赖条目（-76 行），`pages.yml` 的 `npm ci` 因 lock 与 package.json 不同步直接失败。改完用 `npm ci --ignore-scripts --dry-run` 验证同步
-   - Windows CI 不保存版本副本；手动触发时输入已存在的 `release_tag`，workflow 校验 tag commit 与 package/manifest 后派生文件名
+   - `apps/desktop/package.json` `version`（→ Windows 发送端 EXE 文件名）
+   - 三个 `package-lock.json`（sender/web/desktop）只**手工改自身 `version` 字段两处**（根 + `packages[""]`），**勿用 `npm install --package-lock-only` 重生成 sender/web lock**——v1.2.7 曾用它刷新 lock，结果剪掉了 `react@18.3.1` 等依赖条目（-76 行），`pages.yml` 的 `npm ci` 因 lock 与 package.json 不同步直接失败。改完用 `npm ci --ignore-scripts --dry-run` 验证同步
+    - Windows CI 与 `release-all.yml` 不保存版本副本；仅从 tag 派生版本并校验所有版本源
 
 ### 2.9 Windows 发版（GitHub Actions workflow）
 

@@ -147,7 +147,7 @@ npm run build
 
 `npm run build` 会先构建网页发送端，再产出免安装的 `apps/desktop/dist/AirFerry-Sender-<VER>-win-x64.exe`。首次运行前，网页构建仍要求 `apps/sender/wasm-pkg-simd/` 存在；若缺失，先在 `apps/sender` 执行 `npm run wasm`。
 
-推送与 `apps/sender/package.json` 版本一致的 `v<VER>` tag 后，`.github/workflows/desktop-sender-release.yml` 会在 Windows runner 上重建并上传该 EXE 到 GitHub Release；也可从 Actions 手动运行并输入已有 tag。
+推送与 `apps/sender/package.json` 版本一致的 `v<VER>` tag 后，`.github/workflows/release-all.yml` 会在 Windows runner 上重建并上传该 EXE 到 GitHub Release；也可从 Actions 手动运行并输入已有 tag。
 
 ## 单文件版（双击运行，无需服务器）
 

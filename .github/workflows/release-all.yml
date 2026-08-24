@@ -1,0 +1,250 @@
+name: release-all
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build (for example v1.2.9)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-all-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - id: version
+        name: Verify tag and version identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid tag: $RELEASE_TAG" >&2; exit 1; }
+          version="${RELEASE_TAG#v}"
+          node -e 'const p=require("./apps/sender/package.json"); if (p.version !== process.argv[1] || p.manifest.version !== process.argv[1]) process.exit(1)' "$version"
+          [[ "$(node -p 'require("./apps/web/package.json").version')" == "$version" ]] || { echo "web package version mismatch" >&2; exit 1; }
+          [[ "$(node -p 'require("./apps/desktop/package.json").version')" == "$version" ]] || { echo "desktop package version mismatch" >&2; exit 1; }
+          [[ "$(grep -E '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)" == "$version" ]] || { echo "Rust workspace version mismatch" >&2; exit 1; }
+          grep -q "versionName = \"$version\"" apps/scanner/app/build.gradle.kts || { echo "Android versionName mismatch" >&2; exit 1; }
+          grep -q "<Version>$version</Version>" apps/windows/AirFerry.Windows/AirFerry.Windows.csproj || { echo "Windows receiver version mismatch" >&2; exit 1; }
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  browser-and-web:
+    name: Browser extensions and web sender/receiver
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      CHROME_EXTENSION_PEM_BASE64: ${{ secrets.CHROME_EXTENSION_PEM_BASE64 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/sender/package-lock.json
+            apps/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.15.0
+      - name: Install and build browser sender
+        working-directory: apps/sender
+        run: npm ci && npm run build
+      - name: Install and build web sender and receiver
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run build
+          npm run build:receiver
+          npm run build:standalone
+      - name: Package browser and web assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          mkdir release
+          [[ -n "${CHROME_EXTENSION_PEM_BASE64:-}" ]] || { echo "Missing required GitHub secret: CHROME_EXTENSION_PEM_BASE64" >&2; exit 1; }
+          printf '%s' "$CHROME_EXTENSION_PEM_BASE64" | base64 --decode > chrome-extension.pem
+          actual_key_sha="$(openssl rsa -in chrome-extension.pem -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+          [[ "$actual_key_sha" == "b6059f0bf2184bbdb153013b15eee99cf8176fd653e46fcda4123868a05e2986" ]] || { echo "Chrome signing key fingerprint mismatch" >&2; exit 1; }
+          for target in chrome-mv3 chrome-mv2; do
+            (cd "apps/sender/build/$target-prod" && zip -r -q -X "../../../release/airferry-sender-$target-v$version.zip" .)
+            google-chrome --headless --no-sandbox --disable-gpu --pack-extension="apps/sender/build/$target-prod" --pack-extension-key="$PWD/chrome-extension.pem"
+            mv "apps/sender/build/$target-prod.crx" "release/airferry-sender-$target-v$version.crx"
+          done
+          for target in firefox-mv3 firefox-mv2; do
+            (cd "apps/sender/build/$target-prod" && zip -r -q -X "../../../release/airferry-sender-$target-v$version.xpi" .)
+          done
+          (cd apps/web/dist && zip -r -q -X "../../../release/airferry-sender-web-v$version.zip" . -x 'zxing_reader.wasm' -x 'airferry_zxing.js' -x 'airferry_zxing.wasm')
+          (cd apps/web/dist-receiver && zip -r -q -X "../../../release/airferry-receiver-web-v$version.zip" .)
+          cp "apps/web/dist-standalone/index.html" "release/airferry-sender-web-standalone-v$version.html"
+          rm -f chrome-extension.pem
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: browser-and-web-release-assets
+          path: release/*
+          if-no-files-found: error
+
+  android-receiver:
+    name: Android receiver APK
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+          cargo install cargo-ndk --locked
+      - name: Restore Android release signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_STORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [[ -n "${!name:-}" ]] || { echo "Missing required GitHub secret: $name" >&2; exit 1; }
+          done
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > apps/scanner/airferry-release.keystore
+          chmod 600 apps/scanner/airferry-release.keystore
+          cat > apps/scanner/keystore.properties <<EOF
+          storeFile=airferry-release.keystore
+          storePassword=$ANDROID_STORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+      - name: Build signed release APK
+        working-directory: apps/scanner
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: ./gradlew :app:assembleRelease
+      - name: Package APK
+        shell: bash
+        run: |
+          mkdir release
+          cp apps/scanner/app/build/outputs/apk/release/app-release.apk "release/airferry-receiver-android-arm64-v${{ needs.verify.outputs.version }}.apk"
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: android-release-asset
+          path: release/*.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows receiver and desktop sender
+    needs: verify
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/sender/package-lock.json
+            apps/web/package-lock.json
+            apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.15.0
+      - name: Install and build desktop sender
+        shell: pwsh
+        run: |
+          Push-Location apps/sender; npm ci; npm run wasm; Pop-Location
+          Push-Location apps/web; npm ci; Pop-Location
+          Push-Location apps/desktop; npm ci; npm run build; Pop-Location
+      - name: Build Windows receiver native dependencies
+        shell: pwsh
+        run: |
+          cargo build -p transfer-engine --features cffi --release
+          New-Item -ItemType Directory -Force -Path apps/windows/AirFerry.Windows/runtime | Out-Null
+          Copy-Item target/release/transfer_engine.dll apps/windows/AirFerry.Windows/runtime/transfer_engine.dll -Force
+          cmake -S apps/windows/native -B apps/windows/native/build -G "Visual Studio 17 2022" -A x64
+          cmake --build apps/windows/native/build --config Release --parallel
+          ctest --test-dir apps/windows/native/build -C Release --output-on-failure
+          $zxing = Get-ChildItem apps/windows/native/build -Recurse -File -Filter airferry_zxing.dll | Select-Object -First 1
+          if ($null -eq $zxing) { throw "airferry_zxing.dll not found" }
+          Copy-Item $zxing.FullName apps/windows/AirFerry.Windows/runtime/airferry_zxing.dll -Force
+      - name: Publish Windows receiver
+        run: >-
+          dotnet publish apps/windows/AirFerry.Windows/AirFerry.Windows.csproj
+          -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false
+          -o apps/windows/publish
+      - name: Package Windows assets
+        shell: pwsh
+        run: |
+          $version = "${{ needs.verify.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          foreach ($dll in @("transfer_engine.dll", "airferry_zxing.dll")) {
+            Copy-Item "apps/windows/AirFerry.Windows/runtime/$dll" "apps/windows/publish/$dll" -Force
+          }
+          Compress-Archive -Path "apps/windows/publish/*" -DestinationPath "release/airferry-receiver-windows-x64-v$version.zip"
+          Copy-Item "apps/desktop/dist/AirFerry-Sender-$version-win-x64.exe" "release/airferry-sender-windows-x64-v$version.exe"
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: windows-release-assets
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish all release assets
+    needs: [verify, browser-and-web, android-receiver, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.1.7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(find release -maxdepth 1 -type f -print -quit)"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* --title "$RELEASE_TAG" --generate-notes
+          fi
