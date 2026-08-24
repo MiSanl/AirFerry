@@ -136,10 +136,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          [[ -x "$sdkmanager" ]] || { echo "Android SDK manager not found: $sdkmanager" >&2; exit 1; }
-          yes | "$sdkmanager" --licenses >/dev/null
-          "$sdkmanager" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+          command -v sdkmanager >/dev/null || { echo "Android SDK manager is not on PATH" >&2; exit 1; }
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
           cargo install cargo-ndk --locked
       - name: Restore Android release signing configuration
         shell: bash

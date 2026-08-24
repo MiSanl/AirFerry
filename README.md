@@ -57,7 +57,7 @@
 
 ## 下载安装
 
-最新版本发布在 [GitHub Release v1.2.9](https://github.com/MiSanl/AirFerry/releases/tag/v1.2.9)。
+最新版本发布在 [GitHub Release v1.2.10](https://github.com/MiSanl/AirFerry/releases/tag/v1.2.10)。
 
 | 文件 | 说明 |
 |------|------|

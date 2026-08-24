@@ -9,16 +9,10 @@
 
 name: pages
 
+# Pages is intentionally opt-in. The repository does not currently have a
+# Pages site enabled, so automatic pushes would otherwise fail after a full
+# web build. Enable GitHub Pages first, then restore the push trigger below.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "apps/sender/**"
-      - "apps/web/**"
-      - "core/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
