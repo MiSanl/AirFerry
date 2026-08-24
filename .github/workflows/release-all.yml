@@ -86,7 +86,7 @@ jobs:
           [[ -n "${CHROME_EXTENSION_PEM_BASE64:-}" ]] || { echo "Missing required GitHub secret: CHROME_EXTENSION_PEM_BASE64" >&2; exit 1; }
           printf '%s' "$CHROME_EXTENSION_PEM_BASE64" | base64 --decode > chrome-extension.pem
           actual_key_sha="$(openssl rsa -in chrome-extension.pem -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
-          [[ "$actual_key_sha" == "a0d78b94a9c988bd3fb96bced69724bdb26f7eaf82e754d1848d41735e1e3238" ]] || { echo "Chrome signing key fingerprint mismatch" >&2; exit 1; }
+          [[ "$actual_key_sha" == "652546dececf96073fbff1286dd46a6d9b2bd2e07a0f8072b6825d2fc1d4cebc" ]] || { echo "Chrome signing key fingerprint mismatch" >&2; exit 1; }
           for target in chrome-mv3 chrome-mv2; do
             (cd "apps/sender/build/$target-prod" && zip -r -q -X "../../../release/airferry-sender-$target-v$version.zip" .)
             google-chrome --headless --no-sandbox --disable-gpu --pack-extension="apps/sender/build/$target-prod" --pack-extension-key="$PWD/chrome-extension.pem"
@@ -159,7 +159,7 @@ jobs:
           set -euo pipefail
           apk="apps/scanner/app/build/outputs/apk/release/app-release.apk"
           certificate="$($ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr '[:lower:]' '[:upper:]')"
-          [[ "$certificate" == "7EF30C5906DE3F2379771187134B8B3FA5172CE8A005E91E2CB7276CF4C88A82" ]] || { echo "Android signing certificate fingerprint mismatch" >&2; exit 1; }
+          [[ "$certificate" == "3C1BB3B6BF6710E8C52D18D19D6E8A0123336242820B32DC3D9163791016FF89" ]] || { echo "Android signing certificate fingerprint mismatch" >&2; exit 1; }
       - name: Package APK
         shell: bash
         run: |

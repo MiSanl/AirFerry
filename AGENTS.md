@@ -301,7 +301,7 @@ npm run preview        # 本地预览构建产物
 - `transfer_engine_bg.wasm` + `wasm-zstd.wasm` + `lzma-wasm.wasm`——运行时加载的 WASM 模块
 - 图标 `icon{16,32,48,64,128}.png`
 
-> MV2 与 MV3 用同一 Chrome 签名私钥打包会得到相同扩展 ID。历史 v1.2.7/v1.2.8 的 PEM 对应 `lgafjpalpcbiellnlbfdabdlbfooojjm`；当前 CI 发布 PEM 的公钥 SHA-256 为 `a0d78b94a9c988bd3fb96bced69724bdb26f7eaf82e754d1848d41735e1e3238`，是新的签名身份，扩展 ID 不同。若需要保留历史安装用户的原位升级，必须恢复原始 PEM，不能用新密钥替代。
+> MV2 与 MV3 用同一 Chrome 签名私钥打包会得到相同扩展 ID。历史 v1.2.7/v1.2.8 的 PEM 对应 `lgafjpalpcbiellnlbfdabdlbfooojjm`；当前 CI 发布 PEM 的公钥 SHA-256 为 `652546dececf96073fbff1286dd46a6d9b2bd2e07a0f8072b6825d2fc1d4cebc`，是新的签名身份，扩展 ID 不同。若需要保留历史安装用户的原位升级，必须恢复原始 PEM，不能用新密钥替代。
 
 ### ⚠️ 关键依赖顺序（最容易踩的坑）
 

@@ -4,8 +4,8 @@ Uploads the locally protected AirFerry release credentials to GitHub Actions.
 
 .DESCRIPTION
 The source credentials live under dist/ (git-ignored). release-secrets.dpapi
-contains their Base64 payload and is encrypted with the current Windows user's
-DPAPI profile. This script never prints passwords, private keys, or Base64 data.
+is a PowerShell CLIXML SecureString encrypted for the current Windows user.
+This script never prints passwords, private keys, or Base64 data.
 #>
 
 [CmdletBinding()]
@@ -32,15 +32,20 @@ if (-not $VerifyOnly) {
     }
 }
 
-# ReadAllText preserves a UTF-8 BOM as U+FEFF on Windows PowerShell 5.1.
-# ConvertTo-SecureString requires the encrypted payload to begin at byte zero.
-$protected = [IO.File]::ReadAllText($SecretFile, [Text.Encoding]::UTF8).TrimStart([char]0xFEFF)
-$secure = ConvertTo-SecureString $protected
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+$secure = Import-Clixml -LiteralPath $SecretFile
+if ($secure -isnot [Security.SecureString]) {
+    throw "Invalid release secret store format: $SecretFile"
+}
+$bstr = [IntPtr]::Zero
 try {
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     $json = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+} catch {
+    throw "Cannot decrypt $SecretFile for the current Windows user. Regenerate the local release credential store."
 } finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ($bstr -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
 }
 $values = $json | ConvertFrom-Json
 
