@@ -24,6 +24,19 @@ Android Release APK 使用固定签名，工作流会 fail-closed：缺少任何
 
 工作流会核对 Chrome PEM 派生的公钥 SHA-256 与项目固定值是否一致；不一致或缺失会失败，避免发布改变扩展 ID 的 CRX。私钥只在 runner 临时文件中使用，不会上传到 artifacts 或 Release。
 
+## 本地材料与 Secrets 同步
+
+当前发布材料保存于本机 git-ignored 的 `dist/airferry-release.keystore` 和 `dist/airferry-extension.pem`。对应的 Base64 payload 与密码以当前 Windows 用户 DPAPI 加密保存在 `dist/release-secrets.dpapi`，该文件不能复制到其他 Windows 用户或机器后解密。
+
+安装并登录 GitHub CLI 后，执行以下命令即可上传五个必需 Secrets，命令不会在控制台显示敏感值：
+
+```powershell
+gh auth login --hostname github.com --git-protocol ssh
+.\scripts\set-github-release-secrets.ps1 -Repository MiSanl/AirFerry
+```
+
+Android 证书 SHA-256 为 `7EF30C5906DE3F2379771187134B8B3FA5172CE8A005E91E2CB7276CF4C88A82`，Chrome PEM 公钥 SHA-256 为 `a0d78b94a9c988bd3fb96bced69724bdb26f7eaf82e754d1848d41735e1e3238`。这是一套新生成的签名身份，无法覆盖安装使用旧证书签名的 Android APK，且 Chrome 扩展 ID 会与旧 PEM 对应的 ID 不同；若需要保持旧安装包的升级路径，必须恢复并使用原始私钥，而不能生成替代密钥。
+
 ## 发布步骤
 
 1. 同步各端版本号、发行说明和 lockfile。
