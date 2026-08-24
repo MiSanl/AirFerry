@@ -252,7 +252,7 @@ jobs:
     needs: [verify, browser-and-web, android-receiver, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.1.7
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
         with:
           path: release
           merge-multiple: true
