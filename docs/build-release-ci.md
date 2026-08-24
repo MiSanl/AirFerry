@@ -49,3 +49,7 @@ Android 证书 SHA-256 为 `3C1BB3B6BF6710E8C52D18D19D6E8A0123336242820B32DC3D91
 ## Android 快速验证
 
 修改 Android CI、JNI、NDK、签名或 Gradle 配置后，先在 Actions → `android-verify` → Run workflow 中输入 `main` 或待验证的提交/分支。该工作流只构建并校验签名 APK，上传一个临时 artifact，不创建 Release，也不触发浏览器、网页或 Windows 构建。它是调试用的可选验证步骤；没有 Android 相关改动且近期已通过时，可直接创建版本 tag 运行 `release-all`。
+
+## 仅发布已有产物
+
+若 `release-all` 的构建 job 都成功，但最后 Release 上传步骤失败，使用 `publish-artifacts` workflow 输入目标 `release_tag` 与来源 `release-all` run ID。它只下载该 run 的已有 artifacts 并创建或更新 GitHub Release，不会重新编译 Android、浏览器、网页或 Windows 端。
