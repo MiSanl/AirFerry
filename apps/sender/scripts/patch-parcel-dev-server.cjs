@@ -12,20 +12,16 @@ const fs = require("fs")
 const path = require("path")
 
 const senderRoot = path.resolve(__dirname, "..")
-const reporterRoot = path.join(
-  senderRoot,
-  "node_modules",
-  "@plasmohq",
-  "parcel-config",
-  "node_modules",
-  "@parcel",
-  "reporter-dev-server",
-)
-const packagePath = path.join(reporterRoot, "package.json")
-
-if (!fs.existsSync(packagePath)) {
+let packagePath
+try {
+  // npm may hoist this transitive dependency, while pnpm keeps it nested.
+  packagePath = require.resolve("@parcel/reporter-dev-server/package.json", {
+    paths: [senderRoot],
+  })
+} catch {
   throw new Error("Parcel dev-server reporter not found; Plasmo dependency layout changed")
 }
+const reporterRoot = path.dirname(packagePath)
 
 const reporterVersion = JSON.parse(fs.readFileSync(packagePath, "utf8")).version
 if (reporterVersion !== "2.9.3") {

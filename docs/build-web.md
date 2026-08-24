@@ -135,6 +135,20 @@ node scripts/serve-https.mjs dist-receiver .cert/selfsigned.crt .cert/selfsigned
 
 两端共用同一份 `apps/sender/src/options.tsx`——zstd 预加载走共享助手 `apps/sender/src/wasm/zstdPreload.ts` 的 `preloadZstdBytes()`：用 `typeof chrome !== "undefined"` 做环境自适应，扩展走 `chrome.runtime.getURL`，网页走 `new URL("wasm-zstd.wasm", document.baseURI)`，行为各自正确（见 `AGENTS.md` §5.8）。网页接收端的 receive worker 也由 `ReceivePage` 用同一助手**在 post `init` 前 `await` 预加载**并 post `wasm-init`（worker 消息 FIFO 保证先于 assemble；worker 内 `initZstdFromBytes` 安装）。`compress.ts` 的兜底 fetch 按执行环境分流：主线程（`document`）走 `document.baseURI` 同级路径（子路径部署正确），打包 worker（脚本在 `assets/` 下）走 `../wasm-zstd.wasm`——曾统一按 worker 自身 URL 相对 fetch 解析到 `assets/wasm-zstd.wasm` 404（文件在站点根），导致 zstd 压缩传输在接收完成时报错。
 
+## Windows EXE 发送端
+
+`apps/desktop` 是 Windows 发送端的 Electron 桌面壳。它加载 `apps/web/dist/index.html`，因此完整复用网页端和 `apps/sender/src/` 的发送逻辑，不复制 QR、压缩或 RaptorQ 代码。
+
+```powershell
+cd apps/desktop
+npm install
+npm run build
+```
+
+`npm run build` 会先构建网页发送端，再产出免安装的 `apps/desktop/dist/AirFerry-Sender-<VER>-win-x64.exe`。首次运行前，网页构建仍要求 `apps/sender/wasm-pkg-simd/` 存在；若缺失，先在 `apps/sender` 执行 `npm run wasm`。
+
+推送与 `apps/sender/package.json` 版本一致的 `v<VER>` tag 后，`.github/workflows/desktop-sender-release.yml` 会在 Windows runner 上重建并上传该 EXE 到 GitHub Release；也可从 Actions 手动运行并输入已有 tag。
+
 ## 单文件版（双击运行，无需服务器）
 
 普通 `dist/` 需要静态服务器（因为 ES module 脚本在 `file://` 下被浏览器禁止）。**单文件版**把所有资源内联进一个 `index.html`，**双击即可在 `file://` 下运行**，无需任何服务器。

@@ -28,6 +28,8 @@ apps/sender/build/
 apps/sender/.plasmo/
 apps/sender/assets/icon.png
 apps/web/wasm-pkg/
+apps/desktop/node_modules/
+apps/desktop/dist/
 .plasmo/
 
 # Android / Gradle
