@@ -518,7 +518,7 @@ npm run preview        # 本地预览构建产物
    - **Rust 核心库**（`core/qr-protocol/src/compress.rs:23,52`）：Zstd **level 22**（`DEFAULT_LEVEL`，:23）、Xz **level 6 + EXTREME**（`XZ_PRESET`，:52）；`compress_with` 在 :139、`decompress_with_limit` 在 :170。zstd 编码器窗口封顶 `ZSTD_WINDOW_LOG_MAX=23`（:81）——流式编码器不声明输入大小时高 level 会固定声明 windowLog=27，接收端解码器同样钳制 23，两端必须成对出现。
    - 两套编码默认值不同是**有意的**：浏览器发送端追求启动快（Zstd Lv1），Rust 原生压缩 API 追求压缩率（Zstd Lv22；XZ Lv6+EXTREME，见 `compress.rs:41-49`）。接收端按标准流解压，不依赖编码级别。引用压缩参数时**必须分清 TS 与 Rust 默认值**，不要合并描述。
 
-3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.8`**（versionCode=22）。v1.2.8 移除 Web WASM 的 SIMD 编译依赖，兼容禁用 WebAssembly SIMD 的加固/虚拟化 Chromium；构建目录名 `simd` 为兼容保留。v1.2.7 新增 Windows 持续接收模式与网页接收端屏幕/标签页捕获来源；v1.2.6 整理 Windows 接收结果页层级；v1.2.5 更新全平台图标并统一 Windows 扫描来源。协议仍为 v1.2.0 引入的 descriptor v5（compress-then-segment）。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
+3. **版本号/Release 混用（历史教训）**：README/dist/workflow 曾出现版本漂移。**当前权威版本 `1.2.9`**（versionCode=23）。v1.2.9 新增并修复全量 `release-all` CI，统一构建扩展、网页、Android、Windows 接收端及 Windows 发送端；v1.2.8 移除 Web WASM 的 SIMD 编译依赖，兼容禁用 WebAssembly SIMD 的加固/虚拟化 Chromium；构建目录名 `simd` 为兼容保留。协议仍为 v1.2.0 引入的 descriptor v5（compress-then-segment）。Windows workflow 已移除硬编码 `VER`，只能由现有 `release_tag` 派生并核对 tag commit；改版本时仍须按 §2.8 第 5 条同步代码中的版本源。
 
 4. **`derive_meta_from_totals` 已废弃**：`receiver.rs` 内仍保留 JNI/ABI 兼容符号，**新代码勿调用**（其 OTI 构建在大文件上会 assert）。现代路径：从描述符帧拿权威 OTI。
 

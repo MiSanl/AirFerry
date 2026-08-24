@@ -65,6 +65,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Install Chrome for CRX signing
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.15.0
       - name: Install and build browser sender
@@ -82,22 +84,25 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.verify.outputs.version }}"
-          mkdir release
+          release_dir="$GITHUB_WORKSPACE/release"
+          mkdir -p "$release_dir"
           [[ -n "${CHROME_EXTENSION_PEM_BASE64:-}" ]] || { echo "Missing required GitHub secret: CHROME_EXTENSION_PEM_BASE64" >&2; exit 1; }
           printf '%s' "$CHROME_EXTENSION_PEM_BASE64" | base64 --decode > chrome-extension.pem
           actual_key_sha="$(openssl rsa -in chrome-extension.pem -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
           [[ "$actual_key_sha" == "652546dececf96073fbff1286dd46a6d9b2bd2e07a0f8072b6825d2fc1d4cebc" ]] || { echo "Chrome signing key fingerprint mismatch" >&2; exit 1; }
+          chrome_bin="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)"
+          [[ -n "$chrome_bin" ]] || { echo "No Chrome or Chromium executable is available to sign CRX files" >&2; exit 1; }
           for target in chrome-mv3 chrome-mv2; do
-            (cd "apps/sender/build/$target-prod" && zip -r -q -X "../../../release/airferry-sender-$target-v$version.zip" .)
-            google-chrome --headless --no-sandbox --disable-gpu --pack-extension="apps/sender/build/$target-prod" --pack-extension-key="$PWD/chrome-extension.pem"
-            mv "apps/sender/build/$target-prod.crx" "release/airferry-sender-$target-v$version.crx"
+            (cd "apps/sender/build/$target-prod" && zip -r -q -X "$release_dir/airferry-sender-$target-v$version.zip" .)
+            "$chrome_bin" --headless --no-sandbox --disable-gpu --pack-extension="apps/sender/build/$target-prod" --pack-extension-key="$PWD/chrome-extension.pem"
+            mv "apps/sender/build/$target-prod.crx" "$release_dir/airferry-sender-$target-v$version.crx"
           done
           for target in firefox-mv3 firefox-mv2; do
-            (cd "apps/sender/build/$target-prod" && zip -r -q -X "../../../release/airferry-sender-$target-v$version.xpi" .)
+            (cd "apps/sender/build/$target-prod" && zip -r -q -X "$release_dir/airferry-sender-$target-v$version.xpi" .)
           done
-          (cd apps/web/dist && zip -r -q -X "../../../release/airferry-sender-web-v$version.zip" . -x 'zxing_reader.wasm' -x 'airferry_zxing.js' -x 'airferry_zxing.wasm')
-          (cd apps/web/dist-receiver && zip -r -q -X "../../../release/airferry-receiver-web-v$version.zip" .)
-          cp "apps/web/dist-standalone/index.html" "release/airferry-sender-web-standalone-v$version.html"
+          (cd apps/web/dist && zip -r -q -X "$release_dir/airferry-sender-web-v$version.zip" . -x 'zxing_reader.wasm' -x 'airferry_zxing.js' -x 'airferry_zxing.wasm')
+          (cd apps/web/dist-receiver && zip -r -q -X "$release_dir/airferry-receiver-web-v$version.zip" .)
+          cp "apps/web/dist-standalone/index.html" "$release_dir/airferry-sender-web-standalone-v$version.html"
           rm -f chrome-extension.pem
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
@@ -125,12 +130,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: aarch64-linux-android
+      - name: Setup Android command-line tools
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
       - name: Install Android SDK, NDK and CMake
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$sdkmanager" ]] || { echo "Android SDK manager not found: $sdkmanager" >&2; exit 1; }
+          yes | "$sdkmanager" --licenses >/dev/null
+          "$sdkmanager" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
           cargo install cargo-ndk --locked
       - name: Restore Android release signing configuration
         shell: bash

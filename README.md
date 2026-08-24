@@ -57,20 +57,20 @@
 
 ## 下载安装
 
-最新版本发布在 [GitHub Release v1.2.8](https://github.com/UR-SillyB/AirFerry/releases/tag/v1.2.8)。
+最新版本发布在 [GitHub Release v1.2.9](https://github.com/MiSanl/AirFerry/releases/tag/v1.2.9)。
 
 | 文件 | 说明 |
 |------|------|
-| `airferry-sender-chrome-mv3-v1.2.8.crx` / `.zip` | Chrome / Edge MV3 现代标量版；CRX 使用固定发布密钥签名，受策略限制时改用 zip 解压加载 |
-| `airferry-sender-chrome-mv2-v1.2.8.crx` / `.zip` | Chrome / Edge MV2 旧版兼容标量版；CRX 使用同一固定发布密钥签名 |
-| `airferry-sender-firefox-mv3-v1.2.8.xpi` | Firefox 扩展，MV3（Firefox 116+） |
-| `airferry-sender-firefox-mv2-v1.2.8.xpi` | Firefox 91+ 的 MV2 兼容版 |
-| `airferry-sender-web-v1.2.8.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-sender-web-standalone-v1.2.8.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
-| `airferry-sender-windows-x64-v1.2.8.exe` | Windows x64 发送端桌面版（免安装 portable EXE） |
-| `airferry-receiver-web-v1.2.8.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
-| `airferry-receiver-android-arm64-v1.2.8.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
-| `airferry-receiver-windows-x64-v1.2.8.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
+| `airferry-sender-chrome-mv3-v1.2.9.crx` / `.zip` | Chrome / Edge MV3 现代标量版；CRX 使用固定发布密钥签名，受策略限制时改用 zip 解压加载 |
+| `airferry-sender-chrome-mv2-v1.2.9.crx` / `.zip` | Chrome / Edge MV2 旧版兼容标量版；CRX 使用同一固定发布密钥签名 |
+| `airferry-sender-firefox-mv3-v1.2.9.xpi` | Firefox 扩展，MV3（Firefox 116+） |
+| `airferry-sender-firefox-mv2-v1.2.9.xpi` | Firefox 91+ 的 MV2 兼容版 |
+| `airferry-sender-web-v1.2.9.zip` | 网页发送端静态站点，现代标量 WASM，部署到任意静态托管（官方在线版见[网页端](#网页端web-发送--接收)） |
+| `airferry-sender-web-standalone-v1.2.9.html` | 网页发送端单文件版（约 2MB，双击即用，无需服务器） |
+| `airferry-sender-windows-x64-v1.2.9.exe` | Windows x64 发送端桌面版（免安装 portable EXE） |
+| `airferry-receiver-web-v1.2.9.zip` | **网页接收端**：需部署到 HTTPS / localhost 后使用摄像头（官方在线版见[网页端](#网页端web-发送--接收)） |
+| `airferry-receiver-android-arm64-v1.2.9.apk` | **Android 扫码端**：arm64-v8a，Android 10+，使用固定 release keystore 签名 |
+| `airferry-receiver-windows-x64-v1.2.9.zip` | **Windows 扫码端**：x64，Windows 10+，视频源支持摄像头 + USB/HDMI/SDI 采集卡 + 屏幕区域/窗口捕获 |
 
 > 本地可用 `./scripts/build-all.sh release` 构建发送端、APK 与网页端。正式全量发布由 GitHub Actions `release-all` workflow 完成：为与代码版本一致的 `v<VER>` tag 构建扩展 CRX/zip/xpi、网页发送/接收端、Android APK、Windows 接收端 zip 及 Windows 发送端 EXE 并上传到同一 Release。Android 与 CRX 固定签名材料必须先配置为仓库 Secrets，详见 [GitHub Actions 全量发布](docs/build-release-ci.md)。`pages` workflow 只负责网页部署，需在仓库 Settings → Pages 启用 GitHub Actions；其部署状态不影响 Release 资产构建。
 
@@ -80,7 +80,7 @@
 
 ### Windows 接收端
 
-解压 `airferry-receiver-windows-x64-v1.2.8.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在同一个「扫描来源」单选列表中选择摄像头、采集卡或屏幕捕获（彼此互斥，USB/HDMI/SDI 采集卡会被自动标注），再点统一的主按钮开始。选择「屏幕捕获」时会打开截图式选择器，可把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
+解压 `airferry-receiver-windows-x64-v1.2.9.zip`，安装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) 后运行 `AirFerry.exe`。启动后在同一个「扫描来源」单选列表中选择摄像头、采集卡或屏幕捕获（彼此互斥，USB/HDMI/SDI 采集卡会被自动标注），再点统一的主按钮开始。选择「屏幕捕获」时会打开截图式选择器，可把**屏幕矩形区域**（拖动）或**某个窗口**（单击，悬停自动高亮）作为视频源；**右键= 快速选择整个屏幕**（全屏应用/游戏首选——无边框游戏会因焦点被抢而最小化、独占全屏无法按窗口捕获）——适合同机浏览器播放二维码做端到端测试、虚拟机/远程桌面窗口等无摄像头场景，Esc 取消。进入扫码页对准屏幕二维码即可。
 
 ### Chrome / Edge 扩展
 
