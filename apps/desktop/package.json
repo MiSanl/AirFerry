@@ -1,6 +1,6 @@
 {
   "name": "@airferry/desktop-sender",
-  "version": "1.2.10",
+  "version": "1.2.11",
   "private": true,
   "description": "AirFerry Windows sender desktop shell.",
   "main": "main.cjs",

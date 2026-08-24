@@ -8,7 +8,7 @@
 - Windows WPF 接收端 zip
 - Windows x64 发送端 portable EXE
 
-网页 Pages 部署仍由 `.github/workflows/pages.yml` 单独负责。若仓库未在 Settings → Pages 中选择 GitHub Actions，Pages 部署会失败，但不影响 `release-all.yml` 的 Release 资产构建或上传。
+网页 Pages 部署仍由 `.github/workflows/pages.yml` 单独负责，当前仅允许手动触发。仓库在 Settings → Pages 中启用 GitHub Actions 部署后，可恢复其 push 触发器；这不影响 `release-all.yml` 的 Release 资产构建或上传。
 
 ## 必需 Secrets
 
@@ -48,4 +48,4 @@ Android 证书 SHA-256 为 `3C1BB3B6BF6710E8C52D18D19D6E8A0123336242820B32DC3D91
 
 ## Android 快速验证
 
-修改 Android CI、JNI、NDK、签名或 Gradle 配置后，先在 Actions → `android-verify` → Run workflow 中输入 `main` 或待验证的提交/分支。该工作流只构建并校验签名 APK，上传一个临时 artifact，不创建 Release，也不触发浏览器、网页或 Windows 构建。只有它通过后才运行 `release-all`。
+修改 Android CI、JNI、NDK、签名或 Gradle 配置后，先在 Actions → `android-verify` → Run workflow 中输入 `main` 或待验证的提交/分支。该工作流只构建并校验签名 APK，上传一个临时 artifact，不创建 Release，也不触发浏览器、网页或 Windows 构建。它是调试用的可选验证步骤；没有 Android 相关改动且近期已通过时，可直接创建版本 tag 运行 `release-all`。
