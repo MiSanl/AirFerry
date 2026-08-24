@@ -38,7 +38,7 @@ jobs:
           test -n "$artifact_ids"
           while read -r artifact_id; do
             archive="/tmp/airferry-artifact-$artifact_id.zip"
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" --output "$archive"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$archive"
             unzip -q "$archive" -d release
             rm -f "$archive"
           done <<< "$artifact_ids"
