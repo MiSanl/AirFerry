@@ -33,7 +33,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --dir release
+          mkdir release
+          artifact_ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts" --jq '.artifacts[] | select(.expired == false) | .id')"
+          test -n "$artifact_ids"
+          while read -r artifact_id; do
+            archive="/tmp/airferry-artifact-$artifact_id.zip"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" --output "$archive"
+            unzip -q "$archive" -d release
+            rm -f "$archive"
+          done <<< "$artifact_ids"
           test -n "$(find release -maxdepth 1 -type f -print -quit)"
       - name: Create or update GitHub Release
         env:
