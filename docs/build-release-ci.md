@@ -45,3 +45,7 @@ Android 证书 SHA-256 为 `3C1BB3B6BF6710E8C52D18D19D6E8A0123336242820B32DC3D91
 4. 等待 `release-all` 全部 job 完成，在 Release 页面确认每个资产均已上传。
 
 已存在的 tag 不会自动获得后来新增的工作流；工作流合入后，可在 Actions → `release-all` → Run workflow 中输入该 tag 手动重建。Secrets 未配置时，Android 或 CRX job 会按设计失败，不会发布未签名替代品。
+
+## Android 快速验证
+
+修改 Android CI、JNI、NDK、签名或 Gradle 配置后，先在 Actions → `android-verify` → Run workflow 中输入 `main` 或待验证的提交/分支。该工作流只构建并校验签名 APK，上传一个临时 artifact，不创建 Release，也不触发浏览器、网页或 Windows 构建。只有它通过后才运行 `release-all`。

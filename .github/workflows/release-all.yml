@@ -137,7 +137,12 @@ jobs:
         run: |
           set -euo pipefail
           command -v sdkmanager >/dev/null || { echo "Android SDK manager is not on PATH" >&2; exit 1; }
+          # `yes` exits with SIGPIPE after sdkmanager accepts all licenses;
+          # disable pipefail for this expected producer exit instead of masking
+          # a later package-install failure.
+          set +o pipefail
           yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
           sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
           cargo install cargo-ndk --locked
       - name: Restore Android release signing configuration
